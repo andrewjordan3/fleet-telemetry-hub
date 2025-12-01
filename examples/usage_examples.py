@@ -314,6 +314,79 @@ def example_8_custom_registry() -> None:
     manager = ProviderManager.from_config(config, registry=custom_registry)
 
 
+def example_9_to_dataframe() -> None:
+    """Convert API data to pandas DataFrame for analysis."""
+    from fleet_telemetry_hub.config.loader import load_config
+    from fleet_telemetry_hub.provider import Provider
+
+    config = load_config('config/telemetry_config.yaml')
+    motive = Provider.from_config('motive', config.providers['motive'])
+
+    # Get all vehicles as DataFrame
+    vehicles_df = motive.to_dataframe('vehicles')
+    print(f'Loaded {len(vehicles_df)} vehicles')
+    print(vehicles_df.head())
+
+    # Get vehicle locations with parameters
+    from datetime import date
+
+    locations_df = motive.to_dataframe(
+        'vehicle_locations',
+        vehicle_id=12345,
+        start_date=date(2025, 1, 1),
+        end_date=date(2025, 1, 31),
+    )
+
+    # Analyze data
+    print(f'\nLocation statistics:')
+    print(locations_df.describe())
+
+    # Save to various formats
+    vehicles_df.to_parquet('data/vehicles.parquet', compression='snappy')
+    vehicles_df.to_csv('data/vehicles.csv', index=False)
+    vehicles_df.to_excel('data/vehicles.xlsx', index=False)
+
+    # Or work with multiple endpoints
+    import pandas as pd
+
+    vehicles = motive.to_dataframe('vehicles')
+    groups = motive.to_dataframe('groups')
+    users = motive.to_dataframe('users')
+
+    # Combine or analyze together
+    print(f'\nDataset summary:')
+    print(f'  Vehicles: {len(vehicles)} rows, {len(vehicles.columns)} columns')
+    print(f'  Groups: {len(groups)} rows, {len(groups.columns)} columns')
+    print(f'  Users: {len(users)} rows, {len(users.columns)} columns')
+
+
+def example_10_dataframe_with_client() -> None:
+    """Use to_dataframe with TelemetryClient for lower-level control."""
+    from fleet_telemetry_hub import TelemetryClient
+    from fleet_telemetry_hub.models.motive_requests import MotiveEndpoints
+    from fleet_telemetry_hub.models.shared_response_models import ProviderCredentials
+
+    credentials = ProviderCredentials(
+        base_url='https://api.gomotive.com',
+        api_key='your-api-key-here',
+    )
+
+    with TelemetryClient(credentials) as client:
+        # Get DataFrame using client
+        df = client.to_dataframe(MotiveEndpoints.VEHICLES)
+        print(f'Fetched {len(df)} vehicles')
+
+        # Process multiple endpoints with same client
+        vehicles_df = client.to_dataframe(MotiveEndpoints.VEHICLES)
+        groups_df = client.to_dataframe(MotiveEndpoints.GROUPS)
+        users_df = client.to_dataframe(MotiveEndpoints.USERS)
+
+        # Save combined data
+        vehicles_df.to_parquet('data/vehicles.parquet')
+        groups_df.to_parquet('data/groups.parquet')
+        users_df.to_parquet('data/users.parquet')
+
+
 # =============================================================================
 # Helper Functions
 # =============================================================================

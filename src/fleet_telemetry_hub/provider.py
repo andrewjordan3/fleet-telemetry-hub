@@ -29,7 +29,7 @@ Example:
 
 import logging
 from collections.abc import Iterator
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .client import TelemetryClient
 from .config.config_models import ProviderConfig
@@ -39,6 +39,9 @@ from .models.shared_response_models import (
     ProviderCredentials,
 )
 from .registry import EndpointRegistry, get_registry
+
+if TYPE_CHECKING:
+    import pandas as pd
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -316,6 +319,83 @@ class Provider:
                 request_delay_seconds=request_delay_seconds,
                 **params,
             )
+
+    def to_dataframe(
+        self,
+        endpoint_name: str,
+        request_delay_seconds: float = 0.0,
+        **params: Any,
+    ) -> 'pd.DataFrame':
+        """
+        Fetch all data from an endpoint and return as a pandas DataFrame.
+
+        This is a convenience method that fetches all items, converts them
+        from Pydantic models to dictionaries, and creates a DataFrame.
+
+        Args:
+            endpoint_name: Endpoint name (e.g., 'vehicles').
+            request_delay_seconds: Delay between page requests.
+            **params: Path and query parameters.
+
+        Returns:
+            pandas DataFrame containing all fetched data.
+
+        Raises:
+            ImportError: If pandas is not installed.
+
+        Example:
+            >>> motive = Provider.from_config("motive", config)
+            >>>
+            >>> # Get all vehicles as DataFrame
+            >>> df = motive.to_dataframe("vehicles")
+            >>> print(df.head())
+            >>>
+            >>> # With parameters
+            >>> df = motive.to_dataframe(
+            ...     "vehicle_locations",
+            ...     vehicle_id=12345,
+            ...     start_date=date(2025, 1, 1),
+            ... )
+            >>>
+            >>> # Save to file
+            >>> df.to_parquet("vehicles.parquet")
+            >>> df.to_csv("vehicles.csv")
+        """
+        try:
+            import pandas as pd
+        except ImportError as e:
+            raise ImportError(
+                'pandas is required for to_dataframe(). '
+                'Install it with: pip install pandas'
+            ) from e
+
+        # Fetch all items
+        items = list(
+            self.fetch_all(
+                endpoint_name,
+                request_delay_seconds=request_delay_seconds,
+                **params,
+            )
+        )
+
+        if not items:
+            logger.warning(
+                f'No items found for endpoint "{endpoint_name}" with params {params}'
+            )
+            return pd.DataFrame()
+
+        # Convert Pydantic models to dictionaries
+        data = [item.model_dump() if hasattr(item, 'model_dump') else dict(item) for item in items]
+
+        # Create DataFrame
+        df = pd.DataFrame(data)
+
+        logger.info(
+            f'Created DataFrame from {len(items)} items '
+            f'with {len(df.columns)} columns'
+        )
+
+        return df
 
     def describe(self) -> str:
         """
