@@ -455,4 +455,5 @@ class TelemetryClient:
                 response_body=response.text,
             )
 
-        return response.json()
+        json_response: dict[str, Any] = response.json()
+        return json_response

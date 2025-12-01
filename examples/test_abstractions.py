@@ -48,9 +48,11 @@ def test_layer_2_client() -> None:
     from fleet_telemetry_hub.models.shared_response_models import ProviderCredentials
 
     # Create credentials
+    from pydantic import SecretStr
+
     credentials = ProviderCredentials(
         base_url='https://api.example.com',
-        api_key='test-key-12345',
+        api_key=SecretStr('test-key-12345'),
         timeout=(10, 30),
         max_retries=3,
         verify_ssl=True,
@@ -123,23 +125,42 @@ def test_layer_4_provider() -> None:
     print('\n=== Testing Layer 4: Provider Facade ===')
 
     from fleet_telemetry_hub import Provider
-    from fleet_telemetry_hub.config.config_models import ProviderConfig
+    from fleet_telemetry_hub.config.config_models import ProviderConfig, TelemetryConfig, PipelineConfig, StorageConfig, LoggingConfig
     from fleet_telemetry_hub.models.shared_response_models import ProviderCredentials
     from pydantic import SecretStr
 
-    # Create config
-    config = ProviderConfig(
+    # Create provider config
+    motive_config = ProviderConfig(
         enabled=True,
         base_url='https://api.example.com',
         api_key=SecretStr('test-key-12345'),
-        request_timeout=[10, 30],
+        request_timeout=(10, 30),
         max_retries=5,
         retry_backoff_factor=2.0,
         verify_ssl=True,
         rate_limit_requests_per_second=10,
     )
 
-    print('✓ Created ProviderConfig')
+    # Create full telemetry config
+    config = TelemetryConfig(
+        providers={'motive': motive_config},
+        pipeline=PipelineConfig(
+            default_start_date='2024-01-01',
+            lookback_days=7,
+            request_delay_seconds=0.0,
+        ),
+        storage=StorageConfig(
+            parquet_path='data/test.parquet',
+            parquet_compression='snappy',
+        ),
+        logging=LoggingConfig(
+            file_path='logs/test.log',
+            console_level='INFO',
+            file_level='DEBUG',
+        ),
+    )
+
+    print('✓ Created TelemetryConfig')
 
     # Create provider from config
     provider = Provider.from_config('motive', config)
@@ -184,7 +205,7 @@ def test_provider_manager() -> None:
         enabled=True,
         base_url='https://api.gomotive.com',
         api_key=SecretStr('test-key-1'),
-        request_timeout=[10, 30],
+        request_timeout=(10, 30),
         max_retries=5,
         retry_backoff_factor=2.0,
         verify_ssl=True,
@@ -195,7 +216,7 @@ def test_provider_manager() -> None:
         enabled=True,
         base_url='https://api.samsara.com',
         api_key=SecretStr('test-key-2'),
-        request_timeout=[10, 30],
+        request_timeout=(10, 30),
         max_retries=5,
         retry_backoff_factor=2.0,
         verify_ssl=True,

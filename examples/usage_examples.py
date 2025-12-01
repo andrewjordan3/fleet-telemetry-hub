@@ -23,11 +23,12 @@ def example_1_direct_endpoint_usage() -> None:
     from fleet_telemetry_hub.client import TelemetryClient
     from fleet_telemetry_hub.models.motive_requests import MotiveEndpoints
     from fleet_telemetry_hub.models.shared_response_models import ProviderCredentials
+    from pydantic import SecretStr
 
     # Create credentials
     credentials = ProviderCredentials(
         base_url='https://api.gomotive.com',
-        api_key='your-api-key-here',
+        api_key=SecretStr('your-api-key-here'),
         timeout=(10, 30),
         max_retries=5,
         retry_backoff_factor=2.0,
@@ -63,6 +64,7 @@ def example_2_registry_access() -> None:
     from fleet_telemetry_hub.client import TelemetryClient
     from fleet_telemetry_hub.models.shared_response_models import ProviderCredentials
     from fleet_telemetry_hub.registry import get_registry
+    from pydantic import SecretStr
 
     # Get global registry
     registry = get_registry()
@@ -78,7 +80,7 @@ def example_2_registry_access() -> None:
     # Create credentials
     credentials = ProviderCredentials(
         base_url='https://api.gomotive.com',
-        api_key='your-api-key-here',
+        api_key=SecretStr('your-api-key-here'),
     )
 
     # Use with client
@@ -130,7 +132,7 @@ def example_3_provider_facade() -> None:
     config = load_config('config/telemetry_config.yaml')
 
     # Create provider from config
-    motive = Provider.from_config('motive', config.providers['motive'])
+    motive = Provider.from_config('motive', config)
 
     # Simple fetch - client managed automatically
     for vehicle in motive.fetch_all('vehicles'):
@@ -200,7 +202,7 @@ def example_5_pagination_control() -> None:
     from fleet_telemetry_hub.provider import Provider
 
     config = load_config('config/telemetry_config.yaml')
-    motive = Provider.from_config('motive', config.providers['motive'])
+    motive = Provider.from_config('motive', config)
 
     # Fetch page by page with progress tracking
     total_items = 0
@@ -230,7 +232,7 @@ def example_6_error_handling() -> None:
     registry = get_registry()
     credentials = ProviderCredentials(
         base_url='https://api.gomotive.com',
-        api_key='your-api-key-here',
+        api_key=SecretStr('your-api-key-here'),
     )
 
     try:
@@ -320,7 +322,7 @@ def example_9_to_dataframe() -> None:
     from fleet_telemetry_hub.provider import Provider
 
     config = load_config('config/telemetry_config.yaml')
-    motive = Provider.from_config('motive', config.providers['motive'])
+    motive = Provider.from_config('motive', config)
 
     # Get all vehicles as DataFrame
     vehicles_df = motive.to_dataframe('vehicles')
@@ -368,7 +370,7 @@ def example_10_dataframe_with_client() -> None:
 
     credentials = ProviderCredentials(
         base_url='https://api.gomotive.com',
-        api_key='your-api-key-here',
+        api_key=SecretStr('your-api-key-here'),
     )
 
     with TelemetryClient(credentials) as client:
@@ -416,7 +418,7 @@ def main() -> None:
 
     try:
         config = load_config('config/telemetry_config.yaml')
-        motive = Provider.from_config('motive', config.providers['motive'])
+        motive = Provider.from_config('motive', config)
 
         # Show available endpoints
         print(f'Provider: {motive.name}')

@@ -90,7 +90,7 @@ class EndpointRegistry:
 
     def _register_motive_endpoints(
         self,
-    ) -> dict[str, MotiveEndpointDefinition[Any, Any]]:
+    ) -> dict[str, EndpointDefinition[Any, Any]]:
         """Register all Motive endpoints with normalized names."""
         motive_endpoints = MotiveEndpoints.get_all_endpoints()
 
@@ -101,7 +101,7 @@ class EndpointRegistry:
 
     def _register_samsara_endpoints(
         self,
-    ) -> dict[str, SamsaraEndpointDefinition[Any, Any]]:
+    ) -> dict[str, EndpointDefinition[Any, Any]]:
         """Register all Samsara endpoints with normalized names."""
         samsara_endpoints = SamsaraEndpoints.get_all_endpoints()
 
