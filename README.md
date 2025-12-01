@@ -349,7 +349,7 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 
 **Andrew Jordan** - andrewjordan3@gmail.com
 
-Project Link: https://github.com/andrewjordan3/fleet_telemetry_hub
+Project Link: https://github.com/andrewjordan3/fleet-telemetry-hub
 
 ## Acknowledgments
 

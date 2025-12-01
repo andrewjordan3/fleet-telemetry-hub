@@ -29,19 +29,18 @@ Example:
 
 import logging
 from collections.abc import Iterator
-from typing import TYPE_CHECKING, Any
+from typing import Any, Self
+
+import pandas as pd
 
 from .client import TelemetryClient
-from .config.config_models import ProviderConfig
+from .config import ProviderConfig, TelemetryConfig
 from .models.shared_response_models import (
     EndpointDefinition,
     ParsedResponse,
     ProviderCredentials,
 )
 from .registry import EndpointRegistry, get_registry
-
-if TYPE_CHECKING:
-    import pandas as pd
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -80,6 +79,7 @@ class Provider:
         self,
         name: str,
         credentials: ProviderCredentials,
+        config: TelemetryConfig | None = None,
         registry: EndpointRegistry | None = None,
     ) -> None:
         """
@@ -92,14 +92,15 @@ class Provider:
         """
         self.name: str = name.lower()
         self.credentials: ProviderCredentials = credentials
+        self.config: TelemetryConfig | None = config
         self._registry: EndpointRegistry = registry or get_registry()
 
         # Validate provider exists in registry
         if self.name not in self._registry.list_providers():
-            available = ', '.join(self._registry.list_providers())
+            available: str = ', '.join(self._registry.list_providers())
             raise ValueError(
                 f"Provider '{name}' not found in registry. "
-                f"Available providers: {available}"
+                f'Available providers: {available}'
             )
 
         logger.info(f"Initialized Provider facade for '{self.name}'")
@@ -108,9 +109,9 @@ class Provider:
     def from_config(
         cls,
         provider_name: str,
-        config: ProviderConfig,
+        config: TelemetryConfig,
         registry: EndpointRegistry | None = None,
-    ) -> 'Provider':
+    ) -> Self:
         """
         Create provider from configuration object.
 
@@ -119,7 +120,7 @@ class Provider:
 
         Args:
             provider_name: Provider name (e.g., 'motive', 'samsara').
-            config: Provider configuration from config file.
+            config: Package level onfiguration from config file.
             registry: Optional custom endpoint registry.
 
         Returns:
@@ -129,18 +130,24 @@ class Provider:
             >>> from fleet_telemetry_hub.config.loader import load_config
             >>>
             >>> config = load_config("config.yaml")
-            >>> motive = Provider.from_config("motive", config.providers["motive"])
+            >>> motive = Provider.from_config("motive", config)
         """
+        provider_config: ProviderConfig | None = config.providers.get(provider_name)
+        if not provider_config:
+            logger.error(f'No configuration found for provider {provider_name}.')
+            raise NotImplementedError
+
         credentials = ProviderCredentials(
-            base_url=config.base_url,
-            api_key=config.api_key,
-            timeout=tuple(config.request_timeout),  # type: ignore[arg-type]
-            max_retries=config.max_retries,
-            retry_backoff_factor=config.retry_backoff_factor,
-            verify_ssl=config.verify_ssl,
+            base_url=provider_config.base_url,
+            api_key=provider_config.api_key,
+            timeout=tuple(provider_config.request_timeout),  # type: ignore[arg-type]
+            max_retries=provider_config.max_retries,
+            retry_backoff_factor=provider_config.retry_backoff_factor,
+            verify_ssl=provider_config.verify_ssl,
+            use_truststore=config.pipeline.use_truststore
         )
 
-        return cls(provider_name, credentials, registry)
+        return cls(provider_name, credentials, config, registry)
 
     def endpoint(self, endpoint_name: str) -> EndpointDefinition[Any, Any]:
         """
@@ -214,10 +221,12 @@ class Provider:
             ...     for vehicle in client.fetch_all(motive.endpoint("vehicles")):
             ...         print(vehicle.number)
         """
+        request_delay_seconds: float = self.get_request_delay()
         return TelemetryClient(
             credentials=self.credentials,
             pool_connections=pool_connections,
             pool_maxsize=pool_maxsize,
+            request_delay_seconds=request_delay_seconds,
         )
 
     # -------------------------------------------------------------------------
@@ -247,7 +256,7 @@ class Provider:
             >>> response = motive.fetch("vehicles")
             >>> print(f"Found {response.item_count} vehicles on this page")
         """
-        endpoint = self.endpoint(endpoint_name)
+        endpoint: EndpointDefinition[Any, Any] = self.endpoint(endpoint_name)
 
         with self.client() as client:
             return client.fetch(endpoint, **params)
@@ -277,7 +286,7 @@ class Provider:
             >>> for vehicle in motive.fetch_all("vehicles"):
             ...     print(f"{vehicle.number}: {vehicle.make} {vehicle.model}")
         """
-        endpoint = self.endpoint(endpoint_name)
+        endpoint: EndpointDefinition[Any, Any] = self.endpoint(endpoint_name)
 
         with self.client() as client:
             yield from client.fetch_all(
@@ -311,7 +320,7 @@ class Provider:
             ...     print(f"Processing page with {page.item_count} items")
             ...     process_batch(page.items)
         """
-        endpoint = self.endpoint(endpoint_name)
+        endpoint: EndpointDefinition[Any, Any] = self.endpoint(endpoint_name)
 
         with self.client() as client:
             yield from client.fetch_all_pages(
@@ -325,7 +334,7 @@ class Provider:
         endpoint_name: str,
         request_delay_seconds: float = 0.0,
         **params: Any,
-    ) -> 'pd.DataFrame':
+    ) -> pd.DataFrame:
         """
         Fetch all data from an endpoint and return as a pandas DataFrame.
 
@@ -361,16 +370,8 @@ class Provider:
             >>> df.to_parquet("vehicles.parquet")
             >>> df.to_csv("vehicles.csv")
         """
-        try:
-            import pandas as pd
-        except ImportError as e:
-            raise ImportError(
-                'pandas is required for to_dataframe(). '
-                'Install it with: pip install pandas'
-            ) from e
-
         # Fetch all items
-        items = list(
+        items: list[Any] = list(
             self.fetch_all(
                 endpoint_name,
                 request_delay_seconds=request_delay_seconds,
@@ -385,17 +386,44 @@ class Provider:
             return pd.DataFrame()
 
         # Convert Pydantic models to dictionaries
-        data = [item.model_dump() if hasattr(item, 'model_dump') else dict(item) for item in items]
+        data: list[Any | dict[str, Any]] = [
+            item.model_dump() if hasattr(item, 'model_dump') else dict(item)
+            for item in items
+        ]
 
         # Create DataFrame
         df = pd.DataFrame(data)
 
         logger.info(
-            f'Created DataFrame from {len(items)} items '
-            f'with {len(df.columns)} columns'
+            f'Created DataFrame from {len(items)} items with {len(df.columns)} columns'
         )
 
         return df
+
+    def get_request_delay(self) -> float:
+        """
+        Get the effective request delay, considering both pipeline global delay
+        and provider-specific rate limits.
+
+        Returns the larger of:
+        - Pipeline global delay
+        - 1/rate_limit (time per request based on rate limit)
+        """
+        if not self.config:
+            return 0.0
+
+        pipeline_delay: float = self.config.pipeline.request_delay_seconds
+        provider_config: ProviderConfig | None = self.config.providers.get(self.name)
+        if not provider_config:
+            return pipeline_delay
+
+        # Calculate minimum delay based on rate limit
+        # e.g., 10 req/sec = 0.1 sec/req minimum
+        rate_limit: int = provider_config.rate_limit_requests_per_second
+        rate_delay: float = 1.0 / rate_limit if rate_limit > 0 else 0.0
+
+        # Use the more conservative (larger) delay
+        return max(pipeline_delay, rate_delay)
 
     def describe(self) -> str:
         """
@@ -412,11 +440,11 @@ class Provider:
 
     def __repr__(self) -> str:
         """String representation of Provider."""
-        endpoint_count = len(self.list_endpoints())
+        endpoint_count: int = len(self.list_endpoints())
         return (
             f"Provider(name='{self.name}', "
             f"base_url='{self.credentials.base_url}', "
-            f"endpoints={endpoint_count})"
+            f'endpoints={endpoint_count})'
         )
 
 
@@ -470,9 +498,9 @@ class ProviderManager:
     @classmethod
     def from_config(
         cls,
-        config: Any,  # TelemetryConfig type
+        config: TelemetryConfig,
         registry: EndpointRegistry | None = None,
-    ) -> 'ProviderManager':
+    ) -> Self:
         """
         Create provider manager from configuration.
 
@@ -497,12 +525,12 @@ class ProviderManager:
             if provider_config.enabled:
                 providers[provider_name] = Provider.from_config(
                     provider_name,
-                    provider_config,
+                    config,
                     registry,
                 )
-                logger.info(f"Loaded provider: {provider_name}")
+                logger.info(f'Loaded provider: {provider_name}')
             else:
-                logger.info(f"Skipped disabled provider: {provider_name}")
+                logger.info(f'Skipped disabled provider: {provider_name}')
 
         return cls(providers)
 
@@ -524,10 +552,10 @@ class ProviderManager:
             >>> motive = manager.get("motive")
         """
         if provider_name not in self._providers:
-            available = ', '.join(self._providers.keys())
+            available: str = ', '.join(self._providers.keys())
             raise KeyError(
                 f"Provider '{provider_name}' not found or not enabled. "
-                f"Available providers: {available}"
+                f'Available providers: {available}'
             )
 
         return self._providers[provider_name]
@@ -579,4 +607,4 @@ class ProviderManager:
 
     def __repr__(self) -> str:
         """String representation of ProviderManager."""
-        return f"ProviderManager(providers={list(self._providers.keys())})"
+        return f'ProviderManager(providers={list(self._providers.keys())})'

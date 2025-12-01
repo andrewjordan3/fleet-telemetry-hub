@@ -24,7 +24,7 @@ from .config_models import TelemetryConfig
 logger: logging.Logger = logging.getLogger(__name__)
 
 
-def load_telemetry_config(config_path: Path | str | None = None) -> TelemetryConfig:
+def load_config(config_path: Path | str | None = None) -> TelemetryConfig:
     """Load and validate telemetry configuration from YAML file.
 
     This function reads the YAML configuration file, parses it, and validates
@@ -49,7 +49,7 @@ def load_telemetry_config(config_path: Path | str | None = None) -> TelemetryCon
         Logs detailed validation errors at ERROR level if validation fails.
 
     Example:
-        >>> config = load_telemetry_config("config/telemetry_config.yaml")
+        >>> config = load_config("config/telemetry_config.yaml")
         >>> print(config.providers["motive"].base_url)
         'https://api.gomotive.com'
     """

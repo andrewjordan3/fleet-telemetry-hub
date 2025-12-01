@@ -11,7 +11,7 @@ from .config_models import (
     StorageConfig,
     TelemetryConfig,
 )
-from .loader import load_telemetry_config
+from .loader import load_config
 
 __all__: list[str] = [
     'LoggingConfig',
@@ -19,5 +19,5 @@ __all__: list[str] = [
     'ProviderConfig',
     'StorageConfig',
     'TelemetryConfig',
-    'load_telemetry_config',
+    'load_config',
 ]

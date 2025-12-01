@@ -68,9 +68,9 @@ dev = [
 all = ["fleet_telemetry_hub[dev]"]
 
 [project.urls]
-Homepage = "https://github.com/andrewjordan3/fleet_telemetry_hub"
-Repository = "https://github.com/andrewjordan3/fleet_telemetry_hub"
-Issues = "https://github.com/andrewjordan3/fleet_telemetry_hub/issues"
+Homepage = "https://github.com/andrewjordan3/fleet-telemetry-hub"
+Repository = "https://github.com/andrewjordan3/fleet-telemetry-hub"
+Issues = "https://github.com/andrewjordan3/fleet-telemetry-hub/issues"
 
 ###############################################################################
 # PACKAGE DISCOVERY
@@ -82,7 +82,6 @@ Issues = "https://github.com/andrewjordan3/fleet_telemetry_hub/issues"
 zip-safe = false
 
 [tool.setuptools.package-data]
-# FIXED: Changed from 'fuelsync' to match your actual package name
 fleet_telemetry_hub = ["config/*.yaml", "py.typed"]
 
 [tool.setuptools.packages.find]
@@ -183,7 +182,7 @@ python_classes = ["Test*"]
 python_functions = ["test_*"]
 addopts = [
     "--verbose",
-    "--cov=fleet_telemetry_hub",  # FIXED: Matches package name
+    "--cov=fleet_telemetry_hub",
     "--cov-report=term-missing",
     "--cov-report=html",
 ]

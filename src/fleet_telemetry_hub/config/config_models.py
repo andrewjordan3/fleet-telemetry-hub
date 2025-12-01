@@ -131,6 +131,7 @@ class PipelineConfig(BaseModel):
         default_start_date: ISO-8601 date string for initial backfill (YYYY-MM-DD).
         lookback_days: Number of days to overlap on incremental runs (catches late data).
         request_delay_seconds: Artificial delay between API requests (rate limiting).
+        use_truststore: Use the truststore library for windows environments behind ZScaler or similar.
     """
 
     default_start_date: str = Field(

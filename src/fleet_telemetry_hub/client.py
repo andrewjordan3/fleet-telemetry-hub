@@ -10,18 +10,17 @@ is handled by the EndpointDefinition.
 import logging
 import time
 from collections.abc import Iterator
-from typing import TYPE_CHECKING, Any
+from ssl import SSLContext
+from typing import Any
 
 import httpx
+import pandas as pd
 from tenacity import (
     retry,
     retry_if_exception_type,
     stop_after_attempt,
     wait_exponential,
 )
-
-if TYPE_CHECKING:
-    import pandas as pd
 
 from .models.shared_request_models import RateLimitInfo, RequestSpec
 from .models.shared_response_models import (
@@ -36,6 +35,7 @@ from .utils import build_truststore_ssl_context
 logger: logging.Logger = logging.getLogger(__name__)
 
 RATE_LIMIT_HTTP_CODE: int = 429
+
 
 class APIError(Exception):
     """Base exception for API errors."""
@@ -96,6 +96,7 @@ class TelemetryClient:
         credentials: ProviderCredentials,
         pool_connections: int = 5,
         pool_maxsize: int = 10,
+        request_delay_seconds: float = 0.0,
     ) -> None:
         """
         Initialize telemetry API client.
@@ -104,11 +105,22 @@ class TelemetryClient:
             credentials: Provider credentials and connection settings.
             pool_connections: Max keepalive connections in pool.
             pool_maxsize: Max total connections in pool.
+            request_delay_seconds: Seconds between requests.
         """
         self._credentials: ProviderCredentials = credentials
 
         # Default timeout from credentials, can be overridden per-request
         default_timeout: tuple[int, int] = credentials.timeout
+
+        self.request_delay_seconds: float = request_delay_seconds
+
+        ssl_verify: SSLContext | bool | str
+        if self._credentials.use_truststore:
+            ssl_verify = build_truststore_ssl_context()
+            logger.debug('Using truststore for credential verification.')
+        else:
+            ssl_verify = self._credentials.verify_ssl
+            logger.debug(f'Using "{ssl_verify}" for credential verification.')
 
         self._http_client: httpx.Client = httpx.Client(
             timeout=httpx.Timeout(
@@ -117,7 +129,7 @@ class TelemetryClient:
                 write=default_timeout[0],
                 pool=default_timeout[0],
             ),
-            verify=credentials.verify_ssl,
+            verify=ssl_verify,
             limits=httpx.Limits(
                 max_keepalive_connections=pool_connections,
                 max_connections=pool_maxsize,
@@ -125,8 +137,7 @@ class TelemetryClient:
         )
 
         logger.info(
-            f'Initialized TelemetryClient for {credentials.base_url} '
-            f'(SSL verify: {credentials.verify_ssl})'
+            f'Initialized TelemetryClient for {credentials.base_url}.'
         )
 
     def close(self) -> None:
@@ -186,7 +197,7 @@ class TelemetryClient:
     def fetch_all(
         self,
         endpoint: EndpointDefinition[Any, ItemT],
-        request_delay_seconds: float = 0.0,
+        request_delay_seconds: float | None = None,
         **params: Any,
     ) -> Iterator[ItemT]:
         """
@@ -206,6 +217,11 @@ class TelemetryClient:
         pagination_state: PaginationState | None = None
         page_count: int = 0
         total_items: int = 0
+        effective_delay: float = (
+            self.request_delay_seconds
+            if request_delay_seconds is None
+            else request_delay_seconds
+        )
 
         while True:
             response: ParsedResponse[ItemT] = self.fetch(
@@ -233,13 +249,13 @@ class TelemetryClient:
 
             pagination_state = response.pagination
 
-            if request_delay_seconds > 0:
-                time.sleep(request_delay_seconds)
+            if effective_delay > 0:
+                time.sleep(effective_delay)
 
     def fetch_all_pages(
         self,
         endpoint: EndpointDefinition[Any, ItemT],
-        request_delay_seconds: float = 0.0,
+        request_delay_seconds: float | None = None,
         **params: Any,
     ) -> Iterator[ParsedResponse[ItemT]]:
         """
@@ -257,6 +273,11 @@ class TelemetryClient:
         """
         pagination_state: PaginationState | None = None
         page_count: int = 0
+        effective_delay: float = (
+            self.request_delay_seconds
+            if request_delay_seconds is None
+            else request_delay_seconds
+        )
 
         while True:
             response: ParsedResponse[ItemT] = self.fetch(
@@ -276,13 +297,13 @@ class TelemetryClient:
 
             pagination_state = response.pagination
 
-            if request_delay_seconds > 0:
-                time.sleep(request_delay_seconds)
+            if effective_delay > 0:
+                time.sleep(effective_delay)
 
     def to_dataframe(
         self,
         endpoint: EndpointDefinition[Any, ItemT],
-        request_delay_seconds: float = 0.0,
+        request_delay_seconds: float | None = None,
         **params: Any,
     ) -> 'pd.DataFrame':
         """
@@ -316,19 +337,16 @@ class TelemetryClient:
             ...     # Save to file
             ...     df.to_parquet("vehicles.parquet")
         """
-        try:
-            import pandas as pd
-        except ImportError as e:
-            raise ImportError(
-                'pandas is required for to_dataframe(). '
-                'Install it with: pip install pandas'
-            ) from e
-
+        effective_delay: float = (
+            self.request_delay_seconds
+            if request_delay_seconds is None
+            else request_delay_seconds
+        )
         # Fetch all items
         items: list[ItemT] = list(
             self.fetch_all(
                 endpoint,
-                request_delay_seconds=request_delay_seconds,
+                request_delay_seconds=effective_delay,
                 **params,
             )
         )
@@ -341,7 +359,7 @@ class TelemetryClient:
             return pd.DataFrame()
 
         # Convert Pydantic models to dictionaries
-        data = [
+        data: list[dict[str, Any]] = [
             item.model_dump() if hasattr(item, 'model_dump') else dict(item)
             for item in items
         ]

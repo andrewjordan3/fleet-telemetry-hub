@@ -200,6 +200,8 @@ class ProviderCredentials(BaseModel):
         max_retries: Maximum retry attempts.
         retry_backoff_factor: Exponential backoff multiplier.
         verify_ssl: SSL verification (bool or path to CA bundle).
+        request_delay: delay between requests in seconds.
+        use_truststore: Use the Windows credential manager.
     """
 
     model_config = ConfigDict(extra='forbid')
@@ -210,6 +212,8 @@ class ProviderCredentials(BaseModel):
     max_retries: int = 3
     retry_backoff_factor: float = 1.0
     verify_ssl: bool | str = True
+    request_delay: float = 0.0
+    use_truststore: bool = False
 
 
 # =============================================================================
