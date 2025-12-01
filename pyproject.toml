@@ -1,0 +1,207 @@
+# pyproject.toml
+
+[build-system]
+requires = ["setuptools>=77.0.3", "wheel"]
+build-backend = "setuptools.build_meta"
+
+###############################################################################
+# PROJECT METADATA
+###############################################################################
+[project]
+name = "fleet_telemetry_hub"
+version = "0.1.0"
+authors = [{ name = "Andrew Jordan", email = "andrewjordan3@gmail.com" }]
+description = "A robust, type-safe Python client for telemetry provider APIs"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+keywords = [
+    "samsara",
+    "motive",
+    "fuel",
+    "rest",
+    "api",
+    "eld",
+    "fleet",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+
+# Core dependencies
+dependencies = [
+    "pydantic>=2.0.0",
+    "pyyaml>=6.0.0",
+    "requests>=2.31.0",
+    "pandas>=2.0.0",
+    "pyarrow>=14.0.0",
+    "httpx>=0.28.0",
+    "tenacity>=9.1.0"
+]
+
+# Optional dependencies
+[project.optional-dependencies]
+
+# System trust store / TLS extras
+# For Windows OS behind ZScaler or similar
+tls = [
+    "truststore>=0.10.0",
+]
+
+# Development tools
+dev = [
+    "ruff>=0.1.0",
+    "mypy>=1.7.0",
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    "types-pyyaml>=6.0.0",
+    "types-requests>=2.31.0",
+]
+
+# All optional dependencies
+all = ["fleet_telemetry_hub[dev]"]
+
+[project.urls]
+Homepage = "https://github.com/andrewjordan3/fleet_telemetry_hub"
+Repository = "https://github.com/andrewjordan3/fleet_telemetry_hub"
+Issues = "https://github.com/andrewjordan3/fleet_telemetry_hub/issues"
+
+###############################################################################
+# PACKAGE DISCOVERY
+###############################################################################
+[tool.setuptools.package-dir]
+"" = "src"
+
+[tool.setuptools]
+zip-safe = false
+
+[tool.setuptools.package-data]
+# FIXED: Changed from 'fuelsync' to match your actual package name
+fleet_telemetry_hub = ["config/*.yaml", "py.typed"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["fleet_telemetry_hub*"]
+exclude = ["tests*", "docs*"]
+
+###############################################################################
+# RUFF - LINTING AND FORMATTING
+###############################################################################
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+
+exclude = [
+    ".git",
+    "__pycache__",
+    ".venv",
+    "venv",
+    "build",
+    "dist",
+    "*.egg-info",
+]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "C4",  # flake8-comprehensions
+    "DTZ", # flake8-datetimez
+    "T10", # flake8-debugger
+    "PL",  # pylint
+    "RUF", # ruff-specific rules
+]
+
+ignore = [
+    "E501",    # Line too long (handled by ruff format)
+    "E203",    # Whitespace before ':' (conflicts with formatter)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"] # Allow unused imports in __init__.py
+
+[tool.ruff.format]
+quote-style = "single"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+
+[tool.ruff.lint.isort]
+known-first-party = ["fleet_telemetry_hub"]
+combine-as-imports = true
+
+###############################################################################
+# MYPY - TYPE CHECKING
+###############################################################################
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+warn_unreachable = true
+strict_equality = true
+
+# Ignore missing imports for third-party packages without type stubs
+[[tool.mypy.overrides]]
+module = ["pandas.*", "pyarrow.*"]
+ignore_missing_imports = true
+
+###############################################################################
+# PYRIGHT - FOR VS CODE PYLANCE
+###############################################################################
+[tool.pyright]
+include = ["src"]
+exclude = ["**/node_modules", "**/__pycache__", "**/.*"]
+typeCheckingMode = "strict"
+reportMissingTypeStubs = false
+reportUnknownMemberType = false
+reportUnknownArgumentType = false
+
+###############################################################################
+# PYTEST - TESTING
+###############################################################################
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+    "--verbose",
+    "--cov=fleet_telemetry_hub",  # FIXED: Matches package name
+    "--cov-report=term-missing",
+    "--cov-report=html",
+]
+
+###############################################################################
+# COVERAGE
+###############################################################################
+[tool.coverage.run]
+source = ["src"]
+omit = ["*/tests/*", "*/__pycache__/*", "*/site-packages/*"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+    "@abstractmethod",
+]

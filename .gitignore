@@ -1,0 +1,60 @@
+# ---------------------------
+# Editor / IDE
+# ---------------------------
+.vscode/
+.idea/
+*.code-workspace
+
+# ---------------------------
+# Python bytecode / cache
+# ---------------------------
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# ---------------------------
+# Virtual environments
+# ---------------------------
+.venv/
+venv/
+env/
+ENV/
+
+# ---------------------------
+# Build / packaging artifacts
+# ---------------------------
+build/
+dist/
+*.egg-info/
+.eggs/
+.wheelhouse/
+
+# ---------------------------
+# Test and tooling caches
+# ---------------------------
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage*
+htmlcov/
+.cache/
+
+# ---------------------------
+# OS / misc cruft
+# ---------------------------
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# ---------------------------
+# Data files (project-specific)
+# ---------------------------
+data/
+*.parquet
+
+# ---------------------------
+# Log files
+# ---------------------------
+*.log

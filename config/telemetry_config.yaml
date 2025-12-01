@@ -1,0 +1,95 @@
+# ============================================================================
+# Fleet Telemetry Integration - Master Configuration
+# ============================================================================
+# This file controls the behavior of the data ingestion pipeline.
+# It is designed to be resilient to network flakiness (Zscaler) and
+# provides clear throttles to prevent hitting API rate limits.
+# ============================================================================
+
+providers:
+  # --------------------------------------------------------------------------
+  # Provider 1: Motive (formerly KeepTruckin)
+  # Docs: https://developer.gomotive.com/
+  # --------------------------------------------------------------------------
+  motive:
+    enabled: true
+    base_url: "https://api.gomotive.com"
+    api_key: ""
+
+    # Timeout Tuple: (Connect Timeout, Read Timeout)
+    # 1. Connect (10s): Time to establish handshake. Fails fast if Zscaler hangs.
+    # 2. Read (30s): Time to wait for the server to send bytes.
+    #    Motive reports can be slow to generate; do not lower this below 30s.
+    request_timeout: [10, 30]
+
+    # Retry Logic for network resilience
+    max_retries: 5
+    retry_backoff_factor: 2.0 # Sleep = {backoff factor} * (2 ** ({number of total retries} - 1))
+
+    # SSL Verification
+    # Set to 'true' for standard security.
+    # If Zscaler creates SSL errors, set this to the string path of your custom CA Bundle (.pem file).
+    # Example: 'C:/Users/ajordan/certs/zscaler_root.pem'
+    verify_ssl: true
+
+    # Client-side throttling (Self-imposed speed limit)
+    # Motive allows ~100/min. We set 10/sec (600/min) loosely here,
+    # but the pipeline delay controls the real pace.
+    rate_limit_requests_per_second: 10
+
+  # --------------------------------------------------------------------------
+  # Provider 2: Samsara
+  # Docs: https://developers.samsara.com/
+  # --------------------------------------------------------------------------
+  samsara:
+    enabled: true
+    base_url: "https://api.samsara.com"
+    api_key: ""
+
+    # Samsara endpoints are generally faster than Motive, but we keep
+    # the same robust timeout settings for consistency.
+    request_timeout: [10, 30]
+    max_retries: 5
+    retry_backoff_factor: 2.0
+    verify_ssl: true
+
+    # Samsara rate limits are higher, but we stay conservative.
+    rate_limit_requests_per_second: 5
+
+# ============================================================================
+# Pipeline Orchestration
+# ============================================================================
+pipeline:
+  # The absolute beginning of the dataset for historical backfills.
+  default_start_date: "2024-01-01"
+
+  # How many days back to re-fetch to catch late-arriving logs/edits.
+  # Drivers have up to 14 days to certify logs, so 7-14 is a safe window.
+  lookback_days: 7
+
+  # Global throttle between HTTP requests to be a "good citizen"
+  # and prevent triggering accidental DDoS protection.
+  request_delay_seconds: 0.5
+
+  # Use truststore in a Windows environment for certificate verification
+  use_truststore: false
+
+# ============================================================================
+# Storage Settings
+# ============================================================================
+storage:
+  # Main landing zone for raw telemetry data.
+  # This folder will be created if it does not exist.
+  parquet_path: "data/fleet_telemetry.parquet"
+
+  # 'snappy' is the default for Parquet. fast read/write, moderate compression.
+  # Use 'gzip' if disk space is critical, but it is slower to write.
+  parquet_compression: "snappy"
+
+# ============================================================================
+# Logging Configuration
+# ============================================================================
+logging:
+  file_path: "logs/fleet_telemetry.log"
+  console_level: "INFO" # What you see in the terminal (Progress bars, milestones)
+  file_level: "DEBUG" # What gets saved to disk (Full payloads, retry attempts)
