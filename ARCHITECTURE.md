@@ -104,9 +104,9 @@ with TelemetryClient(credentials) as client:
 **Purpose**: String-based endpoint discovery and lookup across all providers.
 
 ```python
-from fleet_telemetry_hub import get_registry
+from fleet_telemetry_hub import EndpointRegistry
 
-registry = get_registry()
+registry = EndpointRegistry.instance()
 
 # Discover what's available
 print(registry.list_providers())           # ['motive', 'samsara']
@@ -457,9 +457,9 @@ with motive.client() as client:
 ### Pattern 3: Dynamic Endpoint Selection
 
 ```python
-from fleet_telemetry_hub import get_registry
+from fleet_telemetry_hub import EndpointRegistry
 
-registry = get_registry()
+registry = EndpointRegistry.instance()
 config = get_user_config()  # From CLI args, config file, etc.
 
 provider_name = config['provider']

@@ -76,11 +76,11 @@ def test_layer_3_registry() -> None:
     """Test Layer 3: Endpoint Registry."""
     print('\n=== Testing Layer 3: Endpoint Registry ===')
 
-    from fleet_telemetry_hub import EndpointRegistry, get_registry
+    from fleet_telemetry_hub import EndpointRegistry
 
-    # Test global registry
-    registry = get_registry()
-    print(f'✓ Got global registry')
+    # Test shared registry instance
+    registry = EndpointRegistry.instance()
+    print(f'✓ Got shared registry instance')
 
     # List providers
     providers = registry.list_providers()

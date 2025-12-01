@@ -47,7 +47,6 @@ from .registry import (
     EndpointNotFoundError,
     EndpointRegistry,
     ProviderNotFoundError,
-    get_registry,
 )
 
 __all__: list[str] = [
@@ -82,7 +81,6 @@ __all__: list[str] = [
     'TelemetryConfig',
     # Version
     '__version__',
-    'get_registry',
     # Configuration
     'load_config',
 ]

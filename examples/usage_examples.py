@@ -63,11 +63,11 @@ def example_2_registry_access() -> None:
     """
     from fleet_telemetry_hub.client import TelemetryClient
     from fleet_telemetry_hub.models.shared_response_models import ProviderCredentials
-    from fleet_telemetry_hub.registry import get_registry
+    from fleet_telemetry_hub import EndpointRegistry
     from pydantic import SecretStr
 
-    # Get global registry
-    registry = get_registry()
+    # Get shared registry instance
+    registry = EndpointRegistry.instance()
 
     # Discover available endpoints
     print('Available providers:', registry.list_providers())
@@ -96,9 +96,9 @@ def example_2_registry_access() -> None:
 
 def example_2b_registry_introspection() -> None:
     """Discover and explore endpoints programmatically."""
-    from fleet_telemetry_hub.registry import get_registry
+    from fleet_telemetry_hub import EndpointRegistry
 
-    registry = get_registry()
+    registry = EndpointRegistry.instance()
 
     # Generate full documentation
     print(registry.describe())
@@ -227,9 +227,10 @@ def example_6_error_handling() -> None:
     """Proper error handling for API operations."""
     from fleet_telemetry_hub.client import APIError, RateLimitError, TelemetryClient
     from fleet_telemetry_hub.models.shared_response_models import ProviderCredentials
-    from fleet_telemetry_hub.registry import EndpointNotFoundError, get_registry
+    from fleet_telemetry_hub import EndpointRegistry
+    from fleet_telemetry_hub.registry import EndpointNotFoundError
 
-    registry = get_registry()
+    registry = EndpointRegistry.instance()
     credentials = ProviderCredentials(
         base_url='https://api.gomotive.com',
         api_key=SecretStr('your-api-key-here'),
