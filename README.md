@@ -185,6 +185,36 @@ for page in client.fetch_all_pages(endpoint):
     process_batch(page.items)
 ```
 
+### DataFrame Export
+
+Convert API data to pandas DataFrame for analysis:
+
+```python
+from fleet_telemetry_hub import Provider
+from fleet_telemetry_hub.config.loader import load_config
+
+config = load_config("config.yaml")
+motive = Provider.from_config("motive", config.providers["motive"])
+
+# Get all vehicles as DataFrame
+df = motive.to_dataframe("vehicles")
+print(df.head())
+
+# With parameters
+from datetime import date
+
+locations_df = motive.to_dataframe(
+    "vehicle_locations",
+    vehicle_id=12345,
+    start_date=date(2025, 1, 1),
+)
+
+# Save to various formats
+df.to_parquet("vehicles.parquet", compression="snappy")
+df.to_csv("vehicles.csv", index=False)
+df.to_excel("vehicles.xlsx", index=False)
+```
+
 ### Rate Limiting
 
 Built-in rate limit handling with exponential backoff:
