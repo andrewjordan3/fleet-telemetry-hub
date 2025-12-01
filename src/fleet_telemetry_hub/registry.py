@@ -21,7 +21,7 @@ Example:
 """
 
 import logging
-from typing import Any
+from typing import Any, Literal
 
 from .models.motive_requests import MotiveEndpointDefinition, MotiveEndpoints
 from .models.samsara_requests import SamsaraEndpointDefinition, SamsaraEndpoints
@@ -92,22 +92,22 @@ class EndpointRegistry:
         self,
     ) -> dict[str, MotiveEndpointDefinition[Any, Any]]:
         """Register all Motive endpoints with normalized names."""
-        motive_endpoints = MotiveEndpoints.get_all_endpoints()
+        motive_endpoints: dict[str, MotiveEndpointDefinition[Any, Any]] = (
+            MotiveEndpoints.get_all_endpoints()
+        )
 
         # Normalize names: VEHICLES -> vehicles, VEHICLE_LOCATIONS -> vehicle_locations
-        return {
-            name.lower(): endpoint for name, endpoint in motive_endpoints.items()
-        }
+        return {name.lower(): endpoint for name, endpoint in motive_endpoints.items()}
 
     def _register_samsara_endpoints(
         self,
     ) -> dict[str, SamsaraEndpointDefinition[Any, Any]]:
         """Register all Samsara endpoints with normalized names."""
-        samsara_endpoints = SamsaraEndpoints.get_all_endpoints()
+        samsara_endpoints: dict[str, SamsaraEndpointDefinition[Any, Any]] = (
+            SamsaraEndpoints.get_all_endpoints()
+        )
 
-        return {
-            name.lower(): endpoint for name, endpoint in samsara_endpoints.items()
-        }
+        return {name.lower(): endpoint for name, endpoint in samsara_endpoints.items()}
 
     def get(
         self,
@@ -134,13 +134,15 @@ class EndpointRegistry:
             >>> print(endpoint.description)
             'List all vehicles in the fleet with current driver and device info'
         """
-        provider_lower = provider.lower()
-        endpoint_lower = endpoint_name.lower()
+        provider_lower: str = provider.lower()
+        endpoint_lower: str = endpoint_name.lower()
 
         if provider_lower not in self._registry:
             raise ProviderNotFoundError(provider)
 
-        provider_endpoints = self._registry[provider_lower]
+        provider_endpoints: dict[str, EndpointDefinition[Any, Any]] = self._registry[
+            provider_lower
+        ]
 
         if endpoint_lower not in provider_endpoints:
             raise EndpointNotFoundError(provider, endpoint_name)
@@ -163,8 +165,8 @@ class EndpointRegistry:
             >>> if registry.has("samsara", "drivers"):
             ...     endpoint = registry.get("samsara", "drivers")
         """
-        provider_lower = provider.lower()
-        endpoint_lower = endpoint_name.lower()
+        provider_lower: str = provider.lower()
+        endpoint_lower: str = endpoint_name.lower()
 
         return (
             provider_lower in self._registry
@@ -204,7 +206,7 @@ class EndpointRegistry:
             >>> print(endpoints)
             ['vehicles', 'vehicle_locations', 'groups', 'users']
         """
-        provider_lower = provider.lower()
+        provider_lower: str = provider.lower()
 
         if provider_lower not in self._registry:
             raise ProviderNotFoundError(provider)
@@ -233,7 +235,7 @@ class EndpointRegistry:
             >>> for name, endpoint in motive_endpoints.items():
             ...     print(f"{name}: {endpoint.description}")
         """
-        provider_lower = provider.lower()
+        provider_lower: str = provider.lower()
 
         if provider_lower not in self._registry:
             raise ProviderNotFoundError(provider)
@@ -288,21 +290,25 @@ class EndpointRegistry:
         """
         lines: list[str] = []
 
-        providers = [provider.lower()] if provider else self.list_providers()
+        providers: list[str] = [provider.lower()] if provider else self.list_providers()
 
         for provider_name in providers:
             if provider_name not in self._registry:
                 lines.append(f'Provider: {provider_name} (not found)')
                 continue
 
-            endpoints = self._registry[provider_name]
+            endpoints: dict[str, EndpointDefinition[Any, Any]] = self._registry[
+                provider_name
+            ]
             lines.append(f'\nProvider: {provider_name} ({len(endpoints)} endpoints)')
 
             for endpoint_name, endpoint in sorted(endpoints.items()):
                 # Show path and description
-                path = endpoint.endpoint_path
-                desc = endpoint.description
-                paginated = ' [paginated]' if endpoint.is_paginated else ''
+                path: str = endpoint.endpoint_path
+                desc: str = endpoint.description
+                paginated: Literal[' [paginated]'] | Literal[''] = (
+                    ' [paginated]' if endpoint.is_paginated else ''
+                )
                 lines.append(f'  {endpoint_name}:{paginated}')
                 lines.append(f'    Path: {path}')
                 lines.append(f'    Description: {desc}')
