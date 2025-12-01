@@ -76,6 +76,8 @@ class EndpointRegistry:
         ...         print(f"  - {endpoint_name}: {endpoint.description}")
     """
 
+    _instance: 'EndpointRegistry | None' = None
+
     def __init__(self) -> None:
         """Initialize registry with all known providers and endpoints."""
         self._registry: dict[str, dict[str, EndpointDefinition[Any, Any]]] = {
@@ -87,6 +89,27 @@ class EndpointRegistry:
             f'EndpointRegistry initialized with {self._count_total_endpoints()} '
             f'endpoints across {len(self._registry)} providers'
         )
+
+    @classmethod
+    def instance(cls) -> 'EndpointRegistry':
+        """
+        Get the shared registry instance (singleton pattern).
+
+        This is a convenience method that returns a pre-initialized global
+        registry. You can also create your own instances with EndpointRegistry().
+
+        Returns:
+            The shared EndpointRegistry instance.
+
+        Example:
+            >>> from fleet_telemetry_hub import EndpointRegistry
+            >>>
+            >>> registry = EndpointRegistry.instance()
+            >>> endpoint = registry.get("motive", "vehicles")
+        """
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
 
     def _register_motive_endpoints(
         self,
@@ -312,34 +335,3 @@ class EndpointRegistry:
     def _count_total_endpoints(self) -> int:
         """Count total number of registered endpoints across all providers."""
         return sum(len(endpoints) for endpoints in self._registry.values())
-
-
-# =============================================================================
-# Global Registry Instance (Singleton Pattern)
-# =============================================================================
-
-# Pre-initialized global registry for convenient access
-_global_registry: EndpointRegistry | None = None
-
-
-def get_registry() -> EndpointRegistry:
-    """
-    Get the global endpoint registry instance.
-
-    Uses lazy initialization to create registry on first access.
-
-    Returns:
-        The global EndpointRegistry instance.
-
-    Example:
-        >>> from fleet_telemetry_hub.registry import get_registry
-        >>>
-        >>> registry = get_registry()
-        >>> endpoint = registry.get("motive", "vehicles")
-    """
-    global _global_registry
-
-    if _global_registry is None:
-        _global_registry = EndpointRegistry()
-
-    return _global_registry

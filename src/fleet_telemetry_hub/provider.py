@@ -40,7 +40,7 @@ from .models.shared_response_models import (
     ParsedResponse,
     ProviderCredentials,
 )
-from .registry import EndpointRegistry, get_registry
+from .registry import EndpointRegistry
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -93,7 +93,7 @@ class Provider:
         self.name: str = name.lower()
         self.credentials: ProviderCredentials = credentials
         self.config: TelemetryConfig | None = config
-        self._registry: EndpointRegistry = registry or get_registry()
+        self._registry: EndpointRegistry = registry or EndpointRegistry.instance()
 
         # Validate provider exists in registry
         if self.name not in self._registry.list_providers():
