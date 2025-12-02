@@ -101,8 +101,10 @@ class SamsaraEndpointDefinition(
         }
 
         logger.debug(
-            f'Built Samsara request: {self.http_method.value} {url} '
-            f'params={list(query_params.keys())}'
+            'Built Samsara request: %s %s params=%r',
+            self.http_method.value,
+            url,
+            list(query_params.keys()),
         )
 
         return RequestSpec(
@@ -141,8 +143,10 @@ class SamsaraEndpointDefinition(
         )
 
         logger.debug(
-            f'Parsed {len(items)} items from {self.endpoint_path}, '
-            f'has_more={pagination_state.has_next_page}'
+            'Parsed %d items from %r, has_more=%r',
+            len(items),
+            self.endpoint_path,
+            pagination_state.has_next_page,
         )
 
         return ParsedResponse(
@@ -174,7 +178,8 @@ class SamsaraEndpointDefinition(
 
         if pagination_info is None:
             logger.warning(
-                f'Expected pagination metadata for {self.endpoint_path} but found none'
+                'Expected pagination metadata for %s but found none',
+                self.endpoint_path,
             )
             return PaginationState.finished()
 

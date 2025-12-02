@@ -16,6 +16,7 @@ Key Components:
 
 import logging
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from datetime import date, datetime
 from enum import Enum
 from typing import Any, Generic, TypeVar
@@ -406,28 +407,48 @@ class EndpointDefinition(ABC, BaseModel, Generic[ResponseModelT, ItemT]):
         Returns:
             String representation suitable for URL/query string.
         """
-        formatted_value: str
-        if parameter_type == ParameterType.DATE:
-            if isinstance(value, date):
-                formatted_value = value.isoformat()
-            formatted_value = str(value)
+        # Dispatch table maps parameter types to handler methods
+        handler_map: dict[ParameterType, Callable[[Any], str]] = {
+            ParameterType.DATE: self._serialize_date,
+            ParameterType.DATETIME: self._serialize_datetime,
+            ParameterType.BOOLEAN: self._serialize_boolean,
+            ParameterType.STRING_LIST: self._serialize_string_list,
+        }
 
-        if parameter_type == ParameterType.DATETIME:
-            if isinstance(value, datetime):
-                formatted_value = value.isoformat()
-            formatted_value = str(value)
+        # Use handler if registered, otherwise default to string conversion
+        handler: Callable[[Any], str] = handler_map.get(parameter_type, str)
+        formatted_value: str = handler(value)
 
-        if parameter_type == ParameterType.BOOLEAN:
-            formatted_value = 'true' if value else 'false'
-
-        if parameter_type == ParameterType.STRING_LIST:
-            if isinstance(value, (list, tuple)):
-                formatted_value = ','.join(str(v) for v in value)  # pyright: ignore[reportUnknownVariableType]
-            formatted_value = str(value)
-
-        formatted_value = str(value)
+        logger.debug(
+            'Serialized parameter: type=%s, input=%r, output=%r',
+            parameter_type.value,  # Use .value for Enum
+            value,
+            formatted_value,
+        )
 
         return formatted_value
+
+
+    def _serialize_date(self, value: Any) -> str:
+        """Serialize date values to ISO format string."""
+        return value.isoformat() if isinstance(value, date) else str(value)
+
+
+    def _serialize_datetime(self, value: Any) -> str:
+        """Serialize datetime values to ISO format string."""
+        return value.isoformat() if isinstance(value, datetime) else str(value)
+
+
+    def _serialize_boolean(self, value: Any) -> str:
+        """Serialize boolean values to lowercase string literals."""
+        return 'true' if value else 'false'
+
+
+    def _serialize_string_list(self, value: Any) -> str:
+        """Serialize list/tuple values to comma-separated string."""
+        if isinstance(value, (list, tuple)):
+            return ','.join(str(v) for v in value)  # pyright: ignore[reportUnknownVariableType]
+        return str(value)
 
     # -------------------------------------------------------------------------
     # Response Parsing (Abstract - Provider-Specific)

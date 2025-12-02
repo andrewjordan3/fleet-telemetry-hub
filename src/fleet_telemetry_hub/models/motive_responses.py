@@ -328,7 +328,7 @@ class Vehicle(ResponseModelBase):
         try:
             return FuelType(fuel_type_value.lower())
         except ValueError:
-            logger.warning(f'Unknown fuel type encountered: {fuel_type_value}')
+            logger.warning('Unknown fuel type encountered: %s', fuel_type_value)
             return None
 
     @property

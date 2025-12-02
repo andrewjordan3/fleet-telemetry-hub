@@ -118,8 +118,14 @@ select = [
     "C4",  # flake8-comprehensions
     "DTZ", # flake8-datetimez
     "T10", # flake8-debugger
+    "SIM", # flake8-simplify
+    "PTH", # flake8-use-pathlib
     "PL",  # pylint
     "RUF", # ruff-specific rules
+    "PGH", # pygrep-hooks (requires error code for type ignores)
+    "G",   # flake8-logging-format (Enforces lazy logging %s over f-strings)
+    "N",   # pep8-naming
+    "PT",  # flake8-pytest-style (Test suite consistency)
 ]
 
 ignore = [

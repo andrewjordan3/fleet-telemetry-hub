@@ -576,7 +576,7 @@ class EngineStateRecord(SamsaraModelBase):
             for state in EngineState:
                 if state.value.lower() == value.lower():
                     return state
-            logger.warning(f'Unknown engine state: {value}')
+            logger.warning('Unknown engine state: %r', value)
             raise ValueError(f'Unknown engine state: {value}') from None
 
 
