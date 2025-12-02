@@ -42,6 +42,9 @@ from .models.shared_response_models import (
     ParsedResponse,
     ProviderCredentials,
 )
+
+# Pipeline
+from .pipeline import create_vehicle_data_pipeline
 from .provider import Provider, ProviderManager
 from .registry import (
     EndpointNotFoundError,
@@ -83,4 +86,6 @@ __all__: list[str] = [
     '__version__',
     # Configuration
     'load_config',
+    # Pipeline
+    'create_vehicle_data_pipeline',
 ]
