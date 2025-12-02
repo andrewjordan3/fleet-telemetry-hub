@@ -428,21 +428,17 @@ class EndpointDefinition(ABC, BaseModel, Generic[ResponseModelT, ItemT]):
 
         return formatted_value
 
-
     def _serialize_date(self, value: Any) -> str:
         """Serialize date values to ISO format string."""
         return value.isoformat() if isinstance(value, date) else str(value)
-
 
     def _serialize_datetime(self, value: Any) -> str:
         """Serialize datetime values to ISO format string."""
         return value.isoformat() if isinstance(value, datetime) else str(value)
 
-
     def _serialize_boolean(self, value: Any) -> str:
         """Serialize boolean values to lowercase string literals."""
         return 'true' if value else 'false'
-
 
     def _serialize_string_list(self, value: Any) -> str:
         """Serialize list/tuple values to comma-separated string."""

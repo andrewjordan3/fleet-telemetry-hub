@@ -54,6 +54,21 @@ class HarshAccelerationSettingType(str, Enum):
     OFF = 'off'
 
 
+class AssignmentType(str, Enum):
+    """Driver-vehicle assignment type."""
+
+    HOS = 'HOS'  # Hours of Service assignment
+    DISPATCH = 'Dispatch'  # Dispatch assignment
+    MANUAL = 'Manual'  # Manual assignment
+
+
+class FilterBy(str, Enum):
+    """Filter mode for driver-vehicle assignments."""
+
+    VEHICLES = 'vehicles'
+    DRIVERS = 'drivers'
+
+
 # =============================================================================
 # Base Configuration
 # =============================================================================
@@ -322,6 +337,42 @@ class Geofence(SamsaraModelBase):
     settings: GeofenceSettings | None = None
 
 
+class AssignmentDriverReference(SamsaraModelBase):
+    """
+    Driver reference in assignment record.
+
+    Attributes:
+        driver_id: Samsara's internal driver identifier.
+        name: Driver's full name.
+    """
+
+    driver_id: str = Field(alias='id')
+    name: str
+
+
+class AssignmentVehicleReference(SamsaraModelBase):
+    """
+    Vehicle reference in assignment record with external IDs.
+
+    Attributes:
+        vehicle_id: Samsara's internal vehicle identifier.
+        name: Vehicle display name.
+        external_ids: External system identifiers (includes VIN).
+    """
+
+    vehicle_id: str = Field(alias='id')
+    name: str
+    external_ids: dict[str, str] = Field(default_factory=dict, alias='externalIds')
+
+    def get_vin(self) -> str | None:
+        """Extract VIN from external IDs if present."""
+        return self.external_ids.get('samsara.vin')
+
+    def get_serial(self) -> str | None:
+        """Extract device serial from external IDs if present."""
+        return self.external_ids.get('samsara.serial')
+
+
 # =============================================================================
 # Primary Entity Models
 # =============================================================================
@@ -545,6 +596,59 @@ class SamsaraAddress(SamsaraModelBase):
     def has_geofence(self) -> bool:
         """Check if address has a geofence defined."""
         return self.geofence is not None and self.geofence.polygon is not None
+
+
+class DriverVehicleAssignment(SamsaraModelBase):
+    """
+    Driver-vehicle assignment record from Samsara.
+
+    Represents a time period when a specific driver was assigned to a vehicle.
+    Used for correlating driver identity with GPS/telemetry data.
+
+    Attributes:
+        start_time: When assignment started (driver logged into vehicle).
+        end_time: When assignment ended (driver logged out).
+        is_passenger: Whether driver was logged in as passenger (not primary operator).
+        assigned_at_time: Administrative assignment timestamp (may be empty for HOS).
+        assignment_type: How assignment was created (HOS, Dispatch, Manual).
+        driver: Driver who was assigned.
+        vehicle: Vehicle that was assigned.
+    """
+
+    start_time: datetime = Field(alias='startTime')
+    end_time: datetime = Field(alias='endTime')
+    is_passenger: bool = Field(alias='isPassenger')
+    assigned_at_time: str | None = Field(default=None, alias='assignedAtTime')
+    assignment_type: AssignmentType = Field(alias='assignmentType')
+    driver: AssignmentDriverReference
+    vehicle: AssignmentVehicleReference
+
+    @property
+    def duration_seconds(self) -> float:
+        """Calculate assignment duration in seconds."""
+        return (self.end_time - self.start_time).total_seconds()
+
+    @property
+    def duration_hours(self) -> float:
+        """Calculate assignment duration in hours."""
+        return self.duration_seconds / 3600.0
+
+    @property
+    def vin(self) -> str | None:
+        """Get vehicle VIN if available."""
+        return self.vehicle.get_vin()
+
+    def contains_timestamp(self, timestamp: datetime) -> bool:
+        """
+        Check if a timestamp falls within this assignment period.
+
+        Args:
+            timestamp: Timestamp to check.
+
+        Returns:
+            True if timestamp is between start_time and end_time (inclusive).
+        """
+        return self.start_time <= timestamp <= self.end_time
 
 
 # =============================================================================
@@ -808,3 +912,72 @@ class LocationStreamResponse(SamsaraModelBase):
     def get_items(self) -> list[LocationStreamRecord]:
         """Extract location records list (uniform interface method)."""
         return self.data
+
+
+class DriverVehicleAssignmentsResponse(SamsaraModelBase):
+    """
+    Complete response from GET /fleet/driver-vehicle-assignments.
+
+    Attributes:
+        data: List of driver-vehicle assignment records.
+        pagination: Cursor-based pagination metadata.
+    """
+
+    data: list[DriverVehicleAssignment]
+    pagination: SamsaraPaginationInfo | None = None
+
+    def get_items(self) -> list[DriverVehicleAssignment]:
+        """Extract assignment list (uniform interface method)."""
+        return self.data
+
+    def get_assignments_for_vehicle(
+        self, vehicle_id: str
+    ) -> list[DriverVehicleAssignment]:
+        """
+        Filter assignments for a specific vehicle.
+
+        Args:
+            vehicle_id: Samsara vehicle ID to filter by.
+
+        Returns:
+            List of assignments for the specified vehicle.
+        """
+        return [a for a in self.data if a.vehicle.vehicle_id == vehicle_id]
+
+    def get_assignments_for_driver(
+        self, driver_id: str
+    ) -> list[DriverVehicleAssignment]:
+        """
+        Filter assignments for a specific driver.
+
+        Args:
+            driver_id: Samsara driver ID to filter by.
+
+        Returns:
+            List of assignments for the specified driver.
+        """
+        return [a for a in self.data if a.driver.driver_id == driver_id]
+
+    def find_driver_at_timestamp(
+        self,
+        vehicle_id: str,
+        timestamp: datetime,
+    ) -> str | None:
+        """
+        Find which driver was operating a vehicle at a specific timestamp.
+
+        Args:
+            vehicle_id: Samsara vehicle ID to check.
+            timestamp: Timestamp to query.
+
+        Returns:
+            Driver name if an assignment covers the timestamp, else None.
+        """
+        for assignment in self.data:
+            if (
+                assignment.vehicle.vehicle_id == vehicle_id
+                and assignment.contains_timestamp(timestamp)
+                and not assignment.is_passenger
+            ):
+                return assignment.driver.name
+        return None

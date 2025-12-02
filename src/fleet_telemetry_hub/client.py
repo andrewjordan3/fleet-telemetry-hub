@@ -120,7 +120,7 @@ class TelemetryClient:
             logger.debug('Using truststore for credential verification.')
         else:
             ssl_verify = self._credentials.verify_ssl
-            logger.debug(f'Using "{ssl_verify}" for credential verification.')
+            logger.debug('Using %r for credential verification.', ssl_verify)
 
         self._http_client: httpx.Client = httpx.Client(
             timeout=httpx.Timeout(
@@ -136,7 +136,7 @@ class TelemetryClient:
             ),
         )
 
-        logger.info(f'Initialized TelemetryClient for {credentials.base_url}.')
+        logger.info('Initialized TelemetryClient for %r.', credentials.base_url)
 
     def close(self) -> None:
         """Close HTTP client and release resources."""
@@ -232,16 +232,20 @@ class TelemetryClient:
             total_items += response.item_count
 
             logger.debug(
-                f'Page {page_count}: retrieved {response.item_count} items '
-                f'(total: {total_items})'
+                'Page %d: retrieved %d items (total: %d)',
+                page_count,
+                response.item_count,
+                total_items,
             )
 
             yield from response.items
 
             if not response.has_more:
                 logger.info(
-                    f'Completed fetching {endpoint.endpoint_path}: '
-                    f'{total_items} items across {page_count} pages'
+                    'Completed fetching %r: %d items across %d pages',
+                    endpoint.endpoint_path,
+                    total_items,
+                    page_count,
                 )
                 break
 
@@ -289,7 +293,9 @@ class TelemetryClient:
 
             if not response.has_more:
                 logger.info(
-                    f'Completed {page_count} pages from {endpoint.endpoint_path}'
+                    'Completed %d pages from %r',
+                    page_count,
+                    endpoint.endpoint_path,
                 )
                 break
 
@@ -351,8 +357,9 @@ class TelemetryClient:
 
         if not items:
             logger.warning(
-                f'No items found for endpoint {endpoint.endpoint_path} '
-                f'with params {params}'
+                'No items found for endpoint %r with params %r',
+                endpoint.endpoint_path,
+                params,
             )
             return pd.DataFrame()
 
@@ -366,8 +373,10 @@ class TelemetryClient:
         df = pd.DataFrame(data)
 
         logger.info(
-            f'Created DataFrame from {len(items)} items from {endpoint.endpoint_path} '
-            f'with {len(df.columns)} columns'
+            'Created DataFrame from %d items from %r with %d columns',
+            len(items),
+            endpoint.endpoint_path,
+            len(df.columns),
         )
 
         return df
@@ -405,8 +414,10 @@ class TelemetryClient:
         Uses tenacity for exponential backoff retry logic.
         """
         logger.debug(
-            f'{request_spec.method.value} {request_spec.url} '
-            f'params={list(request_spec.query_params.keys())}'
+            '%s %r params=%r',
+            request_spec.method.value,
+            request_spec.url,
+            list(request_spec.query_params.keys()),
         )
 
         try:
@@ -427,10 +438,14 @@ class TelemetryClient:
                 timeout=timeout,
             )
         except httpx.TimeoutException as error:
-            logger.error(f'Request timeout: {request_spec.url}')
+            logger.error('Request timeout: %s', request_spec.url)
             raise APIError(f'Request timeout: {error}') from error
         except httpx.RequestError as error:
-            logger.error(f'Request failed: {request_spec.url} - {error}')
+            logger.error(
+                'Request failed: %s - %r',
+                request_spec.url,
+                error,
+            )
             raise APIError(f'Request failed: {error}') from error
 
         # Handle rate limiting
@@ -439,14 +454,15 @@ class TelemetryClient:
                 dict(response.headers)
             )
             logger.warning(
-                f'Rate limited, retry after {rate_limit_info.retry_after_seconds}s '
-                f'(remaining: {rate_limit_info.remaining})'
+                'Rate limited, retry after %.2fs (remaining: %d)',
+                rate_limit_info.retry_after_seconds,
+                rate_limit_info.remaining,
             )
             raise RateLimitError(rate_limit_info)
 
         # Handle other errors
         if not response.is_success:
-            logger.error(f'API error {response.status_code}: {response.text[:500]}')
+            logger.error('API error %d: %r', response.status_code, response.text[:500])
             raise APIError(
                 message=f'API returned {response.status_code}',
                 status_code=response.status_code,

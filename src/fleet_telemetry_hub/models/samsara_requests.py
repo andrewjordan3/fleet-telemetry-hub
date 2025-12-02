@@ -9,6 +9,8 @@ from pydantic import ConfigDict, Field
 from .samsara_responses import (
     AddressesResponse,
     DriversResponse,
+    DriverVehicleAssignment,
+    DriverVehicleAssignmentsResponse,
     LocationStreamRecord,
     LocationStreamResponse,
     SamsaraAddress,
@@ -355,6 +357,55 @@ class SamsaraEndpoints:
         ),
         is_paginated=True,
         response_model=LocationStreamResponse,
+        item_extractor_method='get_items',
+    )
+
+    DRIVER_VEHICLE_ASSIGNMENTS: SamsaraEndpointDefinition[
+        DriverVehicleAssignmentsResponse,
+        DriverVehicleAssignment,
+    ] = SamsaraEndpointDefinition(
+        endpoint_path='/fleet/driver-vehicle-assignments',
+        http_method=HTTPMethod.GET,
+        description='Get driver-vehicle assignments for a time period to correlate drivers with GPS data',
+        query_parameters=(
+            QueryParameterSpec(
+                name='filter_by',
+                parameter_type=ParameterType.STRING,
+                required=True,
+                api_name='filterBy',
+                description='Filter mode: "vehicles" or "drivers"',
+            ),
+            QueryParameterSpec(
+                name='start_time',
+                parameter_type=ParameterType.DATETIME,
+                required=True,
+                api_name='startTime',
+                description='Start of time range (ISO-8601 UTC)',
+            ),
+            QueryParameterSpec(
+                name='end_time',
+                parameter_type=ParameterType.DATETIME,
+                required=True,
+                api_name='endTime',
+                description='End of time range (ISO-8601 UTC)',
+            ),
+            QueryParameterSpec(
+                name='vehicle_ids',
+                parameter_type=ParameterType.STRING_LIST,
+                required=False,
+                api_name='vehicleIds',
+                description='Comma-separated vehicle IDs (required if filterBy=vehicles)',
+            ),
+            QueryParameterSpec(
+                name='driver_ids',
+                parameter_type=ParameterType.STRING_LIST,
+                required=False,
+                api_name='driverIds',
+                description='Comma-separated driver IDs (required if filterBy=drivers)',
+            ),
+        ),
+        is_paginated=True,
+        response_model=DriverVehicleAssignmentsResponse,
         item_extractor_method='get_items',
     )
 

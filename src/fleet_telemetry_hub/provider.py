@@ -103,7 +103,7 @@ class Provider:
                 f'Available providers: {available}'
             )
 
-        logger.info(f"Initialized Provider facade for '{self.name}'")
+        logger.info('Initialized Provider facade for %r', self.name)
 
     @classmethod
     def from_config(
@@ -134,7 +134,7 @@ class Provider:
         """
         provider_config: ProviderConfig | None = config.providers.get(provider_name)
         if not provider_config:
-            logger.error(f'No configuration found for provider {provider_name}.')
+            logger.error('No configuration found for provider %r.', provider_name)
             raise NotImplementedError
 
         credentials = ProviderCredentials(
@@ -381,7 +381,7 @@ class Provider:
 
         if not items:
             logger.warning(
-                f'No items found for endpoint "{endpoint_name}" with params {params}'
+                'No items found for endpoint %r with params %r', endpoint_name, params
             )
             return pd.DataFrame()
 
@@ -395,7 +395,9 @@ class Provider:
         df = pd.DataFrame(data)
 
         logger.info(
-            f'Created DataFrame from {len(items)} items with {len(df.columns)} columns'
+            'Created DataFrame from %d items with %d columns',
+            len(items),
+            len(df.columns),
         )
 
         return df
@@ -491,8 +493,9 @@ class ProviderManager:
         self._providers: dict[str, Provider] = providers
 
         logger.info(
-            f'ProviderManager initialized with {len(providers)} provider(s): '
-            f'{", ".join(providers.keys())}'
+            'ProviderManager initialized with %d provider(s): %r',
+            len(providers),
+            ', '.join(providers.keys()),
         )
 
     @classmethod
@@ -528,9 +531,9 @@ class ProviderManager:
                     config,
                     registry,
                 )
-                logger.info(f'Loaded provider: {provider_name}')
+                logger.info('Loaded provider: %r', provider_name)
             else:
-                logger.info(f'Skipped disabled provider: {provider_name}')
+                logger.info('Skipped disabled provider: %r', provider_name)
 
         return cls(providers)
 

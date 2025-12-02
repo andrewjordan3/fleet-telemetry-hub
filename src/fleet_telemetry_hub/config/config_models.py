@@ -271,5 +271,5 @@ class TelemetryConfig(BaseModel):
         if not enabled_providers:
             raise ValueError('At least one provider must be enabled')
 
-        logger.debug(f'Enabled providers: {", ".join(enabled_providers)}')
+        logger.debug('Enabled providers: %r', ', '.join(enabled_providers))
         return self

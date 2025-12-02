@@ -120,8 +120,10 @@ class MotiveEndpointDefinition(
         }
 
         logger.debug(
-            f'Built Motive request: {self.http_method.value} {url} '
-            f'params={list(query_params.keys())}'
+            'Built Motive request: %s %r params=%r',
+            self.http_method.value,
+            url,
+            list(query_params.keys()),
         )
 
         return RequestSpec(
@@ -160,8 +162,10 @@ class MotiveEndpointDefinition(
         )
 
         logger.debug(
-            f'Parsed {len(items)} items from {self.endpoint_path}, '
-            f'has_more={pagination_state.has_next_page}'
+            'Parsed %d items from %r, has_more=%r',
+            len(items),
+            self.endpoint_path,
+            pagination_state.has_next_page,
         )
 
         return ParsedResponse(
@@ -193,7 +197,8 @@ class MotiveEndpointDefinition(
 
         if pagination_info is None:
             logger.warning(
-                f'Expected pagination metadata for {self.endpoint_path} but found none'
+                'Expected pagination metadata for %r but found none',
+                self.endpoint_path,
             )
             return PaginationState.finished()
 

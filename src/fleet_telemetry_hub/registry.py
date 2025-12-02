@@ -86,8 +86,9 @@ class EndpointRegistry:
         }
 
         logger.info(
-            f'EndpointRegistry initialized with {self._count_total_endpoints()} '
-            f'endpoints across {len(self._registry)} providers'
+            'EndpointRegistry initialized with %d endpoints across %d providers',
+            self._count_total_endpoints(),
+            len(self._registry),
         )
 
     @classmethod

@@ -62,7 +62,7 @@ def load_config(config_path: Path | str | None = None) -> TelemetryConfig:
     else:
         config_path = Path(config_path)
 
-    logger.info(f'Loading telemetry configuration from: {config_path}')
+    logger.info('Loading telemetry configuration from: %s', config_path)
 
     # Check file existence
     if not config_path.exists():
@@ -72,7 +72,7 @@ def load_config(config_path: Path | str | None = None) -> TelemetryConfig:
 
     # Parse YAML
     try:
-        with open(config_path, encoding='utf-8') as config_file:
+        with Path.open(config_path, encoding='utf-8') as config_file:
             raw_config_data = yaml.safe_load(config_file)
     except yaml.YAMLError as error:
         error_message = f'Failed to parse YAML configuration: {error}'
