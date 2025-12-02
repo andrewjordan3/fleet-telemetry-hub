@@ -26,7 +26,7 @@ from .motive_responses import (
     VehicleLocationsResponse,
     VehiclesResponse,
 )
-from .shared_request_models import HTTPMethod
+from .shared_request_models import HTTPMethod, RequestSpec
 from .shared_response_models import (
     EndpointDefinition,
     ItemT,
@@ -36,7 +36,6 @@ from .shared_response_models import (
     PathParameterSpec,
     ProviderCredentials,
     QueryParameterSpec,
-    RequestSpec,
     ResponseModelT,
 )
 

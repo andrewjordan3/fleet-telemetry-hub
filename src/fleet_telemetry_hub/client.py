@@ -136,9 +136,7 @@ class TelemetryClient:
             ),
         )
 
-        logger.info(
-            f'Initialized TelemetryClient for {credentials.base_url}.'
-        )
+        logger.info(f'Initialized TelemetryClient for {credentials.base_url}.')
 
     def close(self) -> None:
         """Close HTTP client and release resources."""

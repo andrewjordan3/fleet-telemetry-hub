@@ -7,6 +7,17 @@ from low-level to high-level abstractions.
 """
 
 from datetime import date, datetime
+from typing import Any
+
+from fleet_telemetry_hub.config.config_models import TelemetryConfig
+from fleet_telemetry_hub.models.motive_requests import MotiveEndpointDefinition
+from fleet_telemetry_hub.models.motive_responses import Vehicle, VehiclesResponse
+from fleet_telemetry_hub.models.shared_response_models import (
+    EndpointDefinition,
+    ParsedResponse,
+)
+from fleet_telemetry_hub.provider import Provider, ProviderManager
+from fleet_telemetry_hub.registry import EndpointRegistry
 
 # =============================================================================
 # Level 1: Direct Endpoint Usage (Most Control)
@@ -20,10 +31,11 @@ def example_1_direct_endpoint_usage() -> None:
     Use this when you need maximum control or are working with
     a single endpoint repeatedly.
     """
+    from pydantic import SecretStr
+
     from fleet_telemetry_hub.client import TelemetryClient
     from fleet_telemetry_hub.models.motive_requests import MotiveEndpoints
     from fleet_telemetry_hub.models.shared_response_models import ProviderCredentials
-    from pydantic import SecretStr
 
     # Create credentials
     credentials = ProviderCredentials(
@@ -36,12 +48,14 @@ def example_1_direct_endpoint_usage() -> None:
     )
 
     # Get endpoint definition
-    vehicles_endpoint = MotiveEndpoints.VEHICLES
+    vehicles_endpoint: MotiveEndpointDefinition[VehiclesResponse, Vehicle] = (
+        MotiveEndpoints.VEHICLES
+    )
 
     # Create client and fetch
     with TelemetryClient(credentials) as client:
         # Fetch single page
-        response = client.fetch(vehicles_endpoint)
+        response: ParsedResponse[Vehicle] = client.fetch(vehicles_endpoint)
         print(f'Found {response.item_count} vehicles on page 1')
 
         # Or fetch all items across all pages
@@ -61,21 +75,22 @@ def example_2_registry_access() -> None:
     Use this when you need to select endpoints at runtime
     based on string names (e.g., from config or user input).
     """
-    from fleet_telemetry_hub.client import TelemetryClient
-    from fleet_telemetry_hub.models.shared_response_models import ProviderCredentials
-    from fleet_telemetry_hub import EndpointRegistry
     from pydantic import SecretStr
 
+    from fleet_telemetry_hub import EndpointRegistry
+    from fleet_telemetry_hub.client import TelemetryClient
+    from fleet_telemetry_hub.models.shared_response_models import ProviderCredentials
+
     # Get shared registry instance
-    registry = EndpointRegistry.instance()
+    registry: EndpointRegistry = EndpointRegistry.instance()
 
     # Discover available endpoints
     print('Available providers:', registry.list_providers())
     print('Motive endpoints:', registry.list_endpoints('motive'))
 
     # Get endpoint by string name
-    vehicles_endpoint = registry.get('motive', 'vehicles')
-    groups_endpoint = registry.get('motive', 'groups')
+    vehicles_endpoint: EndpointDefinition[Any, Any] = registry.get('motive', 'vehicles')
+    groups_endpoint: EndpointDefinition[Any, Any] = registry.get('motive', 'groups')
 
     # Create credentials
     credentials = ProviderCredentials(
@@ -98,18 +113,18 @@ def example_2b_registry_introspection() -> None:
     """Discover and explore endpoints programmatically."""
     from fleet_telemetry_hub import EndpointRegistry
 
-    registry = EndpointRegistry.instance()
+    registry: EndpointRegistry = EndpointRegistry.instance()
 
     # Generate full documentation
     print(registry.describe())
 
     # Find endpoints by path
-    matches = registry.find_by_path('/vehicles')
+    matches: list[tuple[str, str]] = registry.find_by_path('/vehicles')
     print(f'Endpoints with "/vehicles" in path: {matches}')
 
     # Check if endpoint exists before using
     if registry.has('samsara', 'drivers'):
-        endpoint = registry.get('samsara', 'drivers')
+        endpoint: EndpointDefinition[Any, Any] = registry.get('samsara', 'drivers')
         print(f'Found endpoint: {endpoint.description}')
 
 
@@ -129,10 +144,10 @@ def example_3_provider_facade() -> None:
     from fleet_telemetry_hub.provider import Provider
 
     # Load configuration
-    config = load_config('config/telemetry_config.yaml')
+    config: TelemetryConfig = load_config('config/telemetry_config.yaml')
 
     # Create provider from config
-    motive = Provider.from_config('motive', config)
+    motive: Provider = Provider.from_config('motive', config)
 
     # Simple fetch - client managed automatically
     for vehicle in motive.fetch_all('vehicles'):
@@ -145,14 +160,16 @@ def example_3_provider_facade() -> None:
         start_date=date(2025, 1, 1),
         end_date=date(2025, 1, 31),
     ):
-        print(f'Location at {location.recorded_at}: {location.latitude}, {location.longitude}')
+        print(
+            f'Location at {location.recorded_at}: {location.latitude}, {location.longitude}'
+        )
 
     # Or use context manager for multiple operations (better performance)
     with motive.client() as client:
         # Fetch multiple endpoints with same client
-        vehicles = list(client.fetch_all(motive.endpoint('vehicles')))
-        groups = list(client.fetch_all(motive.endpoint('groups')))
-        users = list(client.fetch_all(motive.endpoint('users')))
+        vehicles: list[Any] = list(client.fetch_all(motive.endpoint('vehicles')))
+        groups: list[Any] = list(client.fetch_all(motive.endpoint('groups')))
+        users: list[Any] = list(client.fetch_all(motive.endpoint('users')))
 
     print(f'Fetched {len(vehicles)} vehicles, {len(groups)} groups, {len(users)} users')
 
@@ -169,16 +186,15 @@ def example_4_provider_manager() -> None:
     Use this when working with multiple providers (Motive + Samsara).
     """
     from fleet_telemetry_hub.config.loader import load_config
-    from fleet_telemetry_hub.provider import ProviderManager
 
     # Load configuration
-    config = load_config('config/telemetry_config.yaml')
+    config: TelemetryConfig = load_config('config/telemetry_config.yaml')
 
     # Create manager for all enabled providers
-    manager = ProviderManager.from_config(config)
+    manager: ProviderManager = ProviderManager.from_config(config)
 
     # Access specific provider
-    motive = manager.get('motive')
+    motive: Provider = manager.get('motive')
     for vehicle in motive.fetch_all('vehicles'):
         print(f'Motive: {vehicle.number}')
 
@@ -201,8 +217,8 @@ def example_5_pagination_control() -> None:
     from fleet_telemetry_hub.config.loader import load_config
     from fleet_telemetry_hub.provider import Provider
 
-    config = load_config('config/telemetry_config.yaml')
-    motive = Provider.from_config('motive', config)
+    config: TelemetryConfig = load_config('config/telemetry_config.yaml')
+    motive: Provider = Provider.from_config('motive', config)
 
     # Fetch page by page with progress tracking
     total_items = 0
@@ -211,7 +227,7 @@ def example_5_pagination_control() -> None:
         print(f'Page {page_num}: {page.item_count} items (total so far: {total_items})')
 
         if page.pagination.total_items:
-            progress = (total_items / page.pagination.total_items) * 100
+            progress: float = (total_items / page.pagination.total_items) * 100
             print(f'Progress: {progress:.1f}%')
 
         # Process batch
@@ -225,12 +241,14 @@ def example_5_pagination_control() -> None:
 
 def example_6_error_handling() -> None:
     """Proper error handling for API operations."""
+    from pydantic import SecretStr
+
+    from fleet_telemetry_hub import EndpointRegistry
     from fleet_telemetry_hub.client import APIError, RateLimitError, TelemetryClient
     from fleet_telemetry_hub.models.shared_response_models import ProviderCredentials
-    from fleet_telemetry_hub import EndpointRegistry
     from fleet_telemetry_hub.registry import EndpointNotFoundError
 
-    registry = EndpointRegistry.instance()
+    registry: EndpointRegistry = EndpointRegistry.instance()
     credentials = ProviderCredentials(
         base_url='https://api.gomotive.com',
         api_key=SecretStr('your-api-key-here'),
@@ -247,17 +265,17 @@ def example_6_error_handling() -> None:
             for vehicle in client.fetch_all(endpoint):
                 print(vehicle.number)
 
-    except EndpointNotFoundError as e:
-        print(f'Endpoint not found: {e.provider}/{e.endpoint_name}')
+    except EndpointNotFoundError as exc:
+        print(f'Endpoint not found: {exc.provider}/{exc.endpoint_name}')
 
-    except RateLimitError as e:
-        print(f'Rate limited! Retry after {e.rate_limit_info.retry_after_seconds}s')
-        print(f'Remaining: {e.rate_limit_info.remaining}')
+    except RateLimitError as exc:
+        print(f'Rate limited! Retry after {exc.rate_limit_info.retry_after_seconds}s')
+        print(f'Remaining: {exc.rate_limit_info.remaining}')
 
-    except APIError as e:
-        print(f'API error {e.status_code}: {e}')
-        if e.response_body:
-            print(f'Response: {e.response_body[:500]}')
+    except APIError as exc:
+        print(f'API error {exc.status_code}: {exc}')
+        if exc.response_body:
+            print(f'Response: {exc.response_body[:500]}')
 
 
 def example_7_samsara_specific() -> None:
@@ -265,8 +283,8 @@ def example_7_samsara_specific() -> None:
     from fleet_telemetry_hub.config.loader import load_config
     from fleet_telemetry_hub.provider import Provider
 
-    config = load_config('config/telemetry_config.yaml')
-    samsara = Provider.from_config('samsara', config.providers['samsara'])
+    config: TelemetryConfig = load_config('config/telemetry_config.yaml')
+    samsara: Provider = Provider.from_config('samsara', config)
 
     # Fetch vehicles (cursor-based pagination handled automatically)
     for vehicle in samsara.fetch_all('vehicles'):
@@ -295,45 +313,50 @@ def example_7_samsara_specific() -> None:
 
 def example_8_custom_registry() -> None:
     """Create custom endpoint registry (for testing or extensions)."""
-    from fleet_telemetry_hub.provider import Provider, ProviderManager
-    from fleet_telemetry_hub.registry import EndpointRegistry
+    from fleet_telemetry_hub.config.loader import load_config
+    from fleet_telemetry_hub.provider import Provider
 
     # Create custom registry (useful for testing)
     custom_registry = EndpointRegistry()
 
     # Use with providers
-    from fleet_telemetry_hub.config.loader import load_config
-
-    config = load_config('config/telemetry_config.yaml')
+    config: TelemetryConfig = load_config('config/telemetry_config.yaml')
 
     # Single provider with custom registry
-    motive = Provider.from_config(
+    motive: Provider = Provider.from_config(
         'motive',
-        config.providers['motive'],
+        config,
         registry=custom_registry,
     )
 
     # Or manager with custom registry
-    manager = ProviderManager.from_config(config, registry=custom_registry)
+    manager: ProviderManager = ProviderManager.from_config(
+        config, registry=custom_registry
+    )
+
+    # Demonstrate usage
+    print(f'Custom registry providers: {custom_registry.list_providers()}')
+    print(f'Motive endpoints: {motive.list_endpoints()}')
+    print(f'Manager providers: {list(manager.enabled_providers())}')
 
 
 def example_9_to_dataframe() -> None:
     """Convert API data to pandas DataFrame for analysis."""
+    import pandas as pd
+
     from fleet_telemetry_hub.config.loader import load_config
     from fleet_telemetry_hub.provider import Provider
 
-    config = load_config('config/telemetry_config.yaml')
-    motive = Provider.from_config('motive', config)
+    config: TelemetryConfig = load_config('config/telemetry_config.yaml')
+    motive: Provider = Provider.from_config('motive', config)
 
     # Get all vehicles as DataFrame
-    vehicles_df = motive.to_dataframe('vehicles')
+    vehicles_df: pd.DataFrame = motive.to_dataframe('vehicles')
     print(f'Loaded {len(vehicles_df)} vehicles')
     print(vehicles_df.head())
 
     # Get vehicle locations with parameters
-    from datetime import date
-
-    locations_df = motive.to_dataframe(
+    locations_df: pd.DataFrame = motive.to_dataframe(
         'vehicle_locations',
         vehicle_id=12345,
         start_date=date(2025, 1, 1),
@@ -341,7 +364,7 @@ def example_9_to_dataframe() -> None:
     )
 
     # Analyze data
-    print(f'\nLocation statistics:')
+    print('\nLocation statistics:')
     print(locations_df.describe())
 
     # Save to various formats
@@ -350,21 +373,21 @@ def example_9_to_dataframe() -> None:
     vehicles_df.to_excel('data/vehicles.xlsx', index=False)
 
     # Or work with multiple endpoints
-    import pandas as pd
-
-    vehicles = motive.to_dataframe('vehicles')
-    groups = motive.to_dataframe('groups')
-    users = motive.to_dataframe('users')
+    groups: pd.DataFrame = motive.to_dataframe('groups')
+    users: pd.DataFrame = motive.to_dataframe('users')
 
     # Combine or analyze together
-    print(f'\nDataset summary:')
-    print(f'  Vehicles: {len(vehicles)} rows, {len(vehicles.columns)} columns')
+    print('\nDataset summary:')
+    print(f'  Vehicles: {len(vehicles_df)} rows, {len(vehicles_df.columns)} columns')
     print(f'  Groups: {len(groups)} rows, {len(groups.columns)} columns')
     print(f'  Users: {len(users)} rows, {len(users.columns)} columns')
 
 
 def example_10_dataframe_with_client() -> None:
     """Use to_dataframe with TelemetryClient for lower-level control."""
+    import pandas as pd
+    from pydantic import SecretStr
+
     from fleet_telemetry_hub import TelemetryClient
     from fleet_telemetry_hub.models.motive_requests import MotiveEndpoints
     from fleet_telemetry_hub.models.shared_response_models import ProviderCredentials
@@ -376,13 +399,13 @@ def example_10_dataframe_with_client() -> None:
 
     with TelemetryClient(credentials) as client:
         # Get DataFrame using client
-        df = client.to_dataframe(MotiveEndpoints.VEHICLES)
+        df: pd.DataFrame = client.to_dataframe(MotiveEndpoints.VEHICLES)
         print(f'Fetched {len(df)} vehicles')
 
         # Process multiple endpoints with same client
-        vehicles_df = client.to_dataframe(MotiveEndpoints.VEHICLES)
-        groups_df = client.to_dataframe(MotiveEndpoints.GROUPS)
-        users_df = client.to_dataframe(MotiveEndpoints.USERS)
+        vehicles_df: pd.DataFrame = client.to_dataframe(MotiveEndpoints.VEHICLES)
+        groups_df: pd.DataFrame = client.to_dataframe(MotiveEndpoints.GROUPS)
+        users_df: pd.DataFrame = client.to_dataframe(MotiveEndpoints.USERS)
 
         # Save combined data
         vehicles_df.to_parquet('data/vehicles.parquet')
@@ -418,8 +441,8 @@ def main() -> None:
     from fleet_telemetry_hub.provider import Provider
 
     try:
-        config = load_config('config/telemetry_config.yaml')
-        motive = Provider.from_config('motive', config)
+        config: TelemetryConfig = load_config('config/telemetry_config.yaml')
+        motive: Provider = Provider.from_config('motive', config)
 
         # Show available endpoints
         print(f'Provider: {motive.name}')
@@ -435,8 +458,8 @@ def main() -> None:
 
     except FileNotFoundError:
         print('Config file not found. Please create config/telemetry_config.yaml')
-    except Exception as e:
-        print(f'Error: {e}')
+    except Exception as exc:
+        print(f'Error: {exc}')
 
 
 if __name__ == '__main__':

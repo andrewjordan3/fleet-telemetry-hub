@@ -277,7 +277,7 @@ class Vehicle(ResponseModelBase):
     number: str  # Fleet/unit number
     status: VehicleStatus
     ifta: bool
-    vin: str
+    vin: str | None = None
     make: str | None = None
     model: str | None = None
     year: str | None = None

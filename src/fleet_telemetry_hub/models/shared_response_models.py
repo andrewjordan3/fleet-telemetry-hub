@@ -41,6 +41,7 @@ ItemT = TypeVar('ItemT', bound=BaseModel)
 # Parameter Specifications
 # =============================================================================
 
+
 class ParameterType(str, Enum):
     """Supported parameter types for automatic serialization."""
 
@@ -180,6 +181,7 @@ class ParsedResponse(BaseModel, Generic[ItemT]):
     def has_more(self) -> bool:
         """Whether more pages are available."""
         return self.pagination.has_next_page
+
 
 # =============================================================================
 # Provider Configuration Protocol

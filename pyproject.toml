@@ -104,6 +104,7 @@ exclude = [
     "build",
     "dist",
     "*.egg-info",
+    "examples",
 ]
 
 [tool.ruff.lint]
@@ -155,6 +156,8 @@ warn_unused_ignores = true
 warn_no_return = true
 warn_unreachable = true
 strict_equality = true
+
+exclude = ["examples/"]
 
 # Ignore missing imports for third-party packages without type stubs
 [[tool.mypy.overrides]]

@@ -33,6 +33,7 @@ LogLevelName = Literal['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']
 # Valid compression algorithms supported by pandas.to_parquet()
 CompressionType = Literal['snappy', 'gzip', 'brotli', 'lz4', 'zstd'] | None
 
+
 class ProviderConfig(BaseModel):
     """Configuration for a single telemetry provider (Motive or Samsara).
 

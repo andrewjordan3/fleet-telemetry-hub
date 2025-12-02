@@ -144,7 +144,7 @@ class Provider:
             max_retries=provider_config.max_retries,
             retry_backoff_factor=provider_config.retry_backoff_factor,
             verify_ssl=provider_config.verify_ssl,
-            use_truststore=config.pipeline.use_truststore
+            use_truststore=config.pipeline.use_truststore,
         )
 
         return cls(provider_name, credentials, config, registry)
