@@ -683,6 +683,31 @@ class EngineStateRecord(SamsaraModelBase):
             logger.warning('Unknown engine state: %r', value)
             raise ValueError(f'Unknown engine state: {value}') from None
 
+class ObdOdometerRecord(SamsaraModelBase):
+    """
+    OBD-II odometer reading from vehicle ECU.
+
+    Represents the dashboard odometer value reported by the vehicle's
+    onboard diagnostics system. Readings are sparse (not every GPS point)
+    and must be correlated temporally with GPS records.
+
+    Attributes:
+        time: Timestamp when odometer was read from ECU.
+        value: Odometer reading in meters (Samsara's standard unit).
+    """
+
+    time: datetime
+    value: int = Field(description='Odometer reading in meters')
+
+    @property
+    def value_miles(self) -> float:
+        """Convert meters to miles for US reporting."""
+        return self.value / 1609.344
+
+    @property
+    def value_kilometers(self) -> float:
+        """Convert meters to kilometers."""
+        return self.value / 1000.0
 
 class GpsRecord(SamsaraModelBase):
     """
@@ -732,8 +757,9 @@ class VehicleStatsHistoryRecord(SamsaraModelBase):
     """
     Vehicle stats history for a single vehicle.
 
-    Contains arrays of engine states and GPS readings for the requested
-    time period. Each vehicle in the response gets one of these records.
+    Contains arrays of engine states, GPS readings, and odometer readings
+    for the requested time period. Each vehicle in the response gets one
+    of these records.
 
     Attributes:
         vehicle_id: Samsara's internal vehicle identifier.
@@ -741,6 +767,7 @@ class VehicleStatsHistoryRecord(SamsaraModelBase):
         external_ids: External system identifiers.
         engine_states: List of engine state changes.
         gps: List of GPS readings.
+        obd_odometer_meters: List of OBD-II odometer readings (sparse).
     """
 
     vehicle_id: str = Field(alias='id')
@@ -751,6 +778,10 @@ class VehicleStatsHistoryRecord(SamsaraModelBase):
         alias='engineStates',
     )
     gps: list[GpsRecord] = Field(default_factory=list)
+    obd_odometer_meters: list[ObdOdometerRecord] = Field(
+        default_factory=list,
+        alias='obdOdometerMeters',
+    )
 
     @property
     def has_engine_data(self) -> bool:
@@ -761,6 +792,11 @@ class VehicleStatsHistoryRecord(SamsaraModelBase):
     def has_gps_data(self) -> bool:
         """Check if GPS data was returned."""
         return len(self.gps) > 0
+
+    @property
+    def has_odometer_data(self) -> bool:
+        """Check if odometer data was returned."""
+        return len(self.obd_odometer_meters) > 0
 
     def get_vin(self) -> str | None:
         """Extract VIN from external IDs if present."""

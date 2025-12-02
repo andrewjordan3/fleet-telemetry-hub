@@ -297,7 +297,7 @@ class SamsaraEndpoints:
     ] = SamsaraEndpointDefinition(
         endpoint_path='/fleet/vehicles/stats/history',
         http_method=HTTPMethod.GET,
-        description='Get historical vehicle stats (engine states, GPS) for time range',
+        description='Get historical vehicle stats (engine states, GPS, odometer) for time range',
         query_parameters=(
             QueryParameterSpec(
                 name='start_time',
@@ -317,7 +317,7 @@ class SamsaraEndpoints:
                 name='types',
                 parameter_type=ParameterType.STRING_LIST,
                 required=True,
-                description='Comma-separated stat types (engineStates, gps)',
+                description='Comma-separated stat types (engineStates, gps, obdOdometerMeters)',
             ),
         ),
         is_paginated=True,
