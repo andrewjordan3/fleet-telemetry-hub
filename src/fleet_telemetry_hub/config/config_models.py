@@ -10,7 +10,7 @@ and Samsara providers.
 import logging
 from datetime import datetime
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Self, cast
 
 from pydantic import (
     BaseModel,
@@ -211,27 +211,112 @@ class LoggingConfig(BaseModel):
         file_level: Minimum log level for file output.
     """
 
-    file_path: str
-    console_level: LogLevelName = 'INFO'
-    file_level: LogLevelName = 'DEBUG'
+    file_path: Path | None
+    console_level: LogLevelName | int = 'INFO'
+    file_level: LogLevelName | int | None = 'DEBUG'
 
-    @field_validator('file_path')
+    @field_validator('file_path', mode='before')
     @classmethod
-    def validate_log_path(cls, path_string: str) -> str:
-        """Ensure log file path has .log extension.
+    def validate_log_path(cls, path_string: str | None) -> Path | None:
+        """
+        Normalize incoming string to a Path, and ensure log file path has .log extension.
 
         Args:
             path_string: Path to log file.
 
         Returns:
             The validated path string.
-
-        Raises:
-            ValueError: If path does not end with .log extension.
         """
+        if path_string is None:
+            return None
         if not path_string.endswith('.log'):
-            raise ValueError('file_path must have .log extension')
-        return path_string
+            path_string = f'{path_string}.log'
+        return Path(path_string)
+
+    @field_validator('console_level', 'file_level')
+    @classmethod
+    def validate_log_level(
+        cls, v: LogLevelName | int | None
+    ) -> LogLevelName | int | None:
+        """
+        Validate that log levels are either valid string names or valid numeric values.
+
+        Python's logging module uses these numeric values internally:
+        - DEBUG: 10
+        - INFO: 20
+        - WARNING: 30
+        - ERROR: 40
+        - CRITICAL: 50
+
+        We accept both formats and validate them here.
+        """
+        if v is None:
+            return v
+
+        # If it's a string, Pydantic's Literal type already validated it's one of the allowed names
+        if isinstance(v, str):
+            return v
+
+        # Not None or str, so must be integer, validate it's a standard logging level
+        valid_levels: set[int] = {10, 20, 30, 40, 50}
+        if v not in valid_levels:
+            raise ValueError(
+                f'Numeric log level must be one of {valid_levels}, got {v}'
+            )
+        return v
+
+    @model_validator(mode='after')
+    def validate_file_logging_consistency(self) -> Self:
+        """
+        Ensure that if file_path is provided, file_level is also provided, and vice versa.
+
+        This prevents misconfiguration where someone enables file logging but doesn't
+        specify what level to log at (or vice versa).
+
+        Model validators run after all field validators, so we can safely access
+        multiple fields at once.
+        """
+        has_file_path: bool = self.file_path is not None
+        has_file_level: bool = self.file_level is not None
+
+        if has_file_path and not has_file_level:
+            # Default to DEBUG if path is provided but level is missing
+            self.file_level = 'DEBUG'
+            logger.warning(
+                'file_path provided without file_level. Defaulting to DEBUG for file logging.'
+            )
+
+        if has_file_level and not has_file_path:
+            raise ValueError(
+                'file_level is specified but file_path is missing. '
+                'Both must be provided to enable file logging.'
+            )
+
+        return self
+
+    def get_console_level_int(self) -> int:
+        """
+        Convert console_level to the integer value used by Python's logging module.
+
+        Returns:
+            The integer logging level (10, 20, 30, 40, or 50)
+        """
+        if isinstance(self.console_level, int):
+            return self.console_level
+        return cast(int, getattr(logging, self.console_level))
+
+    def get_file_level_int(self) -> int | None:
+        """
+        Convert file_level to the integer value used by Python's logging module.
+
+        Returns:
+            The integer logging level, or None if file logging is disabled
+        """
+        if self.file_level is None:
+            return None
+        if isinstance(self.file_level, int):
+            return self.file_level
+        return cast(int, getattr(logging, self.file_level))
 
 
 class TelemetryConfig(BaseModel):
