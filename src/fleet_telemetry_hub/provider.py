@@ -35,7 +35,7 @@ import pandas as pd
 
 from .client import TelemetryClient
 from .config import ProviderConfig, TelemetryConfig
-from .models.shared_response_models import (
+from .models import (
     EndpointDefinition,
     ParsedResponse,
     ProviderCredentials,

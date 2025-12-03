@@ -23,9 +23,13 @@ Example:
 import logging
 from typing import Any, Literal
 
-from .models.motive_requests import MotiveEndpointDefinition, MotiveEndpoints
-from .models.samsara_requests import SamsaraEndpointDefinition, SamsaraEndpoints
-from .models.shared_response_models import EndpointDefinition
+from .models import (
+    EndpointDefinition,
+    MotiveEndpointDefinition,
+    MotiveEndpoints,
+    SamsaraEndpointDefinition,
+    SamsaraEndpoints,
+)
 
 logger: logging.Logger = logging.getLogger(__name__)
 

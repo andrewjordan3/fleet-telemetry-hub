@@ -22,13 +22,14 @@ from tenacity import (
     wait_exponential,
 )
 
-from .models.shared_request_models import RateLimitInfo, RequestSpec
-from .models.shared_response_models import (
+from .models import (
     EndpointDefinition,
     ItemT,
     PaginationState,
     ParsedResponse,
     ProviderCredentials,
+    RateLimitInfo,
+    RequestSpec,
 )
 from .utils import build_truststore_ssl_context
 

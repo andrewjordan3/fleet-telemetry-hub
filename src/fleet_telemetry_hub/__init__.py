@@ -18,7 +18,6 @@ Quick Start:
 
 __version__ = '0.1.0'
 
-# High-level API (recommended)
 # Mid-level API
 from .client import APIError, RateLimitError, TelemetryClient
 
@@ -33,14 +32,18 @@ from .config.config_models import (
 from .config.loader import load_config
 
 # Low-level API (for advanced usage)
-from .models.motive_requests import MotiveEndpointDefinition, MotiveEndpoints
-from .models.samsara_requests import SamsaraEndpointDefinition, SamsaraEndpoints
-from .models.shared_request_models import HTTPMethod, RateLimitInfo, RequestSpec
-from .models.shared_response_models import (
+from .models import (
     EndpointDefinition,
+    HTTPMethod,
+    MotiveEndpointDefinition,
+    MotiveEndpoints,
     PaginationState,
     ParsedResponse,
     ProviderCredentials,
+    RateLimitInfo,
+    RequestSpec,
+    SamsaraEndpointDefinition,
+    SamsaraEndpoints,
 )
 
 # Pipeline
