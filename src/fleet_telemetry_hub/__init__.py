@@ -84,8 +84,8 @@ __all__: list[str] = [
     'TelemetryConfig',
     # Version
     '__version__',
-    # Configuration
-    'load_config',
     # Pipeline
     'create_vehicle_data_pipeline',
+    # Configuration
+    'load_config',
 ]

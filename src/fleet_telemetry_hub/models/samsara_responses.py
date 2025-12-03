@@ -683,6 +683,7 @@ class EngineStateRecord(SamsaraModelBase):
             logger.warning('Unknown engine state: %r', value)
             raise ValueError(f'Unknown engine state: {value}') from None
 
+
 class ObdOdometerRecord(SamsaraModelBase):
     """
     OBD-II odometer reading from vehicle ECU.
@@ -708,6 +709,7 @@ class ObdOdometerRecord(SamsaraModelBase):
     def value_kilometers(self) -> float:
         """Convert meters to kilometers."""
         return self.value / 1000.0
+
 
 class GpsRecord(SamsaraModelBase):
     """
