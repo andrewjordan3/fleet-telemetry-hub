@@ -10,12 +10,12 @@ import logging
 import sys
 from pathlib import Path
 
-from ..config import TelemetryConfig
+from ..config import LoggingConfig
 
 
 def setup_logger(
-    logging_level: int = logging.INFO,
-    config: TelemetryConfig | None = None,
+    logging_level: int | None = None,
+    config: LoggingConfig | None = None,
 ) -> logging.Logger:
     """
     Set up logging for the fuelsync package.
@@ -31,12 +31,12 @@ def setup_logger(
         logging_level: Default logging level (e.g., logging.INFO) to use for
                       the console if NO config object is provided.
         config: Optional validated configuration object. If provided:
-                - Console logging uses config.logging.console_level
-                - File logging is enabled if config.logging.file_path is set
+                - Console logging uses config.console_level
+                - File logging is enabled if config.file_path is set
                 - The 'logging_level' argument is ignored.
 
     Returns:
-        The package-level logger ('fuelsync') for reference. All module-level
+        The package-level logger ('fleet_telemetry_hub') for reference. All module-level
         loggers created with logging.getLogger(__name__) will automatically
         inherit this configuration.
 
@@ -66,8 +66,10 @@ def setup_logger(
 
     # --- 1. Configure Console Handler ---
     # Determine console level: Config priority > Argument fallback
+    if logging_level is None:
+        logging_level = logging.INFO
     if config:
-        console_level: int = config.logging.get_console_level_int()
+        console_level: int = config.get_console_level_int()
     else:
         console_level = logging_level
 
@@ -79,9 +81,9 @@ def setup_logger(
     # --- 2. Configure File Handler (Config Only) ---
     file_level: int | None = None
 
-    if config and config.logging.file_path and config.logging.get_file_level_int():
-        log_file_path: Path = config.logging.file_path
-        file_level = config.logging.get_file_level_int()
+    if config and config.file_path and config.get_file_level_int():
+        log_file_path: Path = config.file_path
+        file_level = config.get_file_level_int()
 
         # Ensure parent directory exists
         log_file_path.parent.mkdir(parents=True, exist_ok=True)

@@ -5,6 +5,7 @@ Exposes the main configuration models and the loader function.
 """
 
 from .config_models import (
+    CompressionType,
     LoggingConfig,
     PipelineConfig,
     ProviderConfig,
@@ -14,6 +15,7 @@ from .config_models import (
 from .loader import load_config
 
 __all__: list[str] = [
+    'CompressionType',
     'LoggingConfig',
     'PipelineConfig',
     'ProviderConfig',

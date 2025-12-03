@@ -67,6 +67,9 @@ pipeline:
   # Drivers have up to 14 days to certify logs, so 7-14 is a safe window.
   lookback_days: 7
 
+  # Batch size in days; supports fractional (0.5 = 12 hours)
+  batch_increment_days: 1.0
+
   # Global throttle between HTTP requests to be a "good citizen"
   # and prevent triggering accidental DDoS protection.
   request_delay_seconds: 0.5

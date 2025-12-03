@@ -47,7 +47,7 @@ from .models import (
 )
 
 # Pipeline
-from .pipeline import create_vehicle_data_pipeline
+from .pipeline import TelemetryPipeline
 from .provider import Provider, ProviderManager
 from .registry import (
     EndpointNotFoundError,
@@ -85,10 +85,10 @@ __all__: list[str] = [
     # Client
     'TelemetryClient',
     'TelemetryConfig',
+    # Pipeline
+    'TelemetryPipeline',
     # Version
     '__version__',
-    # Pipeline
-    'create_vehicle_data_pipeline',
     # Configuration
     'load_config',
 ]
