@@ -1,23 +1,42 @@
 # Fleet Telemetry Hub
 
-A robust, type-safe Python client for fleet telemetry provider APIs. Seamlessly integrate with multiple telematics platforms (Motive, Samsara) through a unified, provider-agnostic interface.
+A comprehensive Python framework for fleet telemetry data. Provides both a **type-safe API client** for direct provider interaction and an **automated ETL pipeline** for building unified datasets from multiple telematics platforms (Motive, Samsara).
 
-[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Type Checked: mypy](https://img.shields.io/badge/type_checked-mypy-blue.svg)](http://mypy-lang.org/)
 [![Code Style: Ruff](https://img.shields.io/badge/code_style-ruff-black.svg)](https://github.com/astral-sh/ruff)
 
+## Overview
+
+Fleet Telemetry Hub is a **dual-purpose system**:
+
+1. **API Abstraction Framework** - Type-safe, provider-agnostic interface for direct API interaction
+2. **Data Pipeline System** - Automated ETL for collecting, normalizing, and persisting telemetry data
+
+Whether you need one-off API queries or continuous data collection, Fleet Telemetry Hub provides the right abstraction.
+
 ## Features
 
+### API Client Features
 - **Multi-Provider Support**: Unified interface for Motive and Samsara APIs
 - **Type-Safe**: Full type hints and Pydantic models for request/response validation
-- **Automatic Pagination**: Seamlessly iterate through paginated results
+- **Automatic Pagination**: Seamlessly iterate through paginated results (offset & cursor-based)
 - **Smart Retry Logic**: Exponential backoff with configurable retry strategies
 - **Rate Limit Handling**: Automatic throttling and retry-after support
 - **Network Resilience**: Designed to work behind corporate proxies (Zscaler, etc.)
 - **SSL Flexibility**: Configurable SSL verification with custom CA bundle support
 - **Connection Pooling**: Efficient HTTP connection management
-- **Data Export**: Built-in Parquet export with pandas integration
+
+### Data Pipeline Features
+- **Unified Schema**: Normalizes data from all providers to common format
+- **Incremental Updates**: Intelligent lookback for late-arriving data
+- **Batch Processing**: Configurable time-based batches for memory efficiency
+- **Atomic Writes**: No data corruption even if process crashes mid-write
+- **Automatic Deduplication**: Handles overlapping data from multiple runs
+- **Parquet Storage**: Efficient columnar storage with compression
+- **Independent Provider Fetching**: One provider's failure doesn't block others
+- **Comprehensive Logging**: Track progress and debug issues
 
 ## Installation
 
@@ -50,30 +69,11 @@ pip install -e ".[all]"
 
 ## Quick Start
 
-### Basic Usage
+### Option 1: Data Pipeline (Recommended for Continuous Data Collection)
 
-```python
-from fleet_telemetry_hub.client import TelemetryClient
-from fleet_telemetry_hub.models.shared_response_models import ProviderCredentials
+The pipeline automatically collects, normalizes, and stores data from all configured providers.
 
-# Configure credentials
-credentials = ProviderCredentials(
-    base_url="https://api.gomotive.com",
-    api_token="your-api-token-here",
-    timeout=(10, 30),
-    verify_ssl=True
-)
-
-# Create client
-with TelemetryClient(credentials) as client:
-    # Fetch all vehicles with automatic pagination
-    for vehicle in client.fetch_all(endpoint):
-        print(f"Vehicle: {vehicle.name}")
-```
-
-### Using Configuration File
-
-Create a configuration file at `config/telemetry_config.yaml`:
+**1. Create a configuration file** at `config/telemetry_config.yaml`:
 
 ```yaml
 providers:
@@ -85,7 +85,6 @@ providers:
     max_retries: 5
     retry_backoff_factor: 2.0
     verify_ssl: true
-    rate_limit_requests_per_second: 10
 
   samsara:
     enabled: true
@@ -95,13 +94,11 @@ providers:
     max_retries: 5
     retry_backoff_factor: 2.0
     verify_ssl: true
-    rate_limit_requests_per_second: 5
 
 pipeline:
   default_start_date: "2024-01-01"
   lookback_days: 7
-  request_delay_seconds: 0.5
-  use_truststore: false
+  batch_increment_days: 1.0
 
 storage:
   parquet_path: "data/fleet_telemetry.parquet"
@@ -113,17 +110,64 @@ logging:
   file_level: "DEBUG"
 ```
 
-Then load and use the configuration:
+**2. Run the pipeline**:
 
 ```python
+from fleet_telemetry_hub.pipeline import TelemetryPipeline
+
+# One-liner for scheduled jobs (cron, etc.)
+TelemetryPipeline('config/telemetry_config.yaml').run()
+
+# Or access the resulting data
+pipeline = TelemetryPipeline('config/telemetry_config.yaml')
+pipeline.run()
+
+# Work with unified DataFrame
+df = pipeline.dataframe
+print(f"Collected {len(df)} records from {df['vin'].nunique()} vehicles")
+print(f"Providers: {df['provider'].unique()}")
+print(f"Date range: {df['timestamp'].min()} to {df['timestamp'].max()}")
+
+# Export to various formats
+df.to_csv('telemetry.csv', index=False)
+df.to_excel('telemetry.xlsx', index=False)
+```
+
+**3. Schedule it** (optional):
+
+```bash
+# Run daily at 2 AM
+0 2 * * * cd /path/to/project && python -c "from fleet_telemetry_hub.pipeline import TelemetryPipeline; TelemetryPipeline('config.yaml').run()"
+```
+
+The pipeline will:
+- Fetch data from all enabled providers
+- Normalize to unified schema (14 columns: VIN, timestamp, GPS, speed, driver, etc.)
+- Deduplicate on (VIN, timestamp)
+- Save incrementally to Parquet with atomic writes
+- Resume from last run with configurable lookback
+
+### Option 2: Direct API Access (For Custom Integrations)
+
+For one-off queries or custom integrations, use the Provider interface:
+
+```python
+from fleet_telemetry_hub import Provider
 from fleet_telemetry_hub.config.loader import load_config
 
-# Load configuration
-config = load_config("config/telemetry_config.yaml")
+# Load config
+config = load_config('config/telemetry_config.yaml')
 
-# Access provider configs
-motive_config = config.providers["motive"]
-print(f"Motive API URL: {motive_config.base_url}")
+# Create provider
+motive = Provider.from_config('motive', config.providers['motive'])
+
+# Fetch data
+for vehicle in motive.fetch_all('vehicles'):
+    print(f"Vehicle: {vehicle.number} - VIN: {vehicle.vin}")
+
+# Or convert directly to DataFrame
+df = motive.to_dataframe('vehicles')
+print(df.head())
 ```
 
 ## Configuration
@@ -170,28 +214,94 @@ request_timeout: [10, 30]  # [connect, read]
 
 ## Advanced Usage
 
-### Pagination
+### Pipeline: Historical Backfill
+
+Fetch historical data by overriding the default start date:
+
+```python
+from fleet_telemetry_hub.pipeline import TelemetryPipeline
+from fleet_telemetry_hub.config.loader import load_config
+
+config = load_config('config.yaml')
+config.pipeline.default_start_date = '2023-01-01'
+config.pipeline.batch_increment_days = 7.0  # Larger batches for backfill
+
+pipeline = TelemetryPipeline.from_config(config)
+pipeline.run()
+```
+
+### Pipeline: Production Deployment with Error Handling
+
+```python
+from fleet_telemetry_hub.pipeline import TelemetryPipeline, PipelineError
+import logging
+
+logger = logging.getLogger(__name__)
+
+try:
+    pipeline = TelemetryPipeline('config.yaml')
+    pipeline.run()
+    logger.info(f"Pipeline success: {len(pipeline.dataframe)} records")
+except PipelineError as e:
+    logger.error(f"Pipeline failed: {e}")
+    if e.partial_data_saved:
+        logger.warning(f"Partial data saved up to batch {e.batch_index}")
+    # Send alert, retry with different config, etc.
+```
+
+### Pipeline: Working with Unified Data
+
+The pipeline produces a DataFrame with standardized columns across all providers:
+
+```python
+from fleet_telemetry_hub.pipeline import TelemetryPipeline
+import pandas as pd
+
+pipeline = TelemetryPipeline('config.yaml')
+pipeline.run()
+
+df = pipeline.dataframe
+
+# Columns available (14 total):
+# provider, provider_vehicle_id, vin, fleet_number, timestamp,
+# latitude, longitude, speed_mph, heading_degrees, engine_state,
+# driver_id, driver_name, location_description, odometer
+
+# Filter by VIN
+vehicle_data = df[df['vin'] == 'ABC123XYZ']
+
+# Analyze by provider
+print(df.groupby('provider')['vin'].nunique())
+
+# Calculate average speed by vehicle
+avg_speeds = df.groupby('fleet_number')['speed_mph'].mean()
+
+# Export subsets
+df[df['timestamp'] >= '2025-01-01'].to_csv('recent_data.csv')
+```
+
+### API: Pagination
 
 The client handles pagination automatically:
 
 ```python
-# Iterate through all items (automatic pagination)
-for item in client.fetch_all(endpoint, request_delay_seconds=0.5):
-    process(item)
+from fleet_telemetry_hub import Provider
 
-# Or work with full pages
-for page in client.fetch_all_pages(endpoint):
-    print(f"Page has {page.item_count} items")
-    process_batch(page.items)
+provider = Provider.from_config('motive', config.providers['motive'])
+
+# Iterate through all items (automatic pagination)
+with provider.client() as client:
+    for item in client.fetch_all(provider.endpoint('vehicles')):
+        process(item)
 ```
 
-### DataFrame Export
+### API: DataFrame Export
 
 Convert API data to pandas DataFrame for analysis:
 
 ```python
 from fleet_telemetry_hub import Provider
-from fleet_telemetry_hub.config.loader import load_config
+from datetime import date
 
 config = load_config("config.yaml")
 motive = Provider.from_config("motive", config.providers["motive"])
@@ -201,8 +311,6 @@ df = motive.to_dataframe("vehicles")
 print(df.head())
 
 # With parameters
-from datetime import date
-
 locations_df = motive.to_dataframe(
     "vehicle_locations",
     vehicle_id=12345,
@@ -215,27 +323,14 @@ df.to_csv("vehicles.csv", index=False)
 df.to_excel("vehicles.xlsx", index=False)
 ```
 
-### Rate Limiting
-
-Built-in rate limit handling with exponential backoff:
+### API: Multi-Endpoint Batch with Connection Reuse
 
 ```python
-# Client automatically retries on 429 responses
-# Respects Retry-After headers
-# Configurable retry attempts and backoff
-```
-
-### Error Handling
-
-```python
-from fleet_telemetry_hub.client import APIError, RateLimitError
-
-try:
-    response = client.fetch(endpoint)
-except RateLimitError as e:
-    print(f"Rate limited, retry after {e.rate_limit_info.retry_after_seconds}s")
-except APIError as e:
-    print(f"API error {e.status_code}: {e.response_body}")
+with motive.client() as client:
+    # Single SSL handshake, connection pooling
+    vehicles = list(client.fetch_all(motive.endpoint('vehicles')))
+    groups = list(client.fetch_all(motive.endpoint('groups')))
+    users = list(client.fetch_all(motive.endpoint('users')))
 ```
 
 ## Development
@@ -280,36 +375,63 @@ pytest --cov=fleet_telemetry_hub --cov-report=html
 fleet-telemetry-hub/
 ├── src/
 │   └── fleet_telemetry_hub/
-│       ├── client.py              # Main HTTP client
+│       ├── pipeline.py            # Main pipeline orchestrator
+│       ├── schema.py              # Unified telemetry schema
+│       ├── client.py              # HTTP client (API abstraction)
+│       ├── provider.py            # Provider facade (API abstraction)
+│       ├── registry.py            # Endpoint discovery
+│       │
 │       ├── config/                # Configuration models and loader
-│       │   ├── config_models.py
-│       │   └── loader.py
+│       │   ├── config_models.py   # Pydantic config models
+│       │   └── loader.py          # YAML config loader
+│       │
 │       ├── models/                # Request/response models
-│       │   ├── motive_requests.py
-│       │   ├── motive_responses.py
-│       │   ├── samsara_requests.py
-│       │   ├── samsara_responses.py
-│       │   ├── shared_request_models.py
-│       │   └── shared_response_models.py
+│       │   ├── shared_request_models.py   # RequestSpec, HTTPMethod
+│       │   ├── shared_response_models.py  # EndpointDefinition, ParsedResponse
+│       │   ├── motive_requests.py         # Motive endpoint definitions
+│       │   ├── motive_responses.py        # Motive Pydantic models
+│       │   ├── samsara_requests.py        # Samsara endpoint definitions
+│       │   └── samsara_responses.py       # Samsara Pydantic models
+│       │
 │       └── utils/                 # Utility functions
-│           └── truststore_context.py
+│           ├── fetch_data.py      # Provider fetch functions (pipeline)
+│           ├── file_io.py         # Parquet I/O handler (pipeline)
+│           ├── logger.py          # Centralized logging setup
+│           ├── motive_funcs.py    # Motive flatten functions
+│           ├── samsara_funcs.py   # Samsara flatten functions
+│           └── truststore_context.py  # SSL/TLS utilities
+│
 ├── config/
 │   └── telemetry_config.yaml     # Example configuration
+├── examples/                      # Example scripts
 ├── tests/                         # Test suite
-├── pyproject.toml                # Project metadata and dependencies
-└── README.md                     # This file
+├── pyproject.toml                 # Project metadata and dependencies
+├── ARCHITECTURE.md                # Detailed architecture documentation
+└── README.md                      # This file
 ```
 
 ## Requirements
 
-- Python 3.11 or higher
+- **Python 3.12 or higher**
 - Dependencies:
-  - `pydantic>=2.0.0` - Data validation
-  - `httpx>=0.28.0` - HTTP client
-  - `tenacity>=9.1.0` - Retry logic
-  - `pyyaml>=6.0.0` - Configuration parsing
-  - `pandas>=2.0.0` - Data manipulation
-  - `pyarrow>=14.0.0` - Parquet support
+  - `pydantic>=2.0.0` - Data validation and type safety
+  - `httpx>=0.28.0` - Modern HTTP client
+  - `tenacity>=9.1.0` - Retry logic with exponential backoff
+  - `pyyaml>=6.0.0` - YAML configuration parsing
+  - `pandas>=2.0.0` - DataFrame manipulation
+  - `pyarrow>=14.0.0` - Parquet I/O and columnar storage
+
+## Architecture
+
+For detailed architecture documentation, see [ARCHITECTURE.md](ARCHITECTURE.md).
+
+Key architectural highlights:
+- **Two-tier system**: Data Pipeline (high-level ETL) + API Abstraction Framework (low-level access)
+- **Self-describing endpoints**: All API knowledge encapsulated in endpoint definitions
+- **Unified schema**: 14-column normalized format for cross-provider analytics
+- **Provider independence**: Add/remove providers without changing core logic
+- **Type safety**: Pydantic models from API → DataFrame
+- **Atomic writes**: Temp file + rename guarantees no data corruption
 
 ## Supported Providers
 
@@ -317,11 +439,15 @@ fleet-telemetry-hub/
 
 - API Documentation: https://developer.gomotive.com/
 - Features: Vehicle tracking, driver logs, fuel data, ELD compliance
+- Pagination: Offset-based (page_no, per_page)
+- Authentication: X-API-Key header
 
 ### Samsara
 
 - API Documentation: https://developers.samsara.com/
 - Features: Fleet management, vehicle health, driver safety, route optimization
+- Pagination: Cursor-based (after parameter)
+- Authentication: Bearer token
 
 ## Contributing
 
@@ -361,12 +487,23 @@ Project Link: https://github.com/andrewjordan3/fleet-telemetry-hub
 
 ## Roadmap
 
+### Completed ✅
+- [x] Unified schema for multi-provider data normalization
+- [x] Automated ETL pipeline with incremental updates
+- [x] Parquet storage with atomic writes
+- [x] Python 3.12+ with modern type syntax
+- [x] Comprehensive logging system
+- [x] Batch processing with configurable time windows
+- [x] Automatic deduplication
+
+### Planned 🎯
 - [ ] Add support for additional providers (Geotab, Verizon Connect)
 - [ ] Async client support with `asyncio`
 - [ ] CLI tool for common operations
+- [ ] Real-time data streaming mode
 - [ ] GraphQL API support
-- [ ] Webhook integration
-- [ ] Real-time event streaming
+- [ ] Webhook integration for push notifications
+- [ ] Data quality metrics and validation reports
 
 ## Troubleshooting
 
