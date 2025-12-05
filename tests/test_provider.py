@@ -267,7 +267,7 @@ class TestProviderManagerInitialization:
         # based on the NAME ('unknown'), not the enabled flag.
         dummy_config = ProviderConfig(
             base_url='https://ignore.me',
-            api_key='ignore_me', # pyright: ignore[reportArgumentType]
+            api_key='ignore_me',  # pyright: ignore[reportArgumentType]
             enabled=True,
             request_timeout=(10, 30),
             max_retries=3,

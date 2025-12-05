@@ -18,12 +18,41 @@ Quick Start:
 
 __version__ = '0.1.0'
 
-# Pipeline
-from fleet_telemetry_hub.pipeline import TelemetryPipeline
+from fleet_telemetry_hub.client import (
+    APIError,
+    RateLimitError,
+    TelemetryClient,
+    TransientAPIError,
+)
+from fleet_telemetry_hub.common import ParquetFileHandler, setup_logger
+from fleet_telemetry_hub.config import load_config
+from fleet_telemetry_hub.pipeline import PipelineError, TelemetryPipeline
+from fleet_telemetry_hub.provider import (
+    Provider,
+    ProviderConfigurationError,
+    ProviderManager,
+)
+from fleet_telemetry_hub.registry import (
+    EndpointNotFoundError,
+    EndpointRegistry,
+    ProviderNotFoundError,
+)
 
 __all__: list[str] = [
-    # Pipeline
+    'APIError',
+    'EndpointNotFoundError',
+    'EndpointRegistry',
+    'ParquetFileHandler',
+    'PipelineError',
+    'Provider',
+    'ProviderConfigurationError',
+    'ProviderManager',
+    'ProviderNotFoundError',
+    'RateLimitError',
+    'TelemetryClient',
     'TelemetryPipeline',
-    # Version
+    'TransientAPIError',
     '__version__',
+    'load_config',
+    'setup_logger',
 ]
