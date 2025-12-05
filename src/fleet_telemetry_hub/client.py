@@ -42,7 +42,8 @@ from tenacity import (
     stop_after_attempt,
 )
 
-from .models import (
+from fleet_telemetry_hub.common import build_truststore_ssl_context
+from fleet_telemetry_hub.models import (
     EndpointDefinition,
     PaginationState,
     ParsedResponse,
@@ -50,7 +51,6 @@ from .models import (
     RateLimitInfo,
     RequestSpec,
 )
-from .utils import build_truststore_ssl_context
 
 __all__: list[str] = [
     'APIError',

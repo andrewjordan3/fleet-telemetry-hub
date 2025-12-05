@@ -17,10 +17,10 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 import pytest
 
+from fleet_telemetry_hub.common import ParquetFileHandler
 from fleet_telemetry_hub.config import StorageConfig
 from fleet_telemetry_hub.config.config_models import CompressionType
 from fleet_telemetry_hub.schema import enforce_telemetry_schema
-from fleet_telemetry_hub.utils import ParquetFileHandler
 
 
 class TestParquetFileHandlerInitialization:
@@ -195,13 +195,17 @@ class TestParquetFileHandlerSave:
 
         # Save initial data
 
-        initial_df: pd.DataFrame = sample_telemetry_dataframe.iloc[:2]  # First 2 records
+        initial_df: pd.DataFrame = sample_telemetry_dataframe.iloc[
+            :2
+        ]  # First 2 records
 
         handler.save(initial_df)
 
         # Save new data (overwrites)
 
-        new_df: pd.DataFrame = sample_telemetry_dataframe.iloc[2:4]  # Different 2 records
+        new_df: pd.DataFrame = sample_telemetry_dataframe.iloc[
+            2:4
+        ]  # Different 2 records
 
         handler.save(new_df)
 
@@ -213,7 +217,9 @@ class TestParquetFileHandlerSave:
 
         assert len(loaded) == 2  # noqa: PLR2004
 
-        pd.testing.assert_frame_equal(loaded, new_df)
+        pd.testing.assert_frame_equal(
+            loaded.reset_index(drop=True), new_df.reset_index(drop=True)
+        )
 
     def test_save_handles_empty_dataframe(
         self,
@@ -292,7 +298,7 @@ class TestParquetFileHandlerSave:
             patch('pandas.DataFrame.to_parquet', side_effect=OSError('Disk full')),
             pytest.raises(OSError, match='Disk full'),
         ):
-                handler.save(sample_telemetry_dataframe)
+            handler.save(sample_telemetry_dataframe)
 
         # Final file should not exist
 
@@ -386,7 +392,7 @@ class TestParquetFileHandlerDelete:
             patch('pathlib.Path.unlink', side_effect=PermissionError('Access denied')),
             pytest.raises(PermissionError, match='Access denied'),
         ):
-                handler.delete()
+            handler.delete()
 
 
 class TestParquetFileHandlerGetFileSize:
@@ -448,7 +454,7 @@ class TestParquetFileHandlerGetFileSize:
 
         # Relationships should hold
 
-        assert size_bytes > size_kb # pyright: ignore[reportOperatorIssue]
+        assert size_bytes > size_kb  # pyright: ignore[reportOperatorIssue]
 
         assert size_kb > size_mb  # pyright: ignore[reportOperatorIssue]
 
@@ -456,7 +462,7 @@ class TestParquetFileHandlerGetFileSize:
 
         # Conversions should be accurate
 
-        assert abs(size_bytes / 1024 - size_kb) < 0.01 # pyright: ignore[reportOperatorIssue, reportOptionalOperand]  # noqa: PLR2004
+        assert abs(size_bytes / 1024 - size_kb) < 0.01  # pyright: ignore[reportOperatorIssue, reportOptionalOperand]  # noqa: PLR2004
 
         assert abs(size_kb / 1024 - size_mb) < 0.01  # pyright: ignore[reportOperatorIssue, reportOptionalOperand]  # noqa: PLR2004
 
@@ -554,7 +560,10 @@ class TestParquetFileHandlerRoundTrip:
 
         # Verify data equality
 
-        pd.testing.assert_frame_equal(loaded, sample_telemetry_dataframe)
+        pd.testing.assert_frame_equal(
+            loaded.reset_index(drop=True),
+            sample_telemetry_dataframe.reset_index(drop=True),
+        )
 
     def test_round_trip_with_multiple_saves(
         self,
@@ -593,7 +602,9 @@ class TestParquetFileHandlerRoundTrip:
 
         # Create a larger dataset (1000 records)
 
-        records: list[dict[str, Any]] = [sample_telemetry_record.copy() for _ in range(1000)]
+        records: list[dict[str, Any]] = [
+            sample_telemetry_record.copy() for _ in range(1000)
+        ]
 
         df = pd.DataFrame(records)
 
@@ -611,7 +622,9 @@ class TestParquetFileHandlerRoundTrip:
 
         assert size_mb is not None
 
-        assert size_mb < 5.0  # Should be well under 5MB with compression  # noqa: PLR2004
+        assert (
+            size_mb < 5.0  # noqa: PLR2004
+        )  # Should be well under 5MB with compression
 
         # Load
 

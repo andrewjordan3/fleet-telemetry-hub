@@ -378,8 +378,8 @@ class TestTelemetryClientFetchAll:
 
         page1_response.json.return_value = {
             'data': [{'id': 1, 'number': 'V001'}],
-            'has_more': True,
-            'page': 1,
+            'has_next_page': True,
+            'current_page': 1,
         }
 
         page1_response.headers = {}
@@ -392,8 +392,8 @@ class TestTelemetryClientFetchAll:
 
         page2_response.json.return_value = {
             'data': [{'id': 2, 'number': 'V002'}],
-            'has_more': False,
-            'page': 2,
+            'has_next_page': False,
+            'current_page': 2,
         }
 
         page2_response.headers = {}
@@ -625,7 +625,7 @@ class TestTelemetryClientSSLConfiguration:
 
         credentials = ProviderCredentials(
             base_url='https://api.example.com',
-            api_key='test_key', # pyright: ignore[reportArgumentType]
+            api_key='test_key',  # pyright: ignore[reportArgumentType]
             timeout=(10, 30),
             max_retries=3,
             retry_backoff_factor=2.0,

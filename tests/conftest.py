@@ -637,7 +637,7 @@ def assert_dataframe_valid_telemetry() -> Any:
         categorical_cols: list[str] = ['provider', 'engine_state']
 
         for col in categorical_cols:
-            assert isinstance(df[col], pd.CategoricalDtype), (
+            assert isinstance(df[col].dtype, pd.CategoricalDtype), (
                 f"Column '{col}' should be category, got {df[col].dtype}"
             )
 

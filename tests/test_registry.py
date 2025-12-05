@@ -351,7 +351,9 @@ class TestEndpointRegistryFindByPath:
 
             assert isinstance(endpoint_name, str)
 
-            endpoint: EndpointDefinition[BaseModel] = registry.get(provider, endpoint_name)
+            endpoint: EndpointDefinition[BaseModel] = registry.get(
+                provider, endpoint_name
+            )
 
             assert 'vehicle' in endpoint.endpoint_path
 
@@ -379,7 +381,9 @@ class TestEndpointRegistryFindByPath:
 
         registry = EndpointRegistry()
 
-        matches: list[tuple[str, str]] = registry.find_by_path('definitely_not_a_real_path_xyzabc')
+        matches: list[tuple[str, str]] = registry.find_by_path(
+            'definitely_not_a_real_path_xyzabc'
+        )
 
         assert matches == []
 

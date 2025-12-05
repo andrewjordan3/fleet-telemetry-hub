@@ -43,21 +43,20 @@ from typing import Any
 
 import pandas as pd
 
+from fleet_telemetry_hub.common import ParquetFileHandler, setup_logger
 from fleet_telemetry_hub.config import (
     TelemetryConfig,
     load_config,
+)
+from fleet_telemetry_hub.operations import (
+    fetch_motive_data,
+    fetch_samsara_data,
 )
 from fleet_telemetry_hub.provider import Provider, ProviderManager
 from fleet_telemetry_hub.schema import (
     DEDUP_COLUMNS,
     SORT_COLUMNS,
     enforce_telemetry_schema,
-)
-from fleet_telemetry_hub.utils import (
-    ParquetFileHandler,
-    fetch_motive_data,
-    fetch_samsara_data,
-    setup_logger,
 )
 
 __all__: list[str] = ['PipelineError', 'TelemetryPipeline']

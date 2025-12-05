@@ -13,6 +13,7 @@ from pydantic.main import BaseModel
 
 from fleet_telemetry_hub.client import TelemetryClient
 from fleet_telemetry_hub.config import TelemetryConfig
+from fleet_telemetry_hub.config.config_models import ProviderConfig
 from fleet_telemetry_hub.models.shared_response_models import EndpointDefinition
 from fleet_telemetry_hub.provider import (
     Provider,
@@ -37,7 +38,7 @@ class TestProviderInitialization:
 
         assert provider.credentials.base_url == 'https://api.gomotive.com'
 
-        assert provider.credentials.api_key == 'test_motive_api_key'
+        assert provider.credentials.api_key.get_secret_value() == 'test_motive_api_key'
 
     def test_from_config_normalizes_provider_name(
         self,
@@ -60,7 +61,7 @@ class TestProviderInitialization:
 
         assert exc_info.value.provider_name == 'unknown_provider'
 
-        assert 'motive' in exc_info.value.available_providers # pyright: ignore[reportOperatorIssue]
+        assert 'motive' in exc_info.value.available_providers  # pyright: ignore[reportOperatorIssue]
 
     def test_from_config_raises_on_unknown_provider_in_registry(
         self,
@@ -261,9 +262,22 @@ class TestProviderManagerInitialization:
     ) -> None:
         """Should skip providers not in registry."""
 
-        # Add unknown provider to config
+        # Create a dummy config with the required fields
+        # We set enabled=True to prove that the Manager skips it
+        # based on the NAME ('unknown'), not the enabled flag.
+        dummy_config = ProviderConfig(
+            base_url='https://ignore.me',
+            api_key='ignore_me', # pyright: ignore[reportArgumentType]
+            enabled=True,
+            request_timeout=(10, 30),
+            max_retries=3,
+            retry_backoff_factor=1.5,
+            verify_ssl=True,
+            rate_limit_requests_per_second=10,
+        )
 
-        telemetry_config.providers['unknown'].enabled = True
+        # Assign it to the dictionary
+        telemetry_config.providers['unknown'] = dummy_config
 
         # Should not raise, just skip unknown provider
 

@@ -120,7 +120,9 @@ def enforce_telemetry_schema(dataframe: pd.DataFrame) -> pd.DataFrame:
         'odometer',
     ]
     for column_name in numeric_columns:
-        result[column_name] = pd.to_numeric(result[column_name], errors='coerce')
+        result[column_name] = pd.to_numeric(
+            result[column_name], errors='coerce'
+        ).astype('float64')
 
     # Categorical columns: memory-efficient storage for low-cardinality strings
     categorical_columns: list[str] = ['provider', 'engine_state']

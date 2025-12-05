@@ -88,7 +88,10 @@ class TestTelemetryPipelineInitialization:
         self,
         temp_dir: Path,
     ) -> None:
-        """Should raise PipelineError when no providers enabled."""
+        """
+        Should raise ValueError when no providers enabled. (load_config catches
+        pydantic's ValidationError and re-raises with ValueError)
+        """
 
         config_file: Path = temp_dir / 'config.yaml'
 
@@ -126,7 +129,7 @@ class TestTelemetryPipelineInitialization:
         with config_file.open('w') as f:
             yaml.dump(config_data, f)
 
-        with pytest.raises(PipelineError, match='No providers are enabled'):
+        with pytest.raises(ValueError, match='Configuration validation failed'):
             TelemetryPipeline(config_file)
 
 
@@ -490,7 +493,7 @@ class TestTelemetryPipelineRun:
             'pipeline': {
                 'default_start_date': '2025-01-01',
                 'lookback_days': 0,  # No lookback for test
-                'batch_increment_days': 30.0,  # Large batch to avoid multiple batches
+                'batch_increment_days': 7,  # Large batch to avoid multiple batches
                 'request_delay_seconds': 0.0,
                 'use_truststore': False,
             },

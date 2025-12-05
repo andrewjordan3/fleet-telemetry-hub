@@ -28,10 +28,10 @@ from fleet_telemetry_hub.models import (
     VehicleLocation,
     VehicleStatsHistoryRecord,
 )
+from fleet_telemetry_hub.operations.motive_funcs import flatten_motive_location
+from fleet_telemetry_hub.operations.samsara_funcs import flatten_samsara_gps
 from fleet_telemetry_hub.provider import Provider
 from fleet_telemetry_hub.schema import TELEMETRY_COLUMNS
-from fleet_telemetry_hub.utils.motive_funcs import flatten_motive_location
-from fleet_telemetry_hub.utils.samsara_funcs import flatten_samsara_gps
 
 __all__: list[str] = ['fetch_motive_data', 'fetch_samsara_data']
 

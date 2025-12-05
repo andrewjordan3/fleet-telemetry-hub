@@ -23,6 +23,7 @@ from fleet_telemetry_hub.schema import (
 
 NUM_OF_TELEMETRY_COLUMNS: int = 14
 
+
 class TestSchemaConstants:
     """Test schema constant definitions."""
 
@@ -181,9 +182,9 @@ class TestEnforceTelemetrySchema:
 
         result: pd.DataFrame = enforce_telemetry_schema(df)
 
-        assert isinstance(result['provider'], pd.CategoricalDtype)
+        assert isinstance(result['provider'].dtype, pd.CategoricalDtype)
 
-        assert isinstance(result['engine_state'], pd.CategoricalDtype)
+        assert isinstance(result['engine_state'].dtype, pd.CategoricalDtype)
 
     def test_enforce_schema_handles_invalid_numeric_values(self) -> None:
         """Should convert invalid numeric values to NaN."""
@@ -280,7 +281,9 @@ class TestEnforceTelemetrySchema:
 
         # First enforcement
 
-        first_result: pd.DataFrame = enforce_telemetry_schema(sample_telemetry_dataframe)
+        first_result: pd.DataFrame = enforce_telemetry_schema(
+            sample_telemetry_dataframe
+        )
 
         # Second enforcement on already-enforced data
 
@@ -309,9 +312,9 @@ class TestEnforceTelemetrySchema:
 
         # Should have correct dtypes (where possible to determine from empty data)
 
-        assert isinstance(result['provider'], pd.CategoricalDtype)
+        assert isinstance(result['provider'].dtype, pd.CategoricalDtype)
 
-        assert isinstance(result['engine_state'], pd.CategoricalDtype)
+        assert isinstance(result['engine_state'].dtype, pd.CategoricalDtype)
 
     def test_enforce_schema_preserves_data_values(
         self,
@@ -464,11 +467,15 @@ class TestSorting:
 
         # Shuffle the DataFrame
 
-        shuffled: pd.DataFrame = df.sample(frac=1.0, random_state=42).reset_index(drop=True)
+        shuffled: pd.DataFrame = df.sample(frac=1.0, random_state=42).reset_index(
+            drop=True
+        )
 
         # Sort using schema constants
 
-        sorted_df: pd.DataFrame = shuffled.sort_values(SORT_COLUMNS).reset_index(drop=True)
+        sorted_df: pd.DataFrame = shuffled.sort_values(SORT_COLUMNS).reset_index(
+            drop=True
+        )
 
         # Check sorting
 
@@ -479,6 +486,6 @@ class TestSorting:
         # Within each VIN, timestamps should be in ascending order
 
         for vin in sorted_df['vin'].unique():
-            vin_records: pd.DataFrame = sorted_df[sorted_df['vin'] == vin] # pyright: ignore[reportUnknownVariableType]
+            vin_records: pd.DataFrame = sorted_df[sorted_df['vin'] == vin]  # pyright: ignore[reportUnknownVariableType]
 
             assert vin_records['timestamp'].is_monotonic_increasing
