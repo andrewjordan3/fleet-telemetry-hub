@@ -349,8 +349,7 @@ def fetch_samsara_data(
     for vehicle_stats in vehicle_stats_list:
         gps_count: int = len(vehicle_stats.gps)
         logger.debug(
-            'Processing Samsara vehicle %s (id=%s): %d GPS records',
-            vehicle_stats.name,
+            'Vehicle %s: %d raw locations fetched',
             vehicle_stats.vehicle_id,
             gps_count,
         )
