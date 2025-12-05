@@ -19,7 +19,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from datetime import date, datetime
 from enum import Enum
-from typing import Any, Generic, TypeVar
+from typing import Any, Self
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 
@@ -27,16 +27,6 @@ from .shared_request_models import HTTPMethod, RequestSpec
 
 logger: logging.Logger = logging.getLogger(__name__)
 
-
-# =============================================================================
-# Type Variables for Generic Response/Item Typing
-# =============================================================================
-
-# The full response model type (e.g., VehiclesResponse)
-ResponseModelT = TypeVar('ResponseModelT', bound=BaseModel)
-
-# The individual item type extracted from responses (e.g., Vehicle)
-ItemT = TypeVar('ItemT', bound=BaseModel)
 
 # =============================================================================
 # Parameter Specifications
@@ -117,12 +107,12 @@ class PaginationState(BaseModel):
     current_cursor: str | None = None
 
     @classmethod
-    def finished(cls) -> 'PaginationState':
+    def finished(cls) -> Self:
         """Factory for terminal pagination state (no more pages)."""
         return cls(has_next_page=False)
 
     @classmethod
-    def first_page(cls, per_page: int = 100) -> 'PaginationState':
+    def first_page(cls, per_page: int = 100) -> Self:
         """Factory for initial pagination state."""
         return cls(
             has_next_page=True,
@@ -131,13 +121,13 @@ class PaginationState(BaseModel):
         )
 
     @classmethod
-    def initial_cursor(cls) -> 'PaginationState':
+    def initial_cursor(cls) -> Self:
         """Factory for initial Cursor-based pagination (Samsara)."""
         # Samsara requires NO 'after' param for the first page
         return cls(has_next_page=True, next_page_params={}, current_cursor=None)
 
     @classmethod
-    def next_cursor(cls, cursor_token: str) -> 'PaginationState':
+    def next_cursor(cls, cursor_token: str) -> Self:
         """Factory for subsequent Cursor-based pages (Samsara)."""
         return cls(
             has_next_page=True,
@@ -151,7 +141,7 @@ class PaginationState(BaseModel):
 # =============================================================================
 
 
-class ParsedResponse(BaseModel, Generic[ItemT]):
+class ParsedResponse[ItemT: BaseModel](BaseModel):
     """
     Uniform container for parsed API responses.
 
@@ -224,7 +214,7 @@ class ProviderCredentials(BaseModel):
 # =============================================================================
 
 
-class EndpointDefinition(ABC, BaseModel, Generic[ResponseModelT, ItemT]):
+class EndpointDefinition[ItemT: BaseModel](ABC, BaseModel):
     """
     Abstract base for self-describing API endpoints.
 
@@ -332,7 +322,7 @@ class EndpointDefinition(ABC, BaseModel, Generic[ResponseModelT, ItemT]):
             if param_spec.name not in path_params:
                 raise ValueError(f'Missing required path parameter: {param_spec.name}')
 
-            value = path_params[param_spec.name]
+            value: Any = path_params[param_spec.name]
             serialized_value: str = self._serialize_parameter_value(
                 value, param_spec.parameter_type
             )
@@ -340,6 +330,44 @@ class EndpointDefinition(ABC, BaseModel, Generic[ResponseModelT, ItemT]):
 
         # base_url should not have trailing slash (enforced in config)
         return f'{base_url}{resolved_path}'
+
+    def build_resource_path(self, **path_params: Any) -> str:
+        """
+        Construct the relative resource path with placeholders replaced.
+
+        This method is distinct from build_url because it returns ONLY the path
+        portion (e.g., '/v1/vehicles/55') without the base URL. This is critical
+        for structured logging where you want to identify the resource being
+        accessed without the noise of the full absolute URL.
+
+        Args:
+            **path_params: Values for path parameter placeholders.
+
+        Returns:
+            str: The relative path with actual values substituted.
+
+        Raises:
+            ValueError: If required path parameters are missing.
+        """
+        resolved_path: str = self.endpoint_path
+
+        for param_spec in self.path_parameters:
+            placeholder: str = f'{{{param_spec.name}}}'
+
+            # Strict check: You cannot log a path if you don't have the ID
+            if param_spec.name not in path_params:
+                raise ValueError(f'Missing required path parameter: {param_spec.name}')
+
+            value: Any = path_params[param_spec.name]
+
+            # Use the existing serializer to ensure consistent formatting
+            # (e.g., Dates become ISO strings)
+            serialized_value: str = self._serialize_parameter_value(
+                value, param_spec.parameter_type
+            )
+            resolved_path = resolved_path.replace(placeholder, serialized_value)
+
+        return resolved_path
 
     def build_query_params(
         self,
@@ -382,10 +410,10 @@ class EndpointDefinition(ABC, BaseModel, Generic[ResponseModelT, ItemT]):
             api_name: str = param_spec.get_api_parameter_name()
 
             if param_name in user_params:
-                value = user_params[param_name]
-                if value is not None:
+                param_value: Any = user_params[param_name]
+                if param_value is not None:
                     query_params[api_name] = self._serialize_parameter_value(
-                        value, param_spec.parameter_type
+                        param_value, param_spec.parameter_type
                     )
             elif param_spec.required:
                 raise ValueError(f'Missing required query parameter: {param_name}')
@@ -418,13 +446,6 @@ class EndpointDefinition(ABC, BaseModel, Generic[ResponseModelT, ItemT]):
         # Use handler if registered, otherwise default to string conversion
         handler: Callable[[Any], str] = handler_map.get(parameter_type, str)
         formatted_value: str = handler(value)
-
-        logger.debug(
-            'Serialized parameter: type=%s, input=%r, output=%r',
-            parameter_type.value,  # Use .value for Enum
-            value,
-            formatted_value,
-        )
 
         return formatted_value
 

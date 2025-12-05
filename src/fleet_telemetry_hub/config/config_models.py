@@ -241,6 +241,8 @@ class ProviderConfig(BaseModel):
         Raises:
             ValueError: If either timeout value is non-positive.
         """
+        connect_timeout: int
+        read_timeout: int
         connect_timeout, read_timeout = timeout
 
         if connect_timeout <= 0:

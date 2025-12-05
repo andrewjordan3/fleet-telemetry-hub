@@ -3,12 +3,14 @@
 import logging
 from typing import Any
 
-from ..models import Vehicle, VehicleLocation, VehicleLocationType
+from fleet_telemetry_hub.models import Vehicle, VehicleLocation, VehicleLocationType
 
 logger: logging.Logger = logging.getLogger(__name__)
 
 # Threshold for GPS drift while still considering a truck idle
 IDLING_THRESHOLD_MPH: float = 3.0
+
+__all__: list[str] = ['flatten_motive_location']
 
 # =============================================================================
 # Motive-Specific Transformation Functions
@@ -73,12 +75,12 @@ def _derive_motive_engine_state(
 
     # We match on a tuple of (type_value, speed_mph)
     match (type_value, speed_mph):
-        # If type_value is 'vehicle_stopped' return Idle.
-        case ('vehicle_stopped', _):
+        # If type_value is 'vehicle_stopped' or 'gps_stopped' return Idle.
+        case ('vehicle_stopped' | 'gps_stopped', _):
             derived_status = 'Idle'
 
-        # If type_value is 'ignition_off' return Off.
-        case ('ignition_off', _):
+        # If type_value is 'ignition_off' or 'engine_stop' return Off.
+        case ('ignition_off' | 'engine_stop', _):
             derived_status = 'Off'
 
         # If the speed_mph is greater than IDLING_THRESHOLD return On.
@@ -93,11 +95,11 @@ def _derive_motive_engine_state(
 
         # If type_value is 'vehicle_moving' or 'vehicle_driving' return On.
         # We can use the pipe | character to match multiple strings.
-        case ('vehicle_moving' | 'vehicle_driving', _):
+        case ('vehicle_moving' | 'vehicle_driving' | 'gps_moving', _):
             derived_status = 'On'
 
-        # If type_value is 'ignition_on' return Idle.
-        case ('ignition_on', _):
+        # If type_value is 'ignition_on' or 'engine_start' return Idle.
+        case ('ignition_on' | 'engine_start', _):
             derived_status = 'Idle'
 
         # Default/Catch-all: Return 'Off'.

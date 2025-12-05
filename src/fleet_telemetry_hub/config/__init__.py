@@ -4,7 +4,7 @@ Configuration Package for Fleet Telemetry Hub.
 Exposes the main configuration models and the loader function.
 """
 
-from .config_models import (
+from fleet_telemetry_hub.config.config_models import (
     CompressionType,
     LoggingConfig,
     PipelineConfig,
@@ -12,7 +12,7 @@ from .config_models import (
     StorageConfig,
     TelemetryConfig,
 )
-from .loader import load_config
+from fleet_telemetry_hub.config.loader import load_config
 
 __all__: list[str] = [
     'CompressionType',

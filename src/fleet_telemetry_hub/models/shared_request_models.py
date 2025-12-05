@@ -9,7 +9,7 @@ to know about provider-specific auth patterns or pagination mechanics.
 
 import logging
 from enum import Enum
-from typing import Any
+from typing import Any, Self
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -95,7 +95,7 @@ class RateLimitInfo(BaseModel):
     reset_at_unix: int | None = None
 
     @classmethod
-    def from_response_headers(cls, headers: dict[str, str]) -> 'RateLimitInfo':
+    def from_response_headers(cls, headers: dict[str, str]) -> Self:
         """
         Extract rate limit information from HTTP response headers.
 

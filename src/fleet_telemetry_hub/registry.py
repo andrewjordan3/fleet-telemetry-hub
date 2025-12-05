@@ -3,27 +3,40 @@
 Unified endpoint registry for dynamic endpoint access across providers.
 
 This module provides a centralized registry that allows string-based endpoint
-lookup, making it easy to work with endpoints dynamically without hardcoding
-provider-specific class references.
+lookup, enabling dynamic endpoint access without hardcoding provider-specific
+class references throughout the codebase.
 
-Example:
-    >>> registry = EndpointRegistry()
-    >>>
-    >>> # Get endpoint by provider and name
-    >>> endpoint = registry.get("motive", "vehicles")
-    >>>
-    >>> # List all endpoints for a provider
-    >>> motive_endpoints = registry.list_endpoints("motive")
-    >>>
-    >>> # Check if endpoint exists
-    >>> if registry.has("samsara", "drivers"):
-    ...     endpoint = registry.get("samsara", "drivers")
+Design Decisions:
+-----------------
+- Case-insensitive lookups: Provider and endpoint names are normalized to
+  lowercase internally, so 'MOTIVE', 'Motive', and 'motive' all work.
+
+- Immutable after initialization: The registry contents cannot be modified
+  after construction, preventing accidental corruption.
+
+- Singleton convenience: The `instance()` class method provides a shared
+  registry for simple use cases, but you can also create independent instances.
+
+Usage:
+------
+    from fleet_telemetry_hub.registry import EndpointRegistry
+
+    # Using the singleton
+    registry = EndpointRegistry.instance()
+    endpoint = registry.get('motive', 'vehicles')
+
+    # Or create your own instance
+    registry = EndpointRegistry()
+    endpoint = registry.get('samsara', 'vehicle_stats_history')
 """
 
 import logging
-from typing import Any, Literal
+from types import MappingProxyType
+from typing import Any, Self
 
-from .models import (
+from pydantic import BaseModel
+
+from fleet_telemetry_hub.models import (
     EndpointDefinition,
     MotiveEndpointDefinition,
     MotiveEndpoints,
@@ -31,26 +44,66 @@ from .models import (
     SamsaraEndpoints,
 )
 
+__all__: list[str] = [
+    'EndpointNotFoundError',
+    'EndpointRegistry',
+    'ProviderNotFoundError',
+]
+
 logger: logging.Logger = logging.getLogger(__name__)
 
 
-class EndpointNotFoundError(Exception):
-    """Raised when requested endpoint doesn't exist in registry."""
-
-    def __init__(self, provider: str, endpoint_name: str) -> None:
-        super().__init__(
-            f"Endpoint '{endpoint_name}' not found for provider '{provider}'"
-        )
-        self.provider: str = provider
-        self.endpoint_name: str = endpoint_name
+# =============================================================================
+# Exceptions
+# =============================================================================
 
 
 class ProviderNotFoundError(Exception):
-    """Raised when requested provider doesn't exist in registry."""
+    """
+    Raised when requested provider doesn't exist in registry.
 
-    def __init__(self, provider: str) -> None:
-        super().__init__(f"Provider '{provider}' not found in registry")
+    Attributes:
+        provider: The provider name that was not found.
+        available_providers: List of valid provider names.
+    """
+
+    def __init__(self, provider: str, available_providers: list[str]) -> None:
         self.provider: str = provider
+        self.available_providers: list[str] = available_providers
+        super().__init__(
+            f"Provider '{provider}' not found. "
+            f'Available: {", ".join(sorted(available_providers))}'
+        )
+
+
+class EndpointNotFoundError(Exception):
+    """
+    Raised when requested endpoint doesn't exist for a provider.
+
+    Attributes:
+        provider: The provider name.
+        endpoint_name: The endpoint name that was not found.
+        available_endpoints: List of valid endpoint names for this provider.
+    """
+
+    def __init__(
+        self,
+        provider: str,
+        endpoint_name: str,
+        available_endpoints: list[str],
+    ) -> None:
+        self.provider: str = provider
+        self.endpoint_name: str = endpoint_name
+        self.available_endpoints: list[str] = available_endpoints
+        super().__init__(
+            f"Endpoint '{endpoint_name}' not found for provider '{provider}'. "
+            f'Available: {", ".join(sorted(available_endpoints))}'
+        )
+
+
+# =============================================================================
+# Registry
+# =============================================================================
 
 
 class EndpointRegistry:
@@ -59,121 +112,127 @@ class EndpointRegistry:
 
     Provides string-based access to endpoint definitions without requiring
     direct references to provider-specific classes like MotiveEndpoints
-    or SamsaraEndpoints.
+    or SamsaraEndpoints. This enables dynamic endpoint selection based on
+    configuration or user input.
 
-    Thread-safe and immutable after initialization.
+    The registry is immutable after initialization. All lookups are
+    case-insensitive.
 
     Example:
         >>> registry = EndpointRegistry()
         >>>
         >>> # Dynamic endpoint access
-        >>> endpoint = registry.get("motive", "vehicles")
+        >>> endpoint = registry.get('motive', 'vehicles')
         >>> with TelemetryClient(credentials) as client:
         ...     for vehicle in client.fetch_all(endpoint):
         ...         print(vehicle.number)
         >>>
         >>> # Discover available endpoints
-        >>> for provider_name in registry.list_providers():
-        ...     print(f"\n{provider_name}:")
-        ...     for endpoint_name in registry.list_endpoints(provider_name):
-        ...         endpoint = registry.get(provider_name, endpoint_name)
-        ...         print(f"  - {endpoint_name}: {endpoint.description}")
+        >>> for provider in registry.list_providers():
+        ...     print(f'{provider}: {registry.list_endpoints(provider)}')
     """
 
-    _instance: 'EndpointRegistry | None' = None
+    _instance: Self | None = None
 
     def __init__(self) -> None:
-        """Initialize registry with all known providers and endpoints."""
-        self._registry: dict[str, dict[str, EndpointDefinition[Any, Any]]] = {
-            'motive': self._register_motive_endpoints(),
-            'samsara': self._register_samsara_endpoints(),
+        """
+        Initialize registry with all known providers and endpoints.
+
+        Endpoint names are normalized to lowercase for case-insensitive lookup.
+        The registry is frozen after initialization using MappingProxyType.
+        """
+        # Build mutable registry during initialization
+        mutable_registry: dict[str, dict[str, EndpointDefinition[BaseModel]]] = {
+            'motive': self._build_motive_endpoints(),
+            'samsara': self._build_samsara_endpoints(),
         }
 
+        # Freeze the registry to prevent modification after initialization.
+        # MappingProxyType provides a read-only view of the underlying dict.
+        self._registry: MappingProxyType[
+            str, MappingProxyType[str, EndpointDefinition[BaseModel]]
+        ] = MappingProxyType(
+            {
+                provider: MappingProxyType(endpoints)
+                for provider, endpoints in mutable_registry.items()
+            }
+        )
+
+        total_endpoints: int = sum(len(eps) for eps in self._registry.values())
         logger.info(
-            'EndpointRegistry initialized with %d endpoints across %d providers',
-            self._count_total_endpoints(),
+            'EndpointRegistry initialized: %d providers, %d endpoints',
             len(self._registry),
+            total_endpoints,
         )
 
     @classmethod
-    def instance(cls) -> 'EndpointRegistry':
+    def instance(cls) -> Self:
         """
         Get the shared registry instance (singleton pattern).
 
-        This is a convenience method that returns a pre-initialized global
-        registry. You can also create your own instances with EndpointRegistry().
+        Convenience method that returns a pre-initialized global registry.
+        For testing or isolated usage, create your own instance instead.
 
         Returns:
             The shared EndpointRegistry instance.
 
-        Example:
-            >>> from fleet_telemetry_hub import EndpointRegistry
-            >>>
-            >>> registry = EndpointRegistry.instance()
-            >>> endpoint = registry.get("motive", "vehicles")
+        Note:
+            This method is not thread-safe for initial creation. In multi-threaded
+            applications, create the singleton during startup before spawning threads.
         """
         if cls._instance is None:
             cls._instance = cls()
         return cls._instance
 
-    def _register_motive_endpoints(
-        self,
-    ) -> dict[str, EndpointDefinition[Any, Any]]:
-        """Register all Motive endpoints with normalized names."""
-        motive_endpoints: dict[str, MotiveEndpointDefinition[Any, Any]] = (
-            MotiveEndpoints.get_all_endpoints()
-        )
-
-        # Normalize names: VEHICLES -> vehicles, VEHICLE_LOCATIONS -> vehicle_locations
-        return {name.lower(): endpoint for name, endpoint in motive_endpoints.items()}
-
-    def _register_samsara_endpoints(
-        self,
-    ) -> dict[str, EndpointDefinition[Any, Any]]:
-        """Register all Samsara endpoints with normalized names."""
-        samsara_endpoints: dict[str, SamsaraEndpointDefinition[Any, Any]] = (
-            SamsaraEndpoints.get_all_endpoints()
-        )
-
-        return {name.lower(): endpoint for name, endpoint in samsara_endpoints.items()}
+    # -------------------------------------------------------------------------
+    # Endpoint Lookup
+    # -------------------------------------------------------------------------
 
     def get(
         self,
         provider: str,
         endpoint_name: str,
-    ) -> EndpointDefinition[Any, Any]:
+    ) -> EndpointDefinition[BaseModel]:
         """
         Get an endpoint definition by provider and name.
 
         Args:
-            provider: Provider name (case-insensitive: 'motive', 'samsara').
-            endpoint_name: Endpoint name (case-insensitive: 'vehicles', 'drivers').
+            provider: Provider name (case-insensitive).
+            endpoint_name: Endpoint name (case-insensitive).
 
         Returns:
             The endpoint definition ready for use with TelemetryClient.
 
         Raises:
-            ProviderNotFoundError: If provider doesn't exist.
+            ProviderNotFoundError: If provider doesn't exist. Exception includes
+                list of available providers.
             EndpointNotFoundError: If endpoint doesn't exist for provider.
+                Exception includes list of available endpoints.
 
         Example:
             >>> registry = EndpointRegistry()
-            >>> endpoint = registry.get("motive", "vehicles")
+            >>> endpoint = registry.get('motive', 'vehicles')
             >>> print(endpoint.description)
-            'List all vehicles in the fleet with current driver and device info'
         """
         provider_lower: str = provider.lower()
         endpoint_lower: str = endpoint_name.lower()
 
         if provider_lower not in self._registry:
-            raise ProviderNotFoundError(provider)
+            raise ProviderNotFoundError(
+                provider=provider,
+                available_providers=list(self._registry.keys()),
+            )
 
-        provider_endpoints: dict[str, EndpointDefinition[Any, Any]] = self._registry[
-            provider_lower
-        ]
+        provider_endpoints: MappingProxyType[str, EndpointDefinition[BaseModel]] = (
+            self._registry[provider_lower]
+        )
 
         if endpoint_lower not in provider_endpoints:
-            raise EndpointNotFoundError(provider, endpoint_name)
+            raise EndpointNotFoundError(
+                provider=provider,
+                endpoint_name=endpoint_name,
+                available_endpoints=list(provider_endpoints.keys()),
+            )
 
         return provider_endpoints[endpoint_lower]
 
@@ -187,33 +246,27 @@ class EndpointRegistry:
 
         Returns:
             True if endpoint exists, False otherwise.
-
-        Example:
-            >>> registry = EndpointRegistry()
-            >>> if registry.has("samsara", "drivers"):
-            ...     endpoint = registry.get("samsara", "drivers")
         """
         provider_lower: str = provider.lower()
         endpoint_lower: str = endpoint_name.lower()
 
-        return (
-            provider_lower in self._registry
-            and endpoint_lower in self._registry[provider_lower]
-        )
+        if provider_lower not in self._registry:
+            return False
+
+        return endpoint_lower in self._registry[provider_lower]
+
+    # -------------------------------------------------------------------------
+    # Discovery Methods
+    # -------------------------------------------------------------------------
 
     def list_providers(self) -> list[str]:
         """
         Get list of all registered provider names.
 
         Returns:
-            List of provider names in lowercase.
-
-        Example:
-            >>> registry = EndpointRegistry()
-            >>> print(registry.list_providers())
-            ['motive', 'samsara']
+            Sorted list of provider names (lowercase).
         """
-        return list(self._registry.keys())
+        return sorted(self._registry.keys())
 
     def list_endpoints(self, provider: str) -> list[str]:
         """
@@ -223,30 +276,30 @@ class EndpointRegistry:
             provider: Provider name (case-insensitive).
 
         Returns:
-            List of endpoint names in lowercase.
+            Sorted list of endpoint names (lowercase).
 
         Raises:
             ProviderNotFoundError: If provider doesn't exist.
-
-        Example:
-            >>> registry = EndpointRegistry()
-            >>> endpoints = registry.list_endpoints("motive")
-            >>> print(endpoints)
-            ['vehicles', 'vehicle_locations', 'groups', 'users']
         """
         provider_lower: str = provider.lower()
 
         if provider_lower not in self._registry:
-            raise ProviderNotFoundError(provider)
+            raise ProviderNotFoundError(
+                provider=provider,
+                available_providers=list(self._registry.keys()),
+            )
 
-        return list(self._registry[provider_lower].keys())
+        return sorted(self._registry[provider_lower].keys())
 
     def get_all_endpoints(
         self,
         provider: str,
-    ) -> dict[str, EndpointDefinition[Any, Any]]:
+    ) -> dict[str, EndpointDefinition[BaseModel]]:
         """
         Get all endpoints for a provider as a dictionary.
+
+        Returns a mutable copy of the internal endpoint mapping. Modifying
+        the returned dict does not affect the registry.
 
         Args:
             provider: Provider name (case-insensitive).
@@ -256,31 +309,31 @@ class EndpointRegistry:
 
         Raises:
             ProviderNotFoundError: If provider doesn't exist.
-
-        Example:
-            >>> registry = EndpointRegistry()
-            >>> motive_endpoints = registry.get_all_endpoints("motive")
-            >>> for name, endpoint in motive_endpoints.items():
-            ...     print(f"{name}: {endpoint.description}")
         """
         provider_lower: str = provider.lower()
 
         if provider_lower not in self._registry:
-            raise ProviderNotFoundError(provider)
+            raise ProviderNotFoundError(
+                provider=provider,
+                available_providers=list(self._registry.keys()),
+            )
 
-        return self._registry[provider_lower].copy()
+        # Return a mutable copy (MappingProxyType -> dict)
+        return dict(self._registry[provider_lower])
 
-    def find_by_path(self, endpoint_path: str) -> list[tuple[str, str]]:
+    def find_by_path(self, path_fragment: str) -> list[tuple[str, str]]:
         """
-        Find endpoints by their API path.
+        Find endpoints whose API path contains the given fragment.
 
-        Useful for discovering which endpoint to use for a given API path.
+        Useful for discovering which endpoint corresponds to a known API path.
 
         Args:
-            endpoint_path: Full or partial endpoint path (e.g., '/v1/vehicles').
+            path_fragment: Substring to search for in endpoint paths.
+                Case-sensitive since API paths are case-sensitive.
 
         Returns:
-            List of (provider, endpoint_name) tuples matching the path.
+            Sorted list of (provider, endpoint_name) tuples for matching endpoints.
+            Empty list if no matches found.
 
         Example:
             >>> registry = EndpointRegistry()
@@ -290,59 +343,81 @@ class EndpointRegistry:
         """
         matches: list[tuple[str, str]] = []
 
-        for provider_name, endpoints in self._registry.items():
-            for endpoint_name, endpoint in endpoints.items():
-                if endpoint_path in endpoint.endpoint_path:
+        for provider_name in self._registry:
+            for endpoint_name, endpoint in self._registry[provider_name].items():
+                if path_fragment in endpoint.endpoint_path:
                     matches.append((provider_name, endpoint_name))
 
-        return matches
+        return sorted(matches)
 
     def describe(self, provider: str | None = None) -> str:
         """
         Generate human-readable description of registry contents.
 
+        Useful for debugging, documentation, or CLI help output.
+
         Args:
-            provider: Optional provider name to describe. If None, describes all.
+            provider: Provider name to describe. If None, describes all providers.
 
         Returns:
-            Formatted string with endpoint descriptions.
+            Formatted multi-line string with endpoint details.
 
-        Example:
-            >>> registry = EndpointRegistry()
-            >>> print(registry.describe("motive"))
-            Provider: motive (4 endpoints)
-              vehicles: List all vehicles in the fleet with current driver and device info
-              vehicle_locations: Get location history (breadcrumbs) for a specific vehicle
-              groups: List all groups (organizational units) in the company
-              users: List all users (drivers and admins) in the company
+        Raises:
+            ProviderNotFoundError: If specified provider doesn't exist.
         """
         lines: list[str] = []
 
-        providers: list[str] = [provider.lower()] if provider else self.list_providers()
+        if provider is not None:
+            provider_lower: str = provider.lower()
+            if provider_lower not in self._registry:
+                raise ProviderNotFoundError(
+                    provider=provider,
+                    available_providers=list(self._registry.keys()),
+                )
+            providers_to_describe: list[str] = [provider_lower]
+        else:
+            providers_to_describe = self.list_providers()
 
-        for provider_name in providers:
-            if provider_name not in self._registry:
-                lines.append(f'Provider: {provider_name} (not found)')
-                continue
+        for provider_name in providers_to_describe:
+            endpoints: MappingProxyType[str, EndpointDefinition[BaseModel]] = (
+                self._registry[provider_name]
+            )
+            lines.append(f'Provider: {provider_name} ({len(endpoints)} endpoints)')
+            lines.append('')
 
-            endpoints: dict[str, EndpointDefinition[Any, Any]] = self._registry[
-                provider_name
-            ]
-            lines.append(f'\nProvider: {provider_name} ({len(endpoints)} endpoints)')
-
-            for endpoint_name, endpoint in sorted(endpoints.items()):
-                # Show path and description
-                path: str = endpoint.endpoint_path
-                desc: str = endpoint.description
-                paginated: Literal[' [paginated]'] | Literal[''] = (
+            for endpoint_name in sorted(endpoints.keys()):
+                endpoint: EndpointDefinition[BaseModel] = endpoints[endpoint_name]
+                pagination_indicator: str = (
                     ' [paginated]' if endpoint.is_paginated else ''
                 )
-                lines.append(f'  {endpoint_name}:{paginated}')
-                lines.append(f'    Path: {path}')
-                lines.append(f'    Description: {desc}')
 
-        return '\n'.join(lines)
+                lines.append(f'  {endpoint_name}{pagination_indicator}')
+                lines.append(f'    Path: {endpoint.endpoint_path}')
+                lines.append(f'    Description: {endpoint.description}')
+                lines.append('')
 
-    def _count_total_endpoints(self) -> int:
-        """Count total number of registered endpoints across all providers."""
-        return sum(len(endpoints) for endpoints in self._registry.values())
+        return '\n'.join(lines).rstrip()
+
+    # -------------------------------------------------------------------------
+    # Internal Registration
+    # -------------------------------------------------------------------------
+
+    def _build_motive_endpoints(
+        self,
+    ) -> dict[str, EndpointDefinition[BaseModel]]:
+        """Build Motive endpoint mapping with normalized (lowercase) names."""
+        motive_endpoints: dict[str, MotiveEndpointDefinition[Any, Any]] = (
+            MotiveEndpoints.get_all_endpoints()
+        )
+
+        return {name.lower(): endpoint for name, endpoint in motive_endpoints.items()}
+
+    def _build_samsara_endpoints(
+        self,
+    ) -> dict[str, EndpointDefinition[BaseModel]]:
+        """Build Samsara endpoint mapping with normalized (lowercase) names."""
+        samsara_endpoints: dict[str, SamsaraEndpointDefinition[Any, Any]] = (
+            SamsaraEndpoints.get_all_endpoints()
+        )
+
+        return {name.lower(): endpoint for name, endpoint in samsara_endpoints.items()}

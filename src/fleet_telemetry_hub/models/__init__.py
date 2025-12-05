@@ -1,17 +1,30 @@
 # fleet_telemetry_hub/models/__init__.py
 
-from .motive_requests import MotiveEndpointDefinition, MotiveEndpoints
-from .motive_responses import Vehicle, VehicleLocation, VehicleLocationType
-from .samsara_requests import SamsaraEndpointDefinition, SamsaraEndpoints
-from .samsara_responses import (
+from fleet_telemetry_hub.models.motive_requests import (
+    MotiveEndpointDefinition,
+    MotiveEndpoints,
+)
+from fleet_telemetry_hub.models.motive_responses import (
+    Vehicle,
+    VehicleLocation,
+    VehicleLocationType,
+)
+from fleet_telemetry_hub.models.samsara_requests import (
+    SamsaraEndpointDefinition,
+    SamsaraEndpoints,
+)
+from fleet_telemetry_hub.models.samsara_responses import (
     DriverVehicleAssignment,
     GpsRecord,
     VehicleStatsHistoryRecord,
 )
-from .shared_request_models import HTTPMethod, RateLimitInfo, RequestSpec
-from .shared_response_models import (
+from fleet_telemetry_hub.models.shared_request_models import (
+    HTTPMethod,
+    RateLimitInfo,
+    RequestSpec,
+)
+from fleet_telemetry_hub.models.shared_response_models import (
     EndpointDefinition,
-    ItemT,
     PaginationState,
     ParsedResponse,
     ProviderCredentials,
@@ -22,7 +35,6 @@ __all__: list[str] = [
     'EndpointDefinition',
     'GpsRecord',
     'HTTPMethod',
-    'ItemT',
     'MotiveEndpointDefinition',
     'MotiveEndpoints',
     'PaginationState',

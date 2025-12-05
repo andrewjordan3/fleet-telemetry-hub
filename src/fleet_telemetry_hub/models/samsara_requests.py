@@ -2,9 +2,9 @@
 
 import logging
 from datetime import datetime
-from typing import Any, Generic
+from typing import Any
 
-from pydantic import ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from .samsara_responses import (
     AddressesResponse,
@@ -15,6 +15,7 @@ from .samsara_responses import (
     LocationStreamResponse,
     SamsaraAddress,
     SamsaraDriver,
+    SamsaraModelBase,
     SamsaraPaginationInfo,
     SamsaraVehicle,
     VehiclesResponse,
@@ -24,21 +25,18 @@ from .samsara_responses import (
 from .shared_request_models import HTTPMethod, RequestSpec
 from .shared_response_models import (
     EndpointDefinition,
-    ItemT,
     PaginationState,
     ParameterType,
     ParsedResponse,
     ProviderCredentials,
     QueryParameterSpec,
-    ResponseModelT,
 )
 
 logger: logging.Logger = logging.getLogger(__name__)
 
 
-class SamsaraEndpointDefinition(
-    EndpointDefinition[ResponseModelT, ItemT],
-    Generic[ResponseModelT, ItemT],
+class SamsaraEndpointDefinition[ResponseModelT: BaseModel, ItemT: BaseModel](
+    EndpointDefinition[ItemT],
 ):
     """
     Samsara-specific endpoint definition with cursor-based pagination.
@@ -412,7 +410,7 @@ class SamsaraEndpoints:
     @classmethod
     def get_all_endpoints(
         cls,
-    ) -> dict[str, SamsaraEndpointDefinition[Any, Any]]:
+    ) -> dict[str, SamsaraEndpointDefinition[SamsaraModelBase, SamsaraModelBase]]:
         """Return all endpoint definitions as a dictionary."""
         return {
             name: value

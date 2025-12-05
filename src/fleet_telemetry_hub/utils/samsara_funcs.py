@@ -4,13 +4,15 @@ import logging
 from datetime import datetime
 from typing import Any
 
-from ..models import (
+from fleet_telemetry_hub.models import (
     DriverVehicleAssignment,
     GpsRecord,
     VehicleStatsHistoryRecord,
 )
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+__all__: list[str] = ['flatten_samsara_gps']
 
 # The timestamps for a location record and odometer reading must be below this
 # amount to be merged
@@ -91,7 +93,7 @@ def _find_odometer_at_time(
     # (tighter tolerance than 1 hour since odometer updates are typically
     # more frequent than originally assumed)
     time_diff_seconds: float = abs((closest['time'] - timestamp).total_seconds())
-    if time_diff_seconds <= GPS_ODO_THRESHOLD_SEC:  # 30 minutes
+    if time_diff_seconds <= GPS_ODO_THRESHOLD_SEC:
         return float(closest['value_miles'])
 
     return None

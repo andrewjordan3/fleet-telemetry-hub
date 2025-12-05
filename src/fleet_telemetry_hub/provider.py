@@ -4,27 +4,32 @@ High-level provider facade for streamlined API access.
 
 This module provides a convenient object-oriented interface that combines
 provider configuration, endpoint access, and client operations into a
-unified API.
+unified API. It eliminates the need to manually manage client instances,
+endpoint lookups, and credential handling.
 
-Example:
-    >>> # Configure provider
-    >>> config = ProviderConfig(
-    ...     enabled=True,
-    ...     base_url="https://api.gomotive.com",
-    ...     api_key="your-key",
-    ...     request_timeout=(10, 30),
-    ...     max_retries=5,
-    ...     retry_backoff_factor=2.0,
-    ...     verify_ssl=True,
-    ...     rate_limit_requests_per_second=10
-    ... )
-    >>>
-    >>> # Create provider interface
-    >>> motive = Provider.from_config("motive", config)
-    >>>
-    >>> # Access endpoints directly
-    >>> for vehicle in motive.fetch_all("vehicles"):
-    ...     print(vehicle.number)
+Design Decisions:
+-----------------
+- Provider wraps credentials + registry + client factory into one object
+- Convenience methods (fetch_all, to_dataframe) auto-manage client lifecycle
+- For repeated operations, use client() context manager for connection reuse
+- ProviderManager handles multi-provider scenarios from a single config
+
+Usage:
+------
+    from fleet_telemetry_hub.config import load_config
+    from fleet_telemetry_hub.provider import Provider, ProviderManager
+
+    config = load_config('config.yaml')
+
+    # Single provider usage
+    motive = Provider.from_config('motive', config)
+    for vehicle in motive.fetch_all('vehicles'):
+        print(vehicle.number)
+
+    # Multi-provider usage
+    manager = ProviderManager.from_config(config)
+    for name, provider in manager.items():
+        print(f'{name}: {len(list(provider.fetch_all("vehicles")))} vehicles')
 """
 
 import logging
@@ -32,17 +37,54 @@ from collections.abc import Iterator
 from typing import Any, Self
 
 import pandas as pd
+from pydantic import BaseModel
 
-from .client import TelemetryClient
-from .config import ProviderConfig, TelemetryConfig
-from .models import (
+from fleet_telemetry_hub.client import TelemetryClient
+from fleet_telemetry_hub.config import ProviderConfig, TelemetryConfig
+from fleet_telemetry_hub.models import (
     EndpointDefinition,
     ParsedResponse,
     ProviderCredentials,
 )
-from .registry import EndpointRegistry
+from fleet_telemetry_hub.registry import EndpointRegistry, ProviderNotFoundError
+
+__all__: list[str] = [
+    'Provider',
+    'ProviderConfigurationError',
+    'ProviderManager',
+]
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# Exceptions
+# =============================================================================
+
+
+class ProviderConfigurationError(Exception):
+    """
+    Raised when provider configuration is missing or invalid.
+
+    Attributes:
+        provider_name: The provider that failed to configure.
+        available_providers: List of configured provider names, if known.
+    """
+
+    def __init__(
+        self,
+        provider_name: str,
+        message: str,
+        available_providers: list[str] | None = None,
+    ) -> None:
+        self.provider_name: str = provider_name
+        self.available_providers: list[str] | None = available_providers
+        super().__init__(message)
+
+
+# =============================================================================
+# Provider Facade
+# =============================================================================
 
 
 class Provider:
@@ -53,26 +95,35 @@ class Provider:
     into a single convenient interface. Eliminates the need to manually
     manage client instances and endpoint lookups.
 
-    This class provides both direct endpoint access and pass-through methods
-    for common client operations.
+    The Provider offers two usage patterns:
+
+    1. Convenience methods (fetch_all, to_dataframe): Automatically create
+       and close a client for each call. Simple but creates new connections.
+
+    2. Context manager (client()): Reuse a single client for multiple
+       operations. Better performance for batch operations.
 
     Attributes:
-        name: Provider name (e.g., 'motive', 'samsara').
+        name: Provider name (lowercase, e.g., 'motive', 'samsara').
         credentials: Provider credentials and connection settings.
+        config: Full telemetry config (optional, used for rate limit calculation).
 
     Example:
-        >>> # Create provider from config
-        >>> config = load_config("config.yaml")
-        >>> motive = Provider.from_config("motive", config.providers["motive"])
+        >>> config = load_config('config.yaml')
+        >>> motive = Provider.from_config('motive', config)
         >>>
-        >>> # Fetch all vehicles (automatic client management)
-        >>> for vehicle in motive.fetch_all("vehicles"):
+        >>> # Simple: auto-managed client per call
+        >>> for vehicle in motive.fetch_all('vehicles'):
         ...     print(vehicle.number)
         >>>
-        >>> # Or use context manager for custom client usage
+        >>> # Efficient: reuse client for multiple operations
         >>> with motive.client() as client:
-        ...     response = client.fetch(motive.endpoint("vehicles"))
-        ...     print(f"Found {response.item_count} vehicles")
+        ...     vehicles = list(client.fetch_all(motive.endpoint('vehicles')))
+        ...     for v in vehicles:
+        ...         locations = list(client.fetch_all(
+        ...             motive.endpoint('vehicle_locations'),
+        ...             vehicle_id=v.vehicle_id,
+        ...         ))
     """
 
     def __init__(
@@ -86,24 +137,43 @@ class Provider:
         Initialize provider facade.
 
         Args:
-            name: Provider name (e.g., 'motive', 'samsara').
+            name: Provider name (e.g., 'motive', 'samsara'). Normalized to lowercase.
             credentials: Provider credentials and connection settings.
-            registry: Optional custom endpoint registry. Uses global if not provided.
+            config: Optional full config, used for rate limit calculations.
+            registry: Optional custom endpoint registry. Uses singleton if not provided.
+
+        Raises:
+            ProviderNotFoundError: If provider doesn't exist in the registry.
         """
-        self.name: str = name.lower()
-        self.credentials: ProviderCredentials = credentials
-        self.config: TelemetryConfig | None = config
+        self._name: str = name.lower()
+        self._credentials: ProviderCredentials = credentials
+        self._config: TelemetryConfig | None = config
         self._registry: EndpointRegistry = registry or EndpointRegistry.instance()
 
-        # Validate provider exists in registry
-        if self.name not in self._registry.list_providers():
-            available: str = ', '.join(self._registry.list_providers())
-            raise ValueError(
-                f"Provider '{name}' not found in registry. "
-                f'Available providers: {available}'
-            )
+        # Validate provider exists in registry (raises ProviderNotFoundError if not)
+        # We call list_endpoints to trigger validation without fetching a specific endpoint
+        self._registry.list_endpoints(self._name)
 
-        logger.info('Initialized Provider facade for %r', self.name)
+        logger.info(
+            'Initialized Provider: name=%r, base_url=%r',
+            self._name,
+            credentials.base_url,
+        )
+
+    @property
+    def name(self) -> str:
+        """Provider name (lowercase)."""
+        return self._name
+
+    @property
+    def credentials(self) -> ProviderCredentials:
+        """Provider credentials and connection settings."""
+        return self._credentials
+
+    @property
+    def config(self) -> TelemetryConfig | None:
+        """Full telemetry config, if provided."""
+        return self._config
 
     @classmethod
     def from_config(
@@ -115,32 +185,52 @@ class Provider:
         """
         Create provider from configuration object.
 
-        Converts ProviderConfig into ProviderCredentials and initializes
-        the provider facade.
+        Extracts the provider-specific configuration, converts it to
+        ProviderCredentials, and initializes the provider facade.
 
         Args:
             provider_name: Provider name (e.g., 'motive', 'samsara').
-            config: Package level onfiguration from config file.
+            config: Full TelemetryConfig from config file.
             registry: Optional custom endpoint registry.
 
         Returns:
             Initialized Provider instance.
 
+        Raises:
+            ProviderConfigurationError: If provider not found in config.
+            ProviderNotFoundError: If provider not found in registry.
+
         Example:
-            >>> from fleet_telemetry_hub.config.loader import load_config
-            >>>
-            >>> config = load_config("config.yaml")
-            >>> motive = Provider.from_config("motive", config)
+            >>> config = load_config('config.yaml')
+            >>> motive = Provider.from_config('motive', config)
         """
-        provider_config: ProviderConfig | None = config.providers.get(provider_name)
-        if not provider_config:
-            logger.error('No configuration found for provider %r.', provider_name)
-            raise NotImplementedError
+        provider_config: ProviderConfig | None = config.providers.get(
+            provider_name.lower()
+        )
+
+        if provider_config is None:
+            available: list[str] = sorted(config.providers.keys())
+            raise ProviderConfigurationError(
+                provider_name=provider_name,
+                message=(
+                    f"Provider '{provider_name}' not found in configuration. "
+                    f'Available: {", ".join(available)}'
+                ),
+                available_providers=available,
+            )
+
+        # Convert ProviderConfig to ProviderCredentials
+        # The tuple cast is needed because ProviderConfig stores it as tuple[int, int]
+        # but ProviderCredentials expects the same type
+        timeout: tuple[int, int] = (
+            provider_config.request_timeout[0],
+            provider_config.request_timeout[1],
+        )
 
         credentials = ProviderCredentials(
             base_url=provider_config.base_url,
             api_key=provider_config.api_key,
-            timeout=tuple(provider_config.request_timeout),  # type: ignore[arg-type]
+            timeout=timeout,
             max_retries=provider_config.max_retries,
             retry_backoff_factor=provider_config.retry_backoff_factor,
             verify_ssl=provider_config.verify_ssl,
@@ -149,55 +239,49 @@ class Provider:
 
         return cls(provider_name, credentials, config, registry)
 
-    def endpoint(self, endpoint_name: str) -> EndpointDefinition[Any, Any]:
+    # -------------------------------------------------------------------------
+    # Endpoint Access
+    # -------------------------------------------------------------------------
+
+    def endpoint(self, endpoint_name: str) -> EndpointDefinition[BaseModel]:
         """
         Get an endpoint definition by name.
 
         Args:
-            endpoint_name: Endpoint name (case-insensitive: 'vehicles', 'drivers').
+            endpoint_name: Endpoint name (case-insensitive).
 
         Returns:
-            Endpoint definition ready for use with client.
+            Endpoint definition ready for use with TelemetryClient.
 
         Raises:
             EndpointNotFoundError: If endpoint doesn't exist for this provider.
-
-        Example:
-            >>> motive = Provider.from_config("motive", config)
-            >>> vehicles_endpoint = motive.endpoint("vehicles")
-            >>> print(vehicles_endpoint.description)
         """
-        return self._registry.get(self.name, endpoint_name)
+        return self._registry.get(self._name, endpoint_name)
 
     def list_endpoints(self) -> list[str]:
         """
         List all available endpoint names for this provider.
 
         Returns:
-            List of endpoint names.
-
-        Example:
-            >>> motive = Provider.from_config("motive", config)
-            >>> print(motive.list_endpoints())
-            ['vehicles', 'vehicle_locations', 'groups', 'users']
+            Sorted list of endpoint names.
         """
-        return self._registry.list_endpoints(self.name)
+        return self._registry.list_endpoints(self._name)
 
     def has_endpoint(self, endpoint_name: str) -> bool:
         """
         Check if an endpoint exists for this provider.
 
         Args:
-            endpoint_name: Endpoint name to check.
+            endpoint_name: Endpoint name to check (case-insensitive).
 
         Returns:
             True if endpoint exists, False otherwise.
-
-        Example:
-            >>> if motive.has_endpoint("vehicles"):
-            ...     data = motive.fetch_all("vehicles")
         """
-        return self._registry.has(self.name, endpoint_name)
+        return self._registry.has(self._name, endpoint_name)
+
+    # -------------------------------------------------------------------------
+    # Client Management
+    # -------------------------------------------------------------------------
 
     def client(
         self,
@@ -205,9 +289,10 @@ class Provider:
         pool_maxsize: int = 10,
     ) -> TelemetryClient:
         """
-        Create a telemetry client for this provider.
+        Create a TelemetryClient for this provider.
 
-        Returns a context manager that handles client lifecycle.
+        Returns a client configured with this provider's credentials.
+        Use as a context manager to ensure proper resource cleanup.
 
         Args:
             pool_connections: Max keepalive connections in pool.
@@ -218,16 +303,43 @@ class Provider:
 
         Example:
             >>> with motive.client() as client:
-            ...     for vehicle in client.fetch_all(motive.endpoint("vehicles")):
+            ...     for vehicle in client.fetch_all(motive.endpoint('vehicles')):
             ...         print(vehicle.number)
         """
-        request_delay_seconds: float = self.get_request_delay()
         return TelemetryClient(
-            credentials=self.credentials,
+            credentials=self._credentials,
             pool_connections=pool_connections,
             pool_maxsize=pool_maxsize,
-            request_delay_seconds=request_delay_seconds,
+            request_delay_seconds=self._calculate_request_delay(),
         )
+
+    def _calculate_request_delay(self) -> float:
+        """
+        Calculate the effective request delay for this provider.
+
+        Returns the larger of:
+        - Pipeline-level request_delay_seconds (global throttle)
+        - 1/rate_limit_requests_per_second (provider-specific rate limit)
+
+        Returns:
+            Delay in seconds between requests.
+        """
+        if self._config is None:
+            return 0.0
+
+        pipeline_delay: float = self._config.pipeline.request_delay_seconds
+
+        # Get provider-specific rate limit
+        provider_config: ProviderConfig | None = self._config.providers.get(self._name)
+        if provider_config is None:
+            return pipeline_delay
+
+        # Convert rate limit to delay: 10 req/sec = 0.1 sec/req
+        rate_limit: int = provider_config.rate_limit_requests_per_second
+        rate_based_delay: float = 1.0 / rate_limit if rate_limit > 0 else 0.0
+
+        # Use the more conservative (larger) delay
+        return max(pipeline_delay, rate_based_delay)
 
     # -------------------------------------------------------------------------
     # Convenience Methods (Auto-managed Client)
@@ -237,26 +349,21 @@ class Provider:
         self,
         endpoint_name: str,
         **params: Any,
-    ) -> ParsedResponse[Any]:
+    ) -> ParsedResponse[BaseModel]:
         """
         Fetch a single page from an endpoint.
 
-        Creates and manages a client automatically. For repeated operations,
-        use the client() context manager for better performance.
+        Creates a client, fetches one page, and closes the client.
+        For repeated operations, use client() context manager instead.
 
         Args:
             endpoint_name: Endpoint name (e.g., 'vehicles').
-            **params: Path parameters and query parameters.
+            **params: Path and query parameters.
 
         Returns:
             ParsedResponse containing typed items and pagination state.
-
-        Example:
-            >>> motive = Provider.from_config("motive", config)
-            >>> response = motive.fetch("vehicles")
-            >>> print(f"Found {response.item_count} vehicles on this page")
         """
-        endpoint: EndpointDefinition[Any, Any] = self.endpoint(endpoint_name)
+        endpoint: EndpointDefinition[BaseModel] = self.endpoint(endpoint_name)
 
         with self.client() as client:
             return client.fetch(endpoint, **params)
@@ -264,29 +371,29 @@ class Provider:
     def fetch_all(
         self,
         endpoint_name: str,
-        request_delay_seconds: float = 0.0,
+        request_delay_seconds: float | None = None,
         **params: Any,
-    ) -> Iterator[Any]:
+    ) -> Iterator[BaseModel]:
         """
         Iterate through all items across all pages.
 
-        Creates and manages a client automatically. Yields individual items
-        as they are retrieved.
+        Creates a client, paginates through all results, and closes the client.
+        Items are yielded one at a time for memory efficiency.
 
         Args:
             endpoint_name: Endpoint name (e.g., 'vehicles').
-            request_delay_seconds: Delay between page requests.
+            request_delay_seconds: Override delay between page requests.
+                None uses the calculated default from rate limits.
             **params: Path and query parameters.
 
         Yields:
             Individual items from each page.
 
         Example:
-            >>> motive = Provider.from_config("motive", config)
-            >>> for vehicle in motive.fetch_all("vehicles"):
-            ...     print(f"{vehicle.number}: {vehicle.make} {vehicle.model}")
+            >>> for vehicle in motive.fetch_all('vehicles'):
+            ...     print(f'{vehicle.number}: {vehicle.make} {vehicle.model}')
         """
-        endpoint: EndpointDefinition[Any, Any] = self.endpoint(endpoint_name)
+        endpoint: EndpointDefinition[BaseModel] = self.endpoint(endpoint_name)
 
         with self.client() as client:
             yield from client.fetch_all(
@@ -298,29 +405,24 @@ class Provider:
     def fetch_all_pages(
         self,
         endpoint_name: str,
-        request_delay_seconds: float = 0.0,
+        request_delay_seconds: float | None = None,
         **params: Any,
-    ) -> Iterator[ParsedResponse[Any]]:
+    ) -> Iterator[ParsedResponse[BaseModel]]:
         """
         Iterate through all pages, yielding full ParsedResponse objects.
 
-        Useful when you need pagination metadata or batch processing.
+        Useful when you need pagination metadata or want to process
+        items in page-sized batches.
 
         Args:
             endpoint_name: Endpoint name (e.g., 'vehicles').
-            request_delay_seconds: Delay between page requests.
+            request_delay_seconds: Override delay between page requests.
             **params: Path and query parameters.
 
         Yields:
             ParsedResponse objects for each page.
-
-        Example:
-            >>> motive = Provider.from_config("motive", config)
-            >>> for page in motive.fetch_all_pages("vehicles"):
-            ...     print(f"Processing page with {page.item_count} items")
-            ...     process_batch(page.items)
         """
-        endpoint: EndpointDefinition[Any, Any] = self.endpoint(endpoint_name)
+        endpoint: EndpointDefinition[BaseModel] = self.endpoint(endpoint_name)
 
         with self.client() as client:
             yield from client.fetch_all_pages(
@@ -332,126 +434,61 @@ class Provider:
     def to_dataframe(
         self,
         endpoint_name: str,
-        request_delay_seconds: float = 0.0,
+        request_delay_seconds: float | None = None,
         **params: Any,
     ) -> pd.DataFrame:
         """
-        Fetch all data from an endpoint and return as a pandas DataFrame.
+        Fetch all data from an endpoint and return as a DataFrame.
 
-        This is a convenience method that fetches all items, converts them
-        from Pydantic models to dictionaries, and creates a DataFrame.
+        Convenience method that fetches all items, converts Pydantic models
+        to dictionaries, and creates a DataFrame. Loads all data into memory.
 
         Args:
             endpoint_name: Endpoint name (e.g., 'vehicles').
-            request_delay_seconds: Delay between page requests.
+            request_delay_seconds: Override delay between page requests.
             **params: Path and query parameters.
 
         Returns:
-            pandas DataFrame containing all fetched data.
-
-        Raises:
-            ImportError: If pandas is not installed.
+            DataFrame containing all fetched data. Empty DataFrame if no items.
 
         Example:
-            >>> motive = Provider.from_config("motive", config)
-            >>>
-            >>> # Get all vehicles as DataFrame
-            >>> df = motive.to_dataframe("vehicles")
-            >>> print(df.head())
-            >>>
-            >>> # With parameters
-            >>> df = motive.to_dataframe(
-            ...     "vehicle_locations",
-            ...     vehicle_id=12345,
-            ...     start_date=date(2025, 1, 1),
-            ... )
-            >>>
-            >>> # Save to file
-            >>> df.to_parquet("vehicles.parquet")
-            >>> df.to_csv("vehicles.csv")
+            >>> df = motive.to_dataframe('vehicles')
+            >>> df.to_parquet('vehicles.parquet')
         """
-        # Fetch all items
-        items: list[Any] = list(
-            self.fetch_all(
-                endpoint_name,
+        endpoint: EndpointDefinition[BaseModel] = self.endpoint(endpoint_name)
+
+        with self.client() as client:
+            return client.to_dataframe(
+                endpoint,
                 request_delay_seconds=request_delay_seconds,
                 **params,
             )
-        )
 
-        if not items:
-            logger.warning(
-                'No items found for endpoint %r with params %r', endpoint_name, params
-            )
-            return pd.DataFrame()
-
-        # Convert Pydantic models to dictionaries
-        data: list[Any | dict[str, Any]] = [
-            item.model_dump() if hasattr(item, 'model_dump') else dict(item)
-            for item in items
-        ]
-
-        # Create DataFrame
-        df = pd.DataFrame(data)
-
-        logger.info(
-            'Created DataFrame from %d items with %d columns',
-            len(items),
-            len(df.columns),
-        )
-
-        return df
-
-    def get_request_delay(self) -> float:
-        """
-        Get the effective request delay, considering both pipeline global delay
-        and provider-specific rate limits.
-
-        Returns the larger of:
-        - Pipeline global delay
-        - 1/rate_limit (time per request based on rate limit)
-        """
-        if not self.config:
-            return 0.0
-
-        pipeline_delay: float = self.config.pipeline.request_delay_seconds
-        provider_config: ProviderConfig | None = self.config.providers.get(self.name)
-        if not provider_config:
-            return pipeline_delay
-
-        # Calculate minimum delay based on rate limit
-        # e.g., 10 req/sec = 0.1 sec/req minimum
-        rate_limit: int = provider_config.rate_limit_requests_per_second
-        rate_delay: float = 1.0 / rate_limit if rate_limit > 0 else 0.0
-
-        # Use the more conservative (larger) delay
-        return max(pipeline_delay, rate_delay)
+    # -------------------------------------------------------------------------
+    # Utility Methods
+    # -------------------------------------------------------------------------
 
     def describe(self) -> str:
         """
         Generate human-readable description of this provider's endpoints.
 
         Returns:
-            Formatted string with endpoint descriptions.
-
-        Example:
-            >>> motive = Provider.from_config("motive", config)
-            >>> print(motive.describe())
+            Formatted multi-line string with endpoint details.
         """
-        return self._registry.describe(self.name)
+        return self._registry.describe(self._name)
 
     def __repr__(self) -> str:
-        """String representation of Provider."""
+        """String representation for debugging."""
         endpoint_count: int = len(self.list_endpoints())
         return (
-            f"Provider(name='{self.name}', "
-            f"base_url='{self.credentials.base_url}', "
+            f'Provider(name={self._name!r}, '
+            f'base_url={self._credentials.base_url!r}, '
             f'endpoints={endpoint_count})'
         )
 
 
 # =============================================================================
-# Multi-Provider Facade
+# Multi-Provider Manager
 # =============================================================================
 
 
@@ -459,43 +496,38 @@ class ProviderManager:
     """
     Manages multiple provider instances from configuration.
 
-    Provides unified access to multiple providers (Motive, Samsara, etc.)
-    from a single configuration file.
+    Provides unified access to all enabled providers from a single config.
+    Only providers with `enabled: true` in configuration are loaded.
 
     Example:
-        >>> from fleet_telemetry_hub.config.loader import load_config
-        >>>
-        >>> config = load_config("config.yaml")
+        >>> config = load_config('config.yaml')
         >>> manager = ProviderManager.from_config(config)
         >>>
-        >>> # Access specific provider
-        >>> motive = manager.get("motive")
-        >>> for vehicle in motive.fetch_all("vehicles"):
-        ...     print(vehicle.number)
-        >>>
-        >>> # Or iterate all enabled providers
-        >>> for provider_name, provider in manager.enabled_providers():
-        ...     print(f"\nFetching from {provider_name}...")
-        ...     for vehicle in provider.fetch_all("vehicles"):
+        >>> # Get specific provider (returns None if not enabled)
+        >>> motive = manager.get('motive')
+        >>> if motive:
+        ...     for vehicle in motive.fetch_all('vehicles'):
         ...         print(vehicle.number)
+        >>>
+        >>> # Iterate all enabled providers
+        >>> for name, provider in manager.items():
+        ...     print(f'{name}: {len(list(provider.fetch_all("vehicles")))} vehicles')
     """
 
-    def __init__(
-        self,
-        providers: dict[str, Provider],
-    ) -> None:
+    def __init__(self, providers: dict[str, Provider]) -> None:
         """
         Initialize provider manager.
 
         Args:
             providers: Dictionary mapping provider names to Provider instances.
+                Only enabled providers should be included.
         """
         self._providers: dict[str, Provider] = providers
 
         logger.info(
-            'ProviderManager initialized with %d provider(s): %r',
+            'ProviderManager initialized: %d provider(s) [%s]',
             len(providers),
-            ', '.join(providers.keys()),
+            ', '.join(sorted(providers.keys())),
         )
 
     @classmethod
@@ -507,39 +539,69 @@ class ProviderManager:
         """
         Create provider manager from configuration.
 
-        Only initializes providers that are marked as enabled.
+        Only initializes providers that are marked as enabled in config.
 
         Args:
             config: TelemetryConfig instance from config file.
             registry: Optional custom endpoint registry.
 
         Returns:
-            Initialized ProviderManager.
+            Initialized ProviderManager with enabled providers.
 
         Example:
-            >>> from fleet_telemetry_hub.config.loader import load_config
-            >>>
-            >>> config = load_config("config.yaml")
+            >>> config = load_config('config.yaml')
             >>> manager = ProviderManager.from_config(config)
+            >>> print(manager.list_providers())
+            ['motive', 'samsara']
         """
         providers: dict[str, Provider] = {}
 
         for provider_name, provider_config in config.providers.items():
             if provider_config.enabled:
-                providers[provider_name] = Provider.from_config(
-                    provider_name,
-                    config,
-                    registry,
-                )
-                logger.info('Loaded provider: %r', provider_name)
+                try:
+                    providers[provider_name] = Provider.from_config(
+                        provider_name,
+                        config,
+                        registry,
+                    )
+                    logger.info('Loaded enabled provider: %r', provider_name)
+                except ProviderNotFoundError:
+                    # Provider is configured but not in registry (unknown provider)
+                    logger.warning(
+                        'Provider %r is enabled but not found in registry, skipping',
+                        provider_name,
+                    )
             else:
-                logger.info('Skipped disabled provider: %r', provider_name)
+                logger.debug('Skipped disabled provider: %r', provider_name)
 
         return cls(providers)
 
-    def get(self, provider_name: str) -> Provider:
+    def get(self, provider_name: str) -> Provider | None:
         """
-        Get a provider by name.
+        Get a provider by name, or None if not available.
+
+        Returns None for providers that are disabled, not configured,
+        or not found in the registry. Use this when you want to gracefully
+        handle missing providers.
+
+        Args:
+            provider_name: Provider name (case-sensitive as stored).
+
+        Returns:
+            Provider instance if available, None otherwise.
+
+        Example:
+            >>> motive = manager.get('motive')
+            >>> if motive:
+            ...     process_motive_data(motive)
+        """
+        return self._providers.get(provider_name)
+
+    def require(self, provider_name: str) -> Provider:
+        """
+        Get a provider by name, raising if not available.
+
+        Use this when a provider is required and its absence is an error.
 
         Args:
             provider_name: Provider name (case-sensitive).
@@ -548,20 +610,21 @@ class ProviderManager:
             Provider instance.
 
         Raises:
-            KeyError: If provider not found or not enabled.
+            KeyError: If provider is not available.
 
         Example:
-            >>> manager = ProviderManager.from_config(config)
-            >>> motive = manager.get("motive")
+            >>> motive = manager.require('motive')  # Raises if not enabled
         """
-        if provider_name not in self._providers:
-            available: str = ', '.join(self._providers.keys())
+        provider: Provider | None = self._providers.get(provider_name)
+
+        if provider is None:
+            available: str = ', '.join(sorted(self._providers.keys()))
             raise KeyError(
-                f"Provider '{provider_name}' not found or not enabled. "
-                f'Available providers: {available}'
+                f"Provider '{provider_name}' not available. "
+                f'Enabled providers: {available or "(none)"}'
             )
 
-        return self._providers[provider_name]
+        return provider
 
     def has(self, provider_name: str) -> bool:
         """
@@ -572,42 +635,44 @@ class ProviderManager:
 
         Returns:
             True if provider is loaded and enabled.
-
-        Example:
-            >>> if manager.has("motive"):
-            ...     motive = manager.get("motive")
         """
         return provider_name in self._providers
 
     def list_providers(self) -> list[str]:
         """
-        Get list of all loaded provider names.
+        Get list of all enabled provider names.
 
         Returns:
-            List of provider names.
-
-        Example:
-            >>> manager = ProviderManager.from_config(config)
-            >>> print(manager.list_providers())
-            ['motive', 'samsara']
+            Sorted list of provider names.
         """
-        return list(self._providers.keys())
+        return sorted(self._providers.keys())
 
-    def enabled_providers(self) -> Iterator[tuple[str, Provider]]:
+    def items(self) -> Iterator[tuple[str, Provider]]:
         """
         Iterate through all enabled providers.
+
+        Yields providers in sorted order by name for deterministic iteration.
 
         Yields:
             Tuples of (provider_name, provider_instance).
 
         Example:
-            >>> for name, provider in manager.enabled_providers():
-            ...     print(f"Processing {name}...")
-            ...     for vehicle in provider.fetch_all("vehicles"):
+            >>> for name, provider in manager.items():
+            ...     print(f'Processing {name}...')
+            ...     for vehicle in provider.fetch_all('vehicles'):
             ...         process(vehicle)
         """
-        yield from self._providers.items()
+        for name in sorted(self._providers.keys()):
+            yield name, self._providers[name]
+
+    def __len__(self) -> int:
+        """Number of enabled providers."""
+        return len(self._providers)
+
+    def __bool__(self) -> bool:
+        """True if at least one provider is enabled."""
+        return len(self._providers) > 0
 
     def __repr__(self) -> str:
-        """String representation of ProviderManager."""
-        return f'ProviderManager(providers={list(self._providers.keys())})'
+        """String representation for debugging."""
+        return f'ProviderManager(providers={sorted(self._providers.keys())})'

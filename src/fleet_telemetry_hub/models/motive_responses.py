@@ -93,6 +93,10 @@ class VehicleLocationType(str, Enum):
     VEHICLE_MOVING = 'vehicle_moving'
     IGNITION_ON = 'ignition_on'
     IGNITION_OFF = 'ignition_off'
+    ENGINE_START = 'engine_start'
+    ENGINE_STOP = 'engine_stop'
+    GPS_MOVING = 'gps_moving'
+    GPS_STOPPED = 'gps_stopped'
 
 
 class FuelType(str, Enum):

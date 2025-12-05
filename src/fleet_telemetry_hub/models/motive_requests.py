@@ -11,14 +11,15 @@ a uniform interface, never needing to know endpoint-specific details.
 """
 
 import logging
-from typing import Any, Generic
+from typing import Any
 
-from pydantic import ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from .motive_responses import (
     Group,
     GroupsResponse,
     MotivePaginationInfo,
+    ResponseModelBase,
     User,
     UsersResponse,
     Vehicle,
@@ -29,14 +30,12 @@ from .motive_responses import (
 from .shared_request_models import HTTPMethod, RequestSpec
 from .shared_response_models import (
     EndpointDefinition,
-    ItemT,
     PaginationState,
     ParameterType,
     ParsedResponse,
     PathParameterSpec,
     ProviderCredentials,
     QueryParameterSpec,
-    ResponseModelT,
 )
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -47,9 +46,8 @@ logger: logging.Logger = logging.getLogger(__name__)
 # =============================================================================
 
 
-class MotiveEndpointDefinition(
-    EndpointDefinition[ResponseModelT, ItemT],
-    Generic[ResponseModelT, ItemT],
+class MotiveEndpointDefinition[ResponseModelT: BaseModel, ItemT: ResponseModelBase](
+    EndpointDefinition[ItemT],
 ):
     """
     Motive-specific endpoint definition with page-number pagination.
@@ -120,10 +118,10 @@ class MotiveEndpointDefinition(
         }
 
         logger.debug(
-            'Built Motive request: %s %r params=%r',
+            'Built Motive request: %s %s params=%r',
             self.http_method.value,
             url,
-            list(query_params.keys()),
+            query_params,
         )
 
         return RequestSpec(
@@ -329,7 +327,7 @@ class MotiveEndpoints:
     @classmethod
     def get_all_endpoints(
         cls,
-    ) -> dict[str, MotiveEndpointDefinition[Any, Any]]:
+    ) -> dict[str, MotiveEndpointDefinition[ResponseModelBase, ResponseModelBase]]:
         """Return all endpoint definitions as a dictionary."""
         return {
             name: value

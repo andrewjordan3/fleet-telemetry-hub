@@ -10,7 +10,7 @@ import logging
 import sys
 from pathlib import Path
 
-from ..config import LoggingConfig
+from fleet_telemetry_hub.config import LoggingConfig
 
 
 def setup_logger(

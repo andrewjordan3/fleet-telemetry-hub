@@ -14,22 +14,14 @@ authors = [{ name = "Andrew Jordan", email = "andrewjordan3@gmail.com" }]
 description = "A robust, type-safe Python client for telemetry provider APIs"
 readme = "README.md"
 license = { text = "MIT" }
-requires-python = ">=3.11"
-keywords = [
-    "samsara",
-    "motive",
-    "fuel",
-    "rest",
-    "api",
-    "eld",
-    "fleet",
-]
+requires-python = ">=3.12"
+keywords = ["samsara", "motive", "fuel", "rest", "api", "eld", "fleet"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Typing :: Typed",
 ]
@@ -42,7 +34,7 @@ dependencies = [
     "pandas>=2.0.0",
     "pyarrow>=14.0.0",
     "httpx>=0.28.0",
-    "tenacity>=9.1.0"
+    "tenacity>=9.1.0",
 ]
 
 # Optional dependencies
@@ -50,9 +42,7 @@ dependencies = [
 
 # System trust store / TLS extras
 # For Windows OS behind ZScaler or similar
-tls = [
-    "truststore>=0.10.0",
-]
+tls = ["truststore>=0.10.0"]
 
 # Development tools
 dev = [
@@ -94,7 +84,7 @@ exclude = ["tests*", "docs*"]
 ###############################################################################
 [tool.ruff]
 line-length = 88
-target-version = "py311"
+target-version = "py312"
 
 exclude = [
     ".git",
@@ -129,8 +119,8 @@ select = [
 ]
 
 ignore = [
-    "E501",    # Line too long (handled by ruff format)
-    "E203",    # Whitespace before ':' (conflicts with formatter)
+    "E501", # Line too long (handled by ruff format)
+    "E203", # Whitespace before ':' (conflicts with formatter)
 ]
 
 [tool.ruff.lint.per-file-ignores]
@@ -150,7 +140,7 @@ combine-as-imports = true
 # MYPY - TYPE CHECKING
 ###############################################################################
 [tool.mypy]
-python_version = "3.11"
+python_version = "3.12"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true

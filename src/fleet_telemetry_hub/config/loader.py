@@ -16,10 +16,11 @@ Responsibilities:
 
 import logging
 from pathlib import Path
+from typing import Any
 
 import yaml
 
-from .config_models import TelemetryConfig
+from fleet_telemetry_hub.config.config_models import TelemetryConfig
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -73,7 +74,7 @@ def load_config(config_path: Path | str | None = None) -> TelemetryConfig:
     # Parse YAML
     try:
         with Path.open(config_path, encoding='utf-8') as config_file:
-            raw_config_data = yaml.safe_load(config_file)
+            raw_config_data: Any = yaml.safe_load(config_file)
     except yaml.YAMLError as error:
         error_message = f'Failed to parse YAML configuration: {error}'
         logger.error(error_message)

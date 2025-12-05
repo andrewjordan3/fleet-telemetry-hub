@@ -36,6 +36,7 @@ Design Decisions:
 """
 
 import logging
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -59,9 +60,40 @@ from fleet_telemetry_hub.utils import (
     setup_logger,
 )
 
-__all__: list[str] = ['TelemetryPipeline']
+__all__: list[str] = ['PipelineError', 'TelemetryPipeline']
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+# Type alias for fetch functions
+FetchFunction = Callable[[Provider, datetime, datetime], list[dict[str, Any]]]
+
+# Registry of provider-specific fetch functions.
+# Add new providers here as they are implemented.
+PROVIDER_FETCH_FUNCTIONS: dict[str, FetchFunction] = {
+    'motive': fetch_motive_data,
+    'samsara': fetch_samsara_data,
+}
+
+
+class PipelineError(Exception):
+    """
+    Raised when the pipeline encounters a fatal error.
+
+    Attributes:
+        message: Human-readable error description.
+        batch_index: Which batch failed (1-indexed), if applicable.
+        partial_data_saved: Whether any data was saved before the error.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        batch_index: int | None = None,
+        partial_data_saved: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.batch_index: int | None = batch_index
+        self.partial_data_saved: bool = partial_data_saved
 
 
 class TelemetryPipeline:
@@ -107,6 +139,7 @@ class TelemetryPipeline:
             FileNotFoundError: If the config file does not exist.
             ValidationError: If the config file fails Pydantic validation.
             OSError: If the Parquet output directory cannot be created.
+            PipelineError: If no providers are enabled or none have fetch functions.
         """
         # Normalize to Path for consistent handling
         config_path = Path(config_path)
@@ -132,6 +165,9 @@ class TelemetryPipeline:
             self._config
         )
 
+        # Validate we have at least one usable provider
+        self._validate_providers()
+
         # Will hold the final DataFrame after run() completes
         self._dataframe: pd.DataFrame | None = None
 
@@ -140,6 +176,38 @@ class TelemetryPipeline:
             list(self._provider_manager.list_providers()),
             self._file_handler.path,
         )
+
+    def _validate_providers(self) -> None:
+        """
+        Validate that at least one enabled provider has a fetch function.
+
+        Raises:
+            PipelineError: If no providers are enabled or none are supported.
+        """
+        if not self._provider_manager:
+            raise PipelineError(
+                'No providers are enabled in configuration. '
+                'Enable at least one provider (motive, samsara) to run the pipeline.'
+            )
+
+        enabled_providers: list[str] = self._provider_manager.list_providers()
+        supported_providers: list[str] = [
+            name for name in enabled_providers if name in PROVIDER_FETCH_FUNCTIONS
+        ]
+
+        if not supported_providers:
+            raise PipelineError(
+                f'No enabled providers have fetch functions implemented. '
+                f'Enabled: {enabled_providers}. '
+                f'Supported: {list(PROVIDER_FETCH_FUNCTIONS.keys())}.'
+            )
+
+        unsupported: set[str] = set(enabled_providers) - set(supported_providers)
+        if unsupported:
+            logger.warning(
+                'Some enabled providers have no fetch function and will be skipped: %s',
+                sorted(unsupported),
+            )
 
     @property
     def config(self) -> TelemetryConfig:
@@ -166,12 +234,13 @@ class TelemetryPipeline:
         2. Generate time-based batches from start to now
         3. For each batch, fetch from all enabled providers
         4. Deduplicate and save incrementally
+        5. Log summary statistics
 
         The pipeline saves after each batch, so partial progress is preserved
         if execution is interrupted.
 
         Raises:
-            RuntimeError: If all providers fail for any batch. Partial data
+            PipelineError: If all providers fail for any batch. Partial data
                 from successful batches is preserved in the Parquet file.
 
         Side Effects:
@@ -179,8 +248,9 @@ class TelemetryPipeline:
             - Updates self._dataframe with the final state
             - Logs progress at INFO level, details at DEBUG level
         """
+        run_start_time: datetime = datetime.now(UTC)
         start_datetime: datetime = self._determine_start_datetime()
-        end_datetime: datetime = datetime.now(UTC)
+        end_datetime: datetime = run_start_time
 
         logger.info(
             'Starting pipeline run: %s to %s',
@@ -194,11 +264,19 @@ class TelemetryPipeline:
             end_datetime,
         )
 
+        if not batches:
+            logger.info('No batches to process (start >= end). Pipeline complete.')
+            self._dataframe = self._file_handler.load()
+            return
+
         logger.info(
             'Processing %d batches (increment=%.2f days)',
             len(batches),
             self._config.pipeline.batch_increment_days,
         )
+
+        total_records_fetched: int = 0
+        batches_with_data: int = 0
 
         for batch_index, (batch_start, batch_end) in enumerate(batches, start=1):
             logger.info(
@@ -217,13 +295,13 @@ class TelemetryPipeline:
 
             # If ALL providers failed, abort the pipeline
             if batch_records is None:
-                error_message: str = (
+                raise PipelineError(
                     f'All providers failed for batch {batch_index}/{len(batches)} '
                     f'({batch_start.isoformat()} to {batch_end.isoformat()}). '
-                    f'Aborting pipeline. Partial data from previous batches is preserved.'
+                    f'Aborting pipeline. Partial data from previous batches is preserved.',
+                    batch_index=batch_index,
+                    partial_data_saved=batches_with_data > 0,
                 )
-                logger.error(error_message)
-                raise RuntimeError(error_message)
 
             # Empty batch (no records, but no errors) is fine - just skip saving
             if not batch_records:
@@ -236,6 +314,8 @@ class TelemetryPipeline:
 
             # Save incrementally
             self._save_batch(batch_records)
+            total_records_fetched += len(batch_records)
+            batches_with_data += 1
 
             logger.info(
                 'Batch %d/%d complete: %d records saved',
@@ -244,13 +324,62 @@ class TelemetryPipeline:
                 len(batch_records),
             )
 
-        # Load final state into memory
-        self._dataframe = self._file_handler.load()
-
-        final_record_count: int = (
-            len(self._dataframe) if self._dataframe is not None else 0
+        # _save_batch already updates _dataframe, no need to reload
+        self._log_run_summary(
+            run_start_time=run_start_time,
+            batches_processed=len(batches),
+            batches_with_data=batches_with_data,
+            records_fetched=total_records_fetched,
         )
-        logger.info('Pipeline run complete: %d total records', final_record_count)
+
+    def _log_run_summary(
+        self,
+        run_start_time: datetime,
+        batches_processed: int,
+        batches_with_data: int,
+        records_fetched: int,
+    ) -> None:
+        """
+        Log summary statistics for the pipeline run.
+
+        Args:
+            run_start_time: When the run started (for duration calculation).
+            batches_processed: Total number of batches processed.
+            batches_with_data: Number of batches that returned data.
+            records_fetched: Total new records fetched this run.
+        """
+        run_duration: timedelta = datetime.now(UTC) - run_start_time
+
+        if self._dataframe is None or self._dataframe.empty:
+            logger.info(
+                'Pipeline run complete: no data. Duration: %s',
+                run_duration,
+            )
+            return
+
+        unique_vins: int = self._dataframe['vin'].nunique()
+        unique_providers: int = self._dataframe['provider'].nunique()
+        min_timestamp: datetime = self._dataframe['timestamp'].min().to_pydatetime()
+        max_timestamp: datetime = self._dataframe['timestamp'].max().to_pydatetime()
+        file_size_mb: float | None = self._file_handler.get_file_size('mb')
+
+        logger.info(
+            'Pipeline run complete: '
+            '%d total records, %d unique VINs, %d provider(s). '
+            'Date range: %s to %s. '
+            'This run: %d batches, %d with data, %d records fetched. '
+            'File size: %.2f MB. Duration: %s',
+            len(self._dataframe),
+            unique_vins,
+            unique_providers,
+            min_timestamp.date().isoformat(),
+            max_timestamp.date().isoformat(),
+            batches_processed,
+            batches_with_data,
+            records_fetched,
+            file_size_mb or 0.0,
+            run_duration,
+        )
 
     def _determine_start_datetime(self) -> datetime:
         """
@@ -354,39 +483,64 @@ class TelemetryPipeline:
             None if all providers failed (signals abort condition).
         """
         all_records: list[dict[str, Any]] = []
-        any_provider_succeeded: bool = False
+        providers_attempted: int = 0
+        providers_succeeded: int = 0
 
-        # Fetch from Motive
-        motive_provider: Provider = self._provider_manager.get('motive')
-        try:
-            motive_records: list[dict[str, Any]] = fetch_motive_data(
-                motive_provider,
-                batch_start,
-                batch_end,
+        # Iterate over enabled providers that have fetch functions
+        for provider_name, provider in self._provider_manager.items():
+            fetch_function: FetchFunction | None = PROVIDER_FETCH_FUNCTIONS.get(
+                provider_name
             )
-            all_records.extend(motive_records)
-            any_provider_succeeded = True
-            logger.debug('Motive returned %d records', len(motive_records))
-        except Exception:
-            logger.exception('Motive fetch failed for batch')
 
-        # Fetch from Samsara
-        samsara_provider: Provider = self._provider_manager.get('samsara')
-        try:
-            samsara_records: list[dict[str, Any]] = fetch_samsara_data(
-                samsara_provider,
-                batch_start,
-                batch_end,
-            )
-            all_records.extend(samsara_records)
-            any_provider_succeeded = True
-            logger.debug('Samsara returned %d records', len(samsara_records))
-        except Exception:
-            logger.exception('Samsara fetch failed for batch')
+            if fetch_function is None:
+                logger.debug(
+                    'Provider %r has no fetch function, skipping',
+                    provider_name,
+                )
+                continue
 
-        # Return None only if ALL providers failed (abort signal)
-        if not any_provider_succeeded:
+            providers_attempted += 1
+
+            try:
+                records: list[dict[str, Any]] = fetch_function(
+                    provider,
+                    batch_start,
+                    batch_end,
+                )
+                all_records.extend(records)
+                providers_succeeded += 1
+                logger.debug(
+                    'Provider %r returned %d records',
+                    provider_name,
+                    len(records),
+                )
+            except Exception:
+                logger.exception(
+                    'Provider %r fetch failed for batch %s to %s',
+                    provider_name,
+                    batch_start.isoformat(),
+                    batch_end.isoformat(),
+                )
+
+        # If no providers were even attempted, something is misconfigured
+        if providers_attempted == 0:
+            logger.error('No providers with fetch functions were available')
             return None
+
+        # Return None only if ALL attempted providers failed (abort signal)
+        if providers_succeeded == 0:
+            logger.error(
+                'All %d provider(s) failed for batch',
+                providers_attempted,
+            )
+            return None
+
+        logger.debug(
+            'Batch fetch complete: %d/%d providers succeeded, %d total records',
+            providers_succeeded,
+            providers_attempted,
+            len(all_records),
+        )
 
         return all_records
 
@@ -420,17 +574,21 @@ class TelemetryPipeline:
                 ignore_index=True,
             )
 
+            pre_dedup_count: int = len(combined_dataframe)
             # Deduplicate: keep='last' means fresh data overwrites stale
             combined_dataframe = combined_dataframe.drop_duplicates(
                 subset=DEDUP_COLUMNS,
                 keep='last',
             )
+            post_dedup_count: int = len(combined_dataframe)
+            duplicates_removed: int = pre_dedup_count - post_dedup_count
 
             logger.debug(
-                'Combined %d existing + %d new = %d after dedup',
+                'Combined %d existing + %d new = %d total, %d duplicates removed',
                 len(existing_dataframe),
                 len(new_dataframe),
-                len(combined_dataframe),
+                post_dedup_count,
+                duplicates_removed,
             )
         else:
             combined_dataframe = new_dataframe

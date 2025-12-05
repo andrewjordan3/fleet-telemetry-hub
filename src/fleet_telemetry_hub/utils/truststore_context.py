@@ -1,6 +1,32 @@
 # fleet_telemetry_hub/utils/truststore_context.py
+"""
+SSL Context Factory using System Trust Store.
 
-from __future__ import annotations
+This module provides a factory function to create SSL contexts that verify
+certificates using the operating system's native trust store, rather than
+Python's default bundled certificates (certifi).
+
+Primary Use Case:
+    Corporate environments using aggressive proxies (like Zscaler) that act as
+    Man-in-the-Middle (MITM) inspectors. These proxies re-encrypt traffic using
+    a private Root CA that is installed in the Windows/macOS system store but
+    is unknown to standard Python libraries.
+
+    Without this module, requests fail with `SSLCertVerificationError`.
+    With this module, Python trusts the Zscaler Root CA, enabling secure
+    connectivity without disabling SSL verification.
+
+Design Benefit: Optional Dependency
+    The `truststore` library is imported lazily inside the factory function.
+    This design ensures that the package remains usable in standard environments
+    (or Linux servers) where `truststore` might not be installed. The package
+    will only raise an ImportError if this specific function is explicitly
+    called without the dependency present.
+
+Dependencies:
+    - truststore: Optional. Required only if using this factory function.
+      Install with: `pip install truststore`
+"""
 
 import ssl
 from ssl import SSLContext
