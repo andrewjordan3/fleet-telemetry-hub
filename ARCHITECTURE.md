@@ -741,7 +741,7 @@ storage:
 The foundation of the entire system. Every endpoint inherits from this base class.
 
 ```python
-class EndpointDefinition(ABC, BaseModel, Generic[ResponseModelT, ItemT]):
+class EndpointDefinition[ResponseModelT, ItemT](ABC, BaseModel):
     """
     Abstract base for self-describing API endpoints.
 
@@ -781,7 +781,7 @@ class EndpointDefinition(ABC, BaseModel, Generic[ResponseModelT, ItemT]):
 #### Motive
 
 ```python
-class MotiveEndpointDefinition(EndpointDefinition[ResponseModelT, ItemT]):
+class MotiveEndpointDefinition[ResponseModelT, ItemT](EndpointDefinition[ResponseModelT, ItemT]):
     """
     Motive uses:
     - Authentication: X-API-Key header
@@ -811,7 +811,7 @@ class MotiveEndpointDefinition(EndpointDefinition[ResponseModelT, ItemT]):
 #### Samsara
 
 ```python
-class SamsaraEndpointDefinition(EndpointDefinition[ResponseModelT, ItemT]):
+class SamsaraEndpointDefinition[ResponseModelT, ItemT](EndpointDefinition[ResponseModelT, ItemT]):
     """
     Samsara uses:
     - Authentication: Bearer token
@@ -909,7 +909,7 @@ What you get back from `endpoint.parse_response()` or `client.fetch()`.
 
 ```python
 @dataclass
-class ParsedResponse(Generic[ItemT]):
+class ParsedResponse[ItemT]:
     """
     Uniform container for parsed API responses.
     """
@@ -1201,7 +1201,7 @@ class GeotabLocation(BaseModel):
 ```python
 from fleet_telemetry_hub.models.shared_response_models import EndpointDefinition
 
-class GeotabEndpointDefinition(EndpointDefinition[ResponseModelT, ItemT]):
+class GeotabEndpointDefinition[ResponseModelT, ItemT](EndpointDefinition[ResponseModelT, ItemT]):
     """
     Geotab-specific endpoint implementation.
     - Authentication: Session token in headers
@@ -1386,7 +1386,7 @@ class XyzVehiclesResponse(BaseModel):
 2. **Create endpoint definition** (in `models/xyz_requests.py`):
 
 ```python
-class XyzEndpointDefinition(EndpointDefinition[ResponseModelT, ItemT]):
+class XyzEndpointDefinition[ResponseModelT, ItemT](EndpointDefinition[ResponseModelT, ItemT]):
     """Provider-specific implementation."""
 
     def build_request_spec(self, credentials, pagination_state, **params):
