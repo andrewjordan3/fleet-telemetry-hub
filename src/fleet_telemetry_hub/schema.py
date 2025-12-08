@@ -22,6 +22,7 @@ The schema is intentionally flat (no nested structures) to optimize for:
 
 from typing import Final
 
+import numpy as np
 import pandas as pd
 
 __all__: list[str] = [
@@ -107,6 +108,9 @@ def enforce_telemetry_schema(dataframe: pd.DataFrame) -> pd.DataFrame:
     # Work on a copy to avoid mutating the input
     result: pd.DataFrame = dataframe.copy()
 
+    # Replace empty strings ('') and whitespace-only strings ('   ') with np.nan.
+    result = result.replace(to_replace=r'^\s*$', value=np.nan, regex=True)
+
     # Timestamp: ensure timezone-aware UTC datetime
     # pd.to_datetime handles strings, timestamps, and already-converted values
     result['timestamp'] = pd.to_datetime(result['timestamp'], utc=True)
@@ -122,7 +126,7 @@ def enforce_telemetry_schema(dataframe: pd.DataFrame) -> pd.DataFrame:
     for column_name in numeric_columns:
         result[column_name] = pd.to_numeric(
             result[column_name], errors='coerce'
-        ).astype('float64')
+        ).astype(np.float64)
 
     # Categorical columns: memory-efficient storage for low-cardinality strings
     categorical_columns: list[str] = ['provider', 'engine_state']
