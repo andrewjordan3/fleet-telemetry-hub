@@ -60,6 +60,17 @@ class AssignmentType(str, Enum):
     HOS = 'HOS'  # Hours of Service assignment
     DISPATCH = 'Dispatch'  # Dispatch assignment
     MANUAL = 'Manual'  # Manual assignment
+    STATIC = 'Static'
+    IDCARD = 'idCard'
+    FACEID = 'faceId'
+    TACHOGRAPH = 'tachograph'
+    SAFETYMANUAL = 'safetyManual'
+    RFID = 'RFID'
+    TRAILER = 'trailer'
+    EXTERNAL = 'external'
+    QRCODE = 'qrCode'
+    INVALID = 'invalid'
+    UNKNOWN = 'unknown'
 
 
 class FilterBy(str, Enum):
