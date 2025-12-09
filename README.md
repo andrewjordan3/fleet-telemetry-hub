@@ -35,6 +35,7 @@ Whether you need one-off API queries or continuous data collection, Fleet Teleme
 - **Atomic Writes**: No data corruption even if process crashes mid-write
 - **Automatic Deduplication**: Handles overlapping data from multiple runs
 - **Parquet Storage**: Efficient columnar storage with compression
+- **Date Partitioning**: Daily partitions for BigQuery compatibility and scalable storage
 - **Independent Provider Fetching**: One provider's failure doesn't block others
 - **Comprehensive Logging**: Track progress and debug issues
 
@@ -73,6 +74,10 @@ pip install -e ".[all]"
 
 The pipeline automatically collects, normalizes, and stores data from all configured providers.
 
+**Choose Your Storage Strategy:**
+- **Single-File Pipeline**: Best for datasets under 10M records or simple deployments
+- **Partitioned Pipeline**: Recommended for large-scale datasets (10M+ records), BigQuery integration, or data retention policies
+
 **1. Create a configuration file** at `config/telemetry_config.yaml`:
 
 ```yaml
@@ -110,7 +115,7 @@ logging:
   file_level: "DEBUG"
 ```
 
-**2. Run the pipeline**:
+**2a. Run the single-file pipeline** (for smaller datasets):
 
 ```python
 from fleet_telemetry_hub.pipeline import TelemetryPipeline
@@ -133,11 +138,54 @@ df.to_csv('telemetry.csv', index=False)
 df.to_excel('telemetry.xlsx', index=False)
 ```
 
+**2b. Run the partitioned pipeline** (for large-scale datasets):
+
+```python
+from fleet_telemetry_hub.pipeline_partitioned import PartitionedTelemetryPipeline
+
+# One-liner for scheduled jobs (cron, etc.)
+PartitionedTelemetryPipeline('config/telemetry_config.yaml').run()
+
+# Or work with specific date ranges
+pipeline = PartitionedTelemetryPipeline('config/telemetry_config.yaml')
+pipeline.run()
+
+# Load data for specific date range (for analysis)
+from datetime import date
+df = pipeline.load_date_range(
+    start_date=date(2024, 1, 1),
+    end_date=date(2024, 1, 31),
+)
+print(f"Loaded {len(df)} records from January 2024")
+
+# Implement data retention (delete old partitions)
+deleted = pipeline.delete_old_partitions(retention_days=90)
+print(f"Deleted {deleted} partitions older than 90 days")
+```
+
+**Partitioned Storage Structure:**
+
+The partitioned pipeline creates a Hive-style directory structure compatible with BigQuery:
+
+```
+data/telemetry/
+├── date=2024-01-15/
+│   └── data.parquet
+├── date=2024-01-16/
+│   └── data.parquet
+├── date=2024-01-17/
+│   └── data.parquet
+└── _metadata.json
+```
+
 **3. Schedule it** (optional):
 
 ```bash
-# Run daily at 2 AM
+# Single-file pipeline - run daily at 2 AM
 0 2 * * * cd /path/to/project && python -c "from fleet_telemetry_hub.pipeline import TelemetryPipeline; TelemetryPipeline('config.yaml').run()"
+
+# Partitioned pipeline - run daily at 2 AM
+0 2 * * * cd /path/to/project && python -c "from fleet_telemetry_hub.pipeline_partitioned import PartitionedTelemetryPipeline; PartitionedTelemetryPipeline('config.yaml').run()"
 ```
 
 The pipeline will:
@@ -146,6 +194,7 @@ The pipeline will:
 - Deduplicate on (VIN, timestamp)
 - Save incrementally to Parquet with atomic writes
 - Resume from last run with configurable lookback
+- **Partitioned only**: Organize data by date for efficient BigQuery loading and retention management
 
 ### Option 2: Direct API Access (For Custom Integrations)
 
@@ -213,6 +262,55 @@ request_timeout: [10, 30]  # [connect, read]
 ```
 
 ## Advanced Usage
+
+### Pipeline: BigQuery Integration (Partitioned Storage Only)
+
+The partitioned pipeline creates Hive-style date partitions that are natively compatible with BigQuery:
+
+```python
+from fleet_telemetry_hub.pipeline_partitioned import PartitionedTelemetryPipeline
+
+# Run pipeline to populate partitioned storage
+pipeline = PartitionedTelemetryPipeline('config.yaml')
+pipeline.run()
+```
+
+**Option 1: BigQuery External Table (recommended for GCS)**
+
+1. Upload partitioned data to Google Cloud Storage:
+```bash
+gsutil -m cp -r data/telemetry/* gs://your-bucket/telemetry/
+```
+
+2. Create external table in BigQuery:
+```sql
+CREATE EXTERNAL TABLE `project.dataset.fleet_telemetry`
+WITH PARTITION COLUMNS (
+  date DATE
+)
+OPTIONS (
+  format = 'PARQUET',
+  uris = ['gs://your-bucket/telemetry/date=*/*.parquet'],
+  hive_partition_uri_prefix = 'gs://your-bucket/telemetry/'
+);
+```
+
+**Option 2: BigQuery LOAD DATA (for one-time imports)**
+
+```sql
+LOAD DATA INTO `project.dataset.fleet_telemetry`
+FROM FILES (
+  format = 'PARQUET',
+  uris = ['gs://your-bucket/telemetry/date=*/*.parquet']
+)
+WITH PARTITION COLUMNS (date DATE);
+```
+
+**Benefits of Partitioned Storage:**
+- Query only specific date ranges (reduces cost and latency)
+- Automatic partition pruning in BigQuery
+- Efficient data retention (delete old partitions easily)
+- Scales to billions of records without memory constraints
 
 ### Pipeline: Historical Backfill
 
@@ -375,17 +473,22 @@ pytest --cov=fleet_telemetry_hub --cov-report=html
 fleet-telemetry-hub/
 ├── src/
 │   └── fleet_telemetry_hub/
-│       ├── pipeline.py            # Main pipeline orchestrator
-│       ├── schema.py              # Unified telemetry schema
-│       ├── client.py              # HTTP client (API abstraction)
-│       ├── provider.py            # Provider facade (API abstraction)
-│       ├── registry.py            # Endpoint discovery
+│       ├── pipeline.py                    # Single-file pipeline orchestrator
+│       ├── pipeline_partitioned.py        # Date-partitioned pipeline orchestrator
+│       ├── schema.py                      # Unified telemetry schema
+│       ├── client.py                      # HTTP client (API abstraction)
+│       ├── provider.py                    # Provider facade (API abstraction)
+│       ├── registry.py                    # Endpoint discovery
 │       │
-│       ├── config/                # Configuration models and loader
-│       │   ├── config_models.py   # Pydantic config models
-│       │   └── loader.py          # YAML config loader
+│       ├── common/                        # Common utilities
+│       │   ├── partitioned_file_io.py     # Date-partitioned Parquet handler
+│       │   └── logger.py                  # Centralized logging setup
 │       │
-│       ├── models/                # Request/response models
+│       ├── config/                        # Configuration models and loader
+│       │   ├── config_models.py           # Pydantic config models
+│       │   └── loader.py                  # YAML config loader
+│       │
+│       ├── models/                        # Request/response models
 │       │   ├── shared_request_models.py   # RequestSpec, HTTPMethod
 │       │   ├── shared_response_models.py  # EndpointDefinition, ParsedResponse
 │       │   ├── motive_requests.py         # Motive endpoint definitions
@@ -393,13 +496,9 @@ fleet-telemetry-hub/
 │       │   ├── samsara_requests.py        # Samsara endpoint definitions
 │       │   └── samsara_responses.py       # Samsara Pydantic models
 │       │
-│       └── utils/                 # Utility functions
-│           ├── fetch_data.py      # Provider fetch functions (pipeline)
-│           ├── file_io.py         # Parquet I/O handler (pipeline)
-│           ├── logger.py          # Centralized logging setup
-│           ├── motive_funcs.py    # Motive flatten functions
-│           ├── samsara_funcs.py   # Samsara flatten functions
-│           └── truststore_context.py  # SSL/TLS utilities
+│       └── operations/                    # Data fetcher implementations
+│           ├── motive_fetcher.py          # Motive data fetcher
+│           └── samsara_fetcher.py         # Samsara data fetcher
 │
 ├── config/
 │   └── telemetry_config.yaml     # Example configuration
@@ -491,6 +590,7 @@ Project Link: https://github.com/andrewjordan3/fleet-telemetry-hub
 - [x] Unified schema for multi-provider data normalization
 - [x] Automated ETL pipeline with incremental updates
 - [x] Parquet storage with atomic writes
+- [x] Date-partitioned storage for BigQuery compatibility
 - [x] Python 3.12+ with modern type syntax
 - [x] Comprehensive logging system
 - [x] Batch processing with configurable time windows

@@ -279,7 +279,11 @@ for provider_name, provider in manager.enabled_providers():
 
 The Data Pipeline System orchestrates the end-to-end process of extracting telemetry from multiple providers, transforming it to a unified schema, and persisting it to Parquet storage.
 
-### Pipeline Flow Diagram
+**Two Pipeline Implementations**:
+1. **TelemetryPipeline** (`pipeline.py`): Single-file storage for smaller datasets
+2. **PartitionedTelemetryPipeline** (`pipeline_partitioned.py`): Date-partitioned storage for large-scale datasets
+
+### Single-File Pipeline Flow Diagram
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -291,7 +295,7 @@ The Data Pipeline System orchestrates the end-to-end process of extracting telem
 │     ├─ Load config from YAML                                        │
 │     ├─ Setup logging (console + file)                               │
 │     ├─ Initialize ProviderManager (enabled providers)               │
-│     └─ Create ParquetFileHandler                                    │
+│     └─ Create ParquetFileHandler (single file)                      │
 │                                                                     │
 │  2. Determine Start DateTime                                        │
 │     ├─ Load existing Parquet file (if exists)                       │
@@ -323,7 +327,7 @@ The Data Pipeline System orchestrates the end-to-end process of extracting telem
 │     │                                                               │
 │     ├─ Save Incrementally (atomic write)                            │
 │     │  ├─ Write to temp file                                        │
-│     │  └─ Atomic rename                                             │
+│     │  └─ Atomic rename to single parquet file                      │
 │     │                                                               │
 │     └─ Continue to next batch                                       │
 │                                                                     │
@@ -332,6 +336,91 @@ The Data Pipeline System orchestrates the end-to-end process of extracting telem
 │                                                                     │
 └─────────────────────────────────────────────────────────────────────┘
 ```
+
+### Partitioned Pipeline Flow Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                 PartitionedTelemetryPipeline                        │
+│                 (pipeline_partitioned.py:86)                        │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  1. Initialize                                                      │
+│     ├─ Load config from YAML                                        │
+│     ├─ Setup logging (console + file)                               │
+│     ├─ Initialize ProviderManager (enabled providers)               │
+│     ├─ Create PartitionedParquetHandler (date partitions)           │
+│     └─ Initialize data fetchers (supports caching)                  │
+│                                                                     │
+│  2. Determine Start DateTime                                        │
+│     ├─ Get latest partition date (from directory scan or cache)     │
+│     ├─ Calculate start: latest_partition_date - lookback_days       │
+│     └─ Or use default_start_date for first run                      │
+│     Note: No Parquet loading needed, just directory metadata        │
+│                                                                     │
+│  3. Generate Time Batches                                           │
+│     └─ Split time range into configurable increments               │
+│        (default: 1 day chunks for memory efficiency)                │
+│                                                                     │
+│  4. For Each Batch:                                                 │
+│     │                                                               │
+│     ├─ Fetch from ALL Providers (parallel, independent)             │
+│     │  ├─ Use cached fetchers (preserves state across batches)      │
+│     │  ├─ Motive: MotiveFetcher.fetch_data()                        │
+│     │  │   └─ vehicles (cached) → locations → flatten               │
+│     │  └─ Samsara: SamsaraFetcher.fetch_data()                      │
+│     │      └─ vehicle_stats + driver_assignments → flatten          │
+│     │                                                               │
+│     ├─ Combine Records (list[dict])                                 │
+│     │  └─ If ALL providers fail → abort pipeline                    │
+│     │                                                               │
+│     ├─ Convert to DataFrame                                         │
+│     │  ├─ enforce_telemetry_schema() - type coercion               │
+│     │  └─ Extract partition_date from timestamp.date()              │
+│     │                                                               │
+│     ├─ Save to Date Partitions                                      │
+│     │  ├─ Group records by partition_date                           │
+│     │  ├─ For each date:                                            │
+│     │  │  ├─ Load existing partition (if any)                       │
+│     │  │  ├─ Merge new records with existing                        │
+│     │  │  ├─ Deduplicate on (vin, timestamp), keep='last'           │
+│     │  │  └─ Save atomically to date=YYYY-MM-DD/data.parquet        │
+│     │  └─ Return dict[date, record_count]                           │
+│     │                                                               │
+│     └─ Continue to next batch                                       │
+│                                                                     │
+│  5. Log Summary Statistics                                          │
+│     └─ Total partitions, date range, records fetched, partitions    │
+│        updated, total size                                          │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### Key Differences Between Pipelines
+
+| Aspect | Single-File Pipeline | Partitioned Pipeline |
+|--------|---------------------|---------------------|
+| **Storage** | One `telemetry.parquet` file | Multiple `date=YYYY-MM-DD/data.parquet` files |
+| **Startup** | Must load entire file to determine start | Scans directory names only (fast) |
+| **Memory** | Loads entire dataset on each batch | Loads only affected partitions |
+| **Deduplication** | Global (entire dataset) | Per-partition (date range) |
+| **BigQuery** | Manual import needed | Native Hive partitioning |
+| **Data Retention** | Manual DataFrame filtering | Delete partition directories |
+| **Fetcher Architecture** | Function-based | Class-based with caching |
+| **Best For** | < 10M records | > 10M records, BigQuery integration |
+
+**Partitioned Pipeline Advantages**:
+1. **Scalability**: Memory usage scales with lookback window, not total dataset size
+2. **Performance**: Faster startup (no Parquet loading during init)
+3. **BigQuery Native**: Drop files in GCS, query immediately with partition pruning
+4. **Data Retention**: Simple directory deletion for old data
+5. **Parallelization Ready**: Different processes can write to different partitions safely
+6. **Fetcher Caching**: Motive vehicle list cached across batches (fewer API calls)
+
+**Single-File Pipeline Advantages**:
+1. **Simplicity**: One file, easier to manage
+2. **Portability**: Single file easier to copy/backup
+3. **Global Queries**: No partition scanning needed for full dataset queries
 
 ### Key Design Decisions
 
@@ -662,22 +751,44 @@ Flatten functions handle this mapping.
 
 ## Storage Layer
 
-The storage layer provides atomic, efficient persistence for telemetry DataFrames.
+The storage layer provides atomic, efficient persistence for telemetry DataFrames. Two storage strategies are available:
 
-### ParquetFileHandler
+### Storage Strategy Comparison
 
-**Location**: `utils/file_io.py:65`
+| Feature | Single-File Storage | Partitioned Storage |
+|---------|-------------------|-------------------|
+| **Best For** | Datasets < 10M records | Datasets > 10M records |
+| **File Structure** | Single `telemetry.parquet` | `date=YYYY-MM-DD/data.parquet` |
+| **Memory Usage** | Loads entire file | Loads only lookback window |
+| **BigQuery** | Manual import | Native Hive partitioning |
+| **Data Retention** | Manual filtering | Delete old partition directories |
+| **Implementation** | `ParquetFileHandler` | `PartitionedParquetHandler` |
+
+### Single-File Storage (ParquetFileHandler)
+
+**Location**: `utils/file_io.py:65` (legacy, single-file pipeline only)
 
 **Responsibilities**:
 1. Load existing Parquet files (returns `None` on error/missing)
 2. Save DataFrames with atomic writes
 3. Provide file metadata (size, existence)
 
+### Partitioned Storage (PartitionedParquetHandler)
+
+**Location**: `common/partitioned_file_io.py:95`
+
+**Responsibilities**:
+1. Manage date-partitioned directory structure (Hive-style)
+2. Load specific date ranges without loading entire dataset
+3. Save records to appropriate date partitions with deduplication
+4. Provide partition-level metadata and statistics
+5. Support data retention policies (delete old partitions)
+
 ### Atomic Write Implementation
 
 **Why**: Parquet writes are NOT atomic by default. If the process crashes mid-write, the file is corrupted.
 
-**Solution**: Temp file + atomic rename
+**Solution**: Temp file + atomic rename (used by both handlers)
 
 ```python
 def save(self, dataframe: pd.DataFrame) -> None:
@@ -700,6 +811,79 @@ def save(self, dataframe: pd.DataFrame) -> None:
 - Original file untouched until new file is complete
 - If crash occurs at any point, original data remains intact
 - No partial/corrupt files
+
+**Partitioned Storage**: Same atomic write guarantees, but at the partition level. Each date partition is written independently, so a crash only affects the partition being written.
+
+### Partitioned Storage Design Details
+
+**Directory Structure**:
+```
+data/telemetry/
+├── date=2024-01-15/
+│   └── data.parquet
+├── date=2024-01-16/
+│   └── data.parquet
+├── date=2024-01-17/
+│   └── data.parquet
+└── _metadata.json  (cache for latest partition date)
+```
+
+**Key Operations**:
+
+1. **Load Date Range** (`load_date_range(start_date, end_date)`):
+   - Scans partition directories matching date range
+   - Loads and concatenates only relevant partitions
+   - Returns combined DataFrame (unsorted)
+   - Memory usage scales with date range, not total dataset size
+
+2. **Save Partitioned** (`save_partitioned(dataframe, date_column)`):
+   - Groups DataFrame by date column
+   - For each date group:
+     - Load existing partition (if any)
+     - Merge new records with existing
+     - Deduplicate on (vin, timestamp), keep='last'
+     - Save atomically to partition file
+   - Returns dict mapping partition dates to record counts
+
+3. **Get Latest Partition** (`get_latest_partition_date()`):
+   - Uses metadata cache if available (fast)
+   - Falls back to directory scan if cache miss
+   - Returns date without loading any Parquet data
+
+4. **Delete Old Partitions** (`delete_partitions_before(cutoff_date)`):
+   - Deletes partition directories older than cutoff
+   - Useful for data retention policies
+   - Invalidates metadata cache
+
+**Metadata Cache**:
+- Stores latest partition date in `_metadata.json`
+- Avoids directory scanning on startup
+- Automatically invalidated on partition writes/deletes
+- Optional optimization (system works without it)
+
+**BigQuery Compatibility**:
+
+The Hive-style partitioning (`date=YYYY-MM-DD/`) is automatically recognized by:
+- BigQuery external tables with `hive_partition_uri_prefix`
+- BigQuery `LOAD DATA` with auto-schema detection
+- Spark, Dask, Polars, and other big data tools
+
+Example BigQuery external table:
+```sql
+CREATE EXTERNAL TABLE `project.dataset.fleet_telemetry`
+WITH PARTITION COLUMNS (date DATE)
+OPTIONS (
+  format = 'PARQUET',
+  uris = ['gs://bucket/telemetry/date=*/*.parquet'],
+  hive_partition_uri_prefix = 'gs://bucket/telemetry/'
+);
+```
+
+Benefits:
+- Query only needed date ranges (partition pruning)
+- Lower query costs (scan less data)
+- Faster query execution
+- No manual partition management in BigQuery
 
 ### Parquet Format Benefits
 
@@ -1489,15 +1673,20 @@ The Fleet Telemetry Hub provides a **complete, layered architecture** for workin
 
 ```
 fleet_telemetry_hub/
-├── pipeline.py              # Main pipeline orchestrator
-├── schema.py                # Unified telemetry schema
-├── client.py                # HTTP client (API abstraction)
-├── provider.py              # Provider facade (API abstraction)
-├── registry.py              # Endpoint discovery (API abstraction)
+├── pipeline.py                    # Single-file pipeline orchestrator
+├── pipeline_partitioned.py        # Date-partitioned pipeline orchestrator
+├── schema.py                      # Unified telemetry schema
+├── client.py                      # HTTP client (API abstraction)
+├── provider.py                    # Provider facade (API abstraction)
+├── registry.py                    # Endpoint discovery (API abstraction)
+│
+├── common/                        # Common utilities
+│   ├── partitioned_file_io.py     # Date-partitioned Parquet handler
+│   └── logger.py                  # Centralized logging setup
 │
 ├── config/
-│   ├── config_models.py     # Configuration Pydantic models
-│   └── loader.py            # YAML config loader
+│   ├── config_models.py           # Configuration Pydantic models
+│   └── loader.py                  # YAML config loader
 │
 ├── models/
 │   ├── shared_request_models.py   # RequestSpec, HTTPMethod, etc.
@@ -1507,22 +1696,22 @@ fleet_telemetry_hub/
 │   ├── samsara_requests.py        # Samsara endpoint definitions
 │   └── samsara_responses.py       # Samsara Pydantic models
 │
-└── utils/
-    ├── fetch_data.py        # Provider fetch functions (pipeline)
-    ├── file_io.py           # Parquet I/O handler (pipeline)
-    ├── logger.py            # Centralized logging setup
-    ├── motive_funcs.py      # Motive flatten functions
-    ├── samsara_funcs.py     # Samsara flatten functions
-    └── truststore_context.py # SSL/TLS utilities
+└── operations/                    # Data fetcher implementations
+    ├── motive_fetcher.py          # Motive data fetcher (class-based)
+    └── samsara_fetcher.py         # Samsara data fetcher (class-based)
 ```
 
 ### When to Use What
 
 | Use Case | Recommended Approach |
 |----------|---------------------|
-| Scheduled data collection (cron) | `TelemetryPipeline` |
-| Historical backfill | `TelemetryPipeline` with custom dates |
-| Unified multi-provider dataset | `TelemetryPipeline` |
+| Scheduled data collection (< 10M records) | `TelemetryPipeline` |
+| Scheduled data collection (> 10M records) | `PartitionedTelemetryPipeline` |
+| Historical backfill (small dataset) | `TelemetryPipeline` with custom dates |
+| Historical backfill (large dataset) | `PartitionedTelemetryPipeline` with custom dates |
+| BigQuery integration | `PartitionedTelemetryPipeline` + GCS |
+| Data retention policies | `PartitionedTelemetryPipeline.delete_old_partitions()` |
+| Unified multi-provider dataset | Either pipeline (choose based on scale) |
 | One-off API query | `Provider.fetch_all()` |
 | Custom integration | `TelemetryClient` + endpoints |
 | Building CLI tools | `EndpointRegistry` + `Provider` |
@@ -1546,9 +1735,11 @@ fleet_telemetry_hub/
 ✅ Rate limit handling
 ✅ Network resilience (proxies, SSL)
 ✅ Incremental updates with lookback
-✅ Atomic file writes
+✅ Atomic file writes (single-file and partitioned)
+✅ Date-partitioned storage for BigQuery compatibility
 ✅ Deduplication on (VIN, timestamp)
 ✅ Comprehensive logging
 ✅ Zero-downtime data collection
+✅ Scalable to billions of records
 
-The architecture ensures that whether you're doing ad-hoc API exploration or running production data pipelines, you have the right abstraction at the right level.
+The architecture ensures that whether you're doing ad-hoc API exploration, running small-scale data pipelines, or managing billion-row datasets with BigQuery, you have the right abstraction at the right level.
