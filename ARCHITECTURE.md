@@ -277,67 +277,9 @@ for provider_name, provider in manager.enabled_providers():
 
 ## Data Pipeline Architecture
 
-The Data Pipeline System orchestrates the end-to-end process of extracting telemetry from multiple providers, transforming it to a unified schema, and persisting it to Parquet storage.
+The Data Pipeline System orchestrates the end-to-end process of extracting telemetry from multiple providers, transforming it to a unified schema, and persisting it to date-partitioned Parquet storage.
 
-**Two Pipeline Implementations**:
-1. **TelemetryPipeline** (`pipeline.py`): Single-file storage for smaller datasets
-2. **PartitionedTelemetryPipeline** (`pipeline_partitioned.py`): Date-partitioned storage for large-scale datasets
-
-### Single-File Pipeline Flow Diagram
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                      TelemetryPipeline                              │
-│                     (pipeline.py:228)                               │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                     │
-│  1. Initialize                                                      │
-│     ├─ Load config from YAML                                        │
-│     ├─ Setup logging (console + file)                               │
-│     ├─ Initialize ProviderManager (enabled providers)               │
-│     └─ Create ParquetFileHandler (single file)                      │
-│                                                                     │
-│  2. Determine Start DateTime                                        │
-│     ├─ Load existing Parquet file (if exists)                       │
-│     ├─ Calculate start: max_timestamp - lookback_days               │
-│     └─ Or use default_start_date for first run                      │
-│                                                                     │
-│  3. Generate Time Batches                                           │
-│     └─ Split time range into configurable increments               │
-│        (default: 1 day chunks for memory efficiency)                │
-│                                                                     │
-│  4. For Each Batch:                                                 │
-│     │                                                               │
-│     ├─ Fetch from ALL Providers (parallel, independent)             │
-│     │  ├─ Motive: fetch_motive_data()                               │
-│     │  │   └─ vehicles → locations → flatten                        │
-│     │  └─ Samsara: fetch_samsara_data()                             │
-│     │      └─ vehicle_stats + driver_assignments → flatten          │
-│     │                                                               │
-│     ├─ Combine Records (list[dict])                                 │
-│     │  └─ If ALL providers fail → abort pipeline                    │
-│     │                                                               │
-│     ├─ Convert to DataFrame                                         │
-│     │  └─ enforce_telemetry_schema() - type coercion               │
-│     │                                                               │
-│     ├─ Append to Existing Data                                      │
-│     │  ├─ Load existing Parquet (if any)                            │
-│     │  ├─ pd.concat([existing, new])                                │
-│     │  └─ Deduplicate on (vin, timestamp), keep='last'              │
-│     │                                                               │
-│     ├─ Save Incrementally (atomic write)                            │
-│     │  ├─ Write to temp file                                        │
-│     │  └─ Atomic rename to single parquet file                      │
-│     │                                                               │
-│     └─ Continue to next batch                                       │
-│                                                                     │
-│  5. Log Summary Statistics                                          │
-│     └─ Total records, unique VINs, date range, file size            │
-│                                                                     │
-└─────────────────────────────────────────────────────────────────────┘
-```
-
-### Partitioned Pipeline Flow Diagram
+### Pipeline Flow Diagram
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -395,32 +337,6 @@ The Data Pipeline System orchestrates the end-to-end process of extracting telem
 │                                                                     │
 └─────────────────────────────────────────────────────────────────────┘
 ```
-
-### Key Differences Between Pipelines
-
-| Aspect | Single-File Pipeline | Partitioned Pipeline |
-|--------|---------------------|---------------------|
-| **Storage** | One `telemetry.parquet` file | Multiple `date=YYYY-MM-DD/data.parquet` files |
-| **Startup** | Must load entire file to determine start | Scans directory names only (fast) |
-| **Memory** | Loads entire dataset on each batch | Loads only affected partitions |
-| **Deduplication** | Global (entire dataset) | Per-partition (date range) |
-| **BigQuery** | Manual import needed | Native Hive partitioning |
-| **Data Retention** | Manual DataFrame filtering | Delete partition directories |
-| **Fetcher Architecture** | Function-based | Class-based with caching |
-| **Best For** | < 10M records | > 10M records, BigQuery integration |
-
-**Partitioned Pipeline Advantages**:
-1. **Scalability**: Memory usage scales with lookback window, not total dataset size
-2. **Performance**: Faster startup (no Parquet loading during init)
-3. **BigQuery Native**: Drop files in GCS, query immediately with partition pruning
-4. **Data Retention**: Simple directory deletion for old data
-5. **Parallelization Ready**: Different processes can write to different partitions safely
-6. **Fetcher Caching**: Motive vehicle list cached across batches (fewer API calls)
-
-**Single-File Pipeline Advantages**:
-1. **Simplicity**: One file, easier to manage
-2. **Portability**: Single file easier to copy/backup
-3. **Global Queries**: No partition scanning needed for full dataset queries
 
 ### Key Design Decisions
 
@@ -515,16 +431,23 @@ logging:
 ### Usage Example
 
 ```python
-from fleet_telemetry_hub.pipeline import TelemetryPipeline
+from fleet_telemetry_hub.pipeline_partitioned import PartitionedTelemetryPipeline
+from datetime import date
 
 # One-liner for cron jobs
-TelemetryPipeline('config.yaml').run()
+PartitionedTelemetryPipeline('config.yaml').run()
 
-# Or with access to results
-pipeline = TelemetryPipeline('config.yaml')
+# Or work with specific date ranges
+pipeline = PartitionedTelemetryPipeline('config.yaml')
 pipeline.run()
-print(f"Records: {len(pipeline.dataframe)}")
-print(f"VINs: {pipeline.dataframe['vin'].nunique()}")
+
+# Load data for analysis
+df = pipeline.load_date_range(
+    start_date=date(2024, 1, 1),
+    end_date=date(2024, 1, 31),
+)
+print(f"Records: {len(df)}")
+print(f"VINs: {df['vin'].nunique()}")
 ```
 
 ---
@@ -751,29 +674,9 @@ Flatten functions handle this mapping.
 
 ## Storage Layer
 
-The storage layer provides atomic, efficient persistence for telemetry DataFrames. Two storage strategies are available:
+The storage layer provides atomic, efficient persistence for telemetry DataFrames using date-partitioned Parquet files.
 
-### Storage Strategy Comparison
-
-| Feature | Single-File Storage | Partitioned Storage |
-|---------|-------------------|-------------------|
-| **Best For** | Datasets < 10M records | Datasets > 10M records |
-| **File Structure** | Single `telemetry.parquet` | `date=YYYY-MM-DD/data.parquet` |
-| **Memory Usage** | Loads entire file | Loads only lookback window |
-| **BigQuery** | Manual import | Native Hive partitioning |
-| **Data Retention** | Manual filtering | Delete old partition directories |
-| **Implementation** | `ParquetFileHandler` | `PartitionedParquetHandler` |
-
-### Single-File Storage (ParquetFileHandler)
-
-**Location**: `utils/file_io.py:65` (legacy, single-file pipeline only)
-
-**Responsibilities**:
-1. Load existing Parquet files (returns `None` on error/missing)
-2. Save DataFrames with atomic writes
-3. Provide file metadata (size, existence)
-
-### Partitioned Storage (PartitionedParquetHandler)
+### PartitionedParquetHandler
 
 **Location**: `common/partitioned_file_io.py:95`
 
@@ -784,18 +687,25 @@ The storage layer provides atomic, efficient persistence for telemetry DataFrame
 4. Provide partition-level metadata and statistics
 5. Support data retention policies (delete old partitions)
 
+**Key Benefits**:
+- **Scalability**: Memory usage scales with lookback window, not total dataset size
+- **BigQuery Native**: Drop files in GCS, query immediately with partition pruning
+- **Data Retention**: Simple directory deletion for old data
+- **Parallelization Ready**: Different processes can write to different partitions safely
+- **Fetcher Caching**: Motive vehicle list cached across batches (fewer API calls)
+
 ### Atomic Write Implementation
 
 **Why**: Parquet writes are NOT atomic by default. If the process crashes mid-write, the file is corrupted.
 
-**Solution**: Temp file + atomic rename (used by both handlers)
+**Solution**: Temp file + atomic rename at the partition level
 
 ```python
-def save(self, dataframe: pd.DataFrame) -> None:
-    # 1. Write to temp file in same directory
+def save_partition(self, dataframe: pd.DataFrame, partition_date: date) -> None:
+    # 1. Write to temp file in partition directory
     with tempfile.NamedTemporaryFile(
         suffix='.parquet.tmp',
-        dir=parquet_path.parent,
+        dir=partition_dir,
         delete=False,
     ) as temp_file:
         temp_path = Path(temp_file.name)
@@ -804,17 +714,16 @@ def save(self, dataframe: pd.DataFrame) -> None:
     dataframe.to_parquet(temp_path, compression='snappy')
 
     # 3. Atomic rename (POSIX guarantees atomicity)
-    temp_path.replace(parquet_path)
+    temp_path.replace(partition_path)
 ```
 
 **Guarantees**:
-- Original file untouched until new file is complete
+- Original partition untouched until new file is complete
 - If crash occurs at any point, original data remains intact
 - No partial/corrupt files
+- Each date partition is written independently, so a crash only affects the partition being written
 
-**Partitioned Storage**: Same atomic write guarantees, but at the partition level. Each date partition is written independently, so a crash only affects the partition being written.
-
-### Partitioned Storage Design Details
+### Storage Design Details
 
 **Directory Structure**:
 ```
@@ -1160,19 +1069,19 @@ vehicle.number  # Type-safe access!
 
 #### Pattern 1: Scheduled Data Collection
 
-**Use Case**: Cron job to keep Parquet file up-to-date
+**Use Case**: Cron job to keep partitioned Parquet data up-to-date
 
 ```python
-from fleet_telemetry_hub.pipeline import TelemetryPipeline
+from fleet_telemetry_hub.pipeline_partitioned import PartitionedTelemetryPipeline
 
 # One-liner for cron jobs
-TelemetryPipeline('config/telemetry_config.yaml').run()
+PartitionedTelemetryPipeline('config/telemetry_config.yaml').run()
 ```
 
 **Crontab Example**:
 ```bash
 # Run every day at 2 AM
-0 2 * * * cd /path/to/project && python -m fleet_telemetry_hub.pipeline config/telemetry_config.yaml
+0 2 * * * cd /path/to/project && python -c "from fleet_telemetry_hub.pipeline_partitioned import PartitionedTelemetryPipeline; PartitionedTelemetryPipeline('config/telemetry_config.yaml').run()"
 ```
 
 #### Pattern 2: Pipeline with Result Access
@@ -1180,22 +1089,25 @@ TelemetryPipeline('config/telemetry_config.yaml').run()
 **Use Case**: ETL jobs that need to process results immediately
 
 ```python
-from fleet_telemetry_hub.pipeline import TelemetryPipeline
+from fleet_telemetry_hub.pipeline_partitioned import PartitionedTelemetryPipeline
+from datetime import date
 
-pipeline = TelemetryPipeline('config.yaml')
+pipeline = PartitionedTelemetryPipeline('config.yaml')
 pipeline.run()
 
-# Access the resulting DataFrame
-df = pipeline.dataframe
-print(f"Fetched {len(df)} records from {df['vin'].nunique()} vehicles")
+# Load specific date range for analysis
+df = pipeline.load_date_range(
+    start_date=date(2025, 1, 1),
+    end_date=date(2025, 1, 31),
+)
+print(f"Loaded {len(df)} records from {df['vin'].nunique()} vehicles")
 
 # Export to various formats
-df.to_csv('telemetry.csv', index=False)
-df.to_excel('telemetry.xlsx', index=False)
+df.to_csv('january_telemetry.csv', index=False)
+df.to_excel('january_telemetry.xlsx', index=False)
 
 # Or analyze directly
-recent_data = df[df['timestamp'] >= '2025-01-01']
-avg_speed = recent_data.groupby('vin')['speed_mph'].mean()
+avg_speed = df.groupby('vin')['speed_mph'].mean()
 ```
 
 #### Pattern 3: Custom Date Range Backfill
@@ -1205,7 +1117,7 @@ avg_speed = recent_data.groupby('vin')['speed_mph'].mean()
 ```python
 from datetime import datetime
 from fleet_telemetry_hub.config import load_config, TelemetryConfig
-from fleet_telemetry_hub.pipeline import TelemetryPipeline
+from fleet_telemetry_hub.pipeline_partitioned import PartitionedTelemetryPipeline
 
 # Temporarily override config for backfill
 config = load_config('config.yaml')
@@ -1213,7 +1125,7 @@ config.pipeline.default_start_date = '2023-01-01'
 config.pipeline.batch_increment_days = 7.0  # Larger batches for backfill
 
 # Run pipeline (will fetch from 2023-01-01 to now)
-pipeline = TelemetryPipeline.from_config(config)
+pipeline = PartitionedTelemetryPipeline.from_config(config)
 pipeline.run()
 ```
 
@@ -1222,16 +1134,17 @@ pipeline.run()
 **Use Case**: Production deployments with monitoring
 
 ```python
-from fleet_telemetry_hub.pipeline import TelemetryPipeline, PipelineError
+from fleet_telemetry_hub.pipeline_partitioned import PartitionedTelemetryPipeline, PartitionedPipelineError
 import logging
 
 logger = logging.getLogger(__name__)
 
 try:
-    pipeline = TelemetryPipeline('config.yaml')
+    pipeline = PartitionedTelemetryPipeline('config.yaml')
     pipeline.run()
-    logger.info(f"Pipeline success: {len(pipeline.dataframe)} records")
-except PipelineError as e:
+    stats = pipeline.file_handler.get_statistics()
+    logger.info(f"Pipeline success: {stats['partition_count']} partitions, {stats['total_size_mb']} MB")
+except PartitionedPipelineError as e:
     logger.error(f"Pipeline failed: {e}")
     if e.partial_data_saved:
         logger.warning(f"Partial data saved up to batch {e.batch_index}")
@@ -1543,7 +1456,7 @@ geotab = Provider.from_config('geotab', config.providers['geotab'])
 vehicles = list(geotab.fetch_all('vehicles'))
 
 # Pipeline usage (automatic)
-pipeline = TelemetryPipeline('config.yaml')
+pipeline = PartitionedTelemetryPipeline('config.yaml')
 pipeline.run()  # Includes Geotab data now!
 ```
 
@@ -1647,11 +1560,11 @@ The Fleet Telemetry Hub provides a **complete, layered architecture** for workin
 ### Two-Tier System
 
 **Tier 1: Data Pipeline System** (High-Level, Automated ETL)
-- `TelemetryPipeline` - Main orchestrator for scheduled data collection
+- `PartitionedTelemetryPipeline` - Main orchestrator for scheduled data collection
 - `schema.py` - Unified schema for cross-provider data normalization
-- `fetch_data.py` - Provider-specific data extraction and transformation
-- `ParquetFileHandler` - Atomic, efficient data persistence
-- **Use when**: Building scheduled data collection, creating unified datasets, historical backfills
+- `operations/` - Provider-specific data fetchers (class-based with caching)
+- `PartitionedParquetHandler` - Atomic, efficient date-partitioned data persistence
+- **Use when**: Building scheduled data collection, creating unified datasets, historical backfills, BigQuery integration
 
 **Tier 2: API Abstraction Framework** (Low-Level, Direct Access)
 - **Level 1 (Endpoints)**: Self-describing API endpoint objects
@@ -1673,8 +1586,7 @@ The Fleet Telemetry Hub provides a **complete, layered architecture** for workin
 
 ```
 fleet_telemetry_hub/
-├── pipeline.py                    # Single-file pipeline orchestrator
-├── pipeline_partitioned.py        # Date-partitioned pipeline orchestrator
+├── pipeline_partitioned.py        # Pipeline orchestrator
 ├── schema.py                      # Unified telemetry schema
 ├── client.py                      # HTTP client (API abstraction)
 ├── provider.py                    # Provider facade (API abstraction)
@@ -1705,13 +1617,11 @@ fleet_telemetry_hub/
 
 | Use Case | Recommended Approach |
 |----------|---------------------|
-| Scheduled data collection (< 10M records) | `TelemetryPipeline` |
-| Scheduled data collection (> 10M records) | `PartitionedTelemetryPipeline` |
-| Historical backfill (small dataset) | `TelemetryPipeline` with custom dates |
-| Historical backfill (large dataset) | `PartitionedTelemetryPipeline` with custom dates |
+| Scheduled data collection | `PartitionedTelemetryPipeline` |
+| Historical backfill | `PartitionedTelemetryPipeline` with custom dates |
 | BigQuery integration | `PartitionedTelemetryPipeline` + GCS |
 | Data retention policies | `PartitionedTelemetryPipeline.delete_old_partitions()` |
-| Unified multi-provider dataset | Either pipeline (choose based on scale) |
+| Unified multi-provider dataset | `PartitionedTelemetryPipeline` |
 | One-off API query | `Provider.fetch_all()` |
 | Custom integration | `TelemetryClient` + endpoints |
 | Building CLI tools | `EndpointRegistry` + `Provider` |
@@ -1735,11 +1645,11 @@ fleet_telemetry_hub/
 ✅ Rate limit handling
 ✅ Network resilience (proxies, SSL)
 ✅ Incremental updates with lookback
-✅ Atomic file writes (single-file and partitioned)
+✅ Atomic partition-level writes
 ✅ Date-partitioned storage for BigQuery compatibility
 ✅ Deduplication on (VIN, timestamp)
 ✅ Comprehensive logging
 ✅ Zero-downtime data collection
 ✅ Scalable to billions of records
 
-The architecture ensures that whether you're doing ad-hoc API exploration, running small-scale data pipelines, or managing billion-row datasets with BigQuery, you have the right abstraction at the right level.
+The architecture ensures that whether you're doing ad-hoc API exploration or managing billion-row datasets with BigQuery, you have the right abstraction at the right level.
