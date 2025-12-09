@@ -1,24 +1,24 @@
 """
+Tests for fleet_telemetry_hub.pipeline_partitioned module.
 
-Tests for fleet_telemetry_hub.pipeline module.
-
-
-
-Tests TelemetryPipeline orchestration, batch processing, and error handling.
-
+Tests PartitionedTelemetryPipeline orchestration, batch processing,
+date partitioning, and error handling.
 """
 
 # pyright: reportPrivateUsage=false
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import yaml
 
 from fleet_telemetry_hub.config import TelemetryConfig
-from fleet_telemetry_hub.pipeline import PipelineError, TelemetryPipeline
+from fleet_telemetry_hub.pipeline_partitioned import (
+    PartitionedPipelineError,
+    PartitionedTelemetryPipeline,
+)
 
 config_type = dict[
     str,
@@ -28,8 +28,8 @@ config_type = dict[
 ]
 
 
-class TestTelemetryPipelineInitialization:
-    """Test TelemetryPipeline initialization."""
+class TestPartitionedTelemetryPipelineInitialization:
+    """Test PartitionedTelemetryPipeline initialization."""
 
     def test_initialization_from_config_file(
         self,
@@ -63,7 +63,7 @@ class TestTelemetryPipelineInitialization:
                 'use_truststore': False,
             },
             'storage': {
-                'parquet_path': str(temp_dir / 'telemetry.parquet'),
+                'parquet_path': str(temp_dir / 'telemetry'),  # Directory, not file
                 'parquet_compression': 'snappy',
             },
             'logging': {
@@ -78,7 +78,7 @@ class TestTelemetryPipelineInitialization:
 
         # Initialize pipeline
 
-        pipeline = TelemetryPipeline(config_file)
+        pipeline = PartitionedTelemetryPipeline(config_file)
 
         assert pipeline is not None
 
@@ -116,7 +116,7 @@ class TestTelemetryPipelineInitialization:
                 'use_truststore': False,
             },
             'storage': {
-                'parquet_path': str(temp_dir / 'telemetry.parquet'),
+                'parquet_path': str(temp_dir / 'telemetry'),
                 'parquet_compression': 'snappy',
             },
             'logging': {
@@ -130,11 +130,11 @@ class TestTelemetryPipelineInitialization:
             yaml.dump(config_data, f)
 
         with pytest.raises(ValueError, match='Configuration validation failed'):
-            TelemetryPipeline(config_file)
+            PartitionedTelemetryPipeline(config_file)
 
 
-class TestTelemetryPipelineProperties:
-    """Test TelemetryPipeline properties."""
+class TestPartitionedTelemetryPipelineProperties:
+    """Test PartitionedTelemetryPipeline properties."""
 
     def test_config_property_returns_config(
         self,
@@ -165,7 +165,7 @@ class TestTelemetryPipelineProperties:
                 'use_truststore': False,
             },
             'storage': {
-                'parquet_path': str(temp_dir / 'telemetry.parquet'),
+                'parquet_path': str(temp_dir / 'telemetry'),
                 'parquet_compression': 'snappy',
             },
             'logging': {
@@ -178,17 +178,17 @@ class TestTelemetryPipelineProperties:
         with config_file.open('w') as f:
             yaml.dump(config_data, f)
 
-        pipeline = TelemetryPipeline(config_file)
+        pipeline = PartitionedTelemetryPipeline(config_file)
 
         assert pipeline.config is not None
 
         assert isinstance(pipeline.config, TelemetryConfig)
 
-    def test_dataframe_property_none_before_run(
+    def test_file_handler_property_returns_handler(
         self,
         temp_dir: Path,
     ) -> None:
-        """Should return None before run() is called."""
+        """Should return file_handler via property."""
 
         config_file: Path = temp_dir / 'config.yaml'
 
@@ -213,7 +213,7 @@ class TestTelemetryPipelineProperties:
                 'use_truststore': False,
             },
             'storage': {
-                'parquet_path': str(temp_dir / 'telemetry.parquet'),
+                'parquet_path': str(temp_dir / 'telemetry'),
                 'parquet_compression': 'snappy',
             },
             'logging': {
@@ -226,19 +226,21 @@ class TestTelemetryPipelineProperties:
         with config_file.open('w') as f:
             yaml.dump(config_data, f)
 
-        pipeline = TelemetryPipeline(config_file)
+        pipeline = PartitionedTelemetryPipeline(config_file)
 
-        assert pipeline.dataframe is None
+        assert pipeline.file_handler is not None
+
+        assert pipeline.file_handler.partition_count == 0
 
 
-class TestTelemetryPipelineDetermineStartDatetime:
+class TestPartitionedTelemetryPipelineDetermineStartDatetime:
     """Test _determine_start_datetime logic."""
 
     def test_uses_default_start_date_on_first_run(
         self,
         temp_dir: Path,
     ) -> None:
-        """Should use default_start_date when no existing data."""
+        """Should use default_start_date when no existing partitions."""
 
         config_file: Path = temp_dir / 'config.yaml'
 
@@ -263,7 +265,7 @@ class TestTelemetryPipelineDetermineStartDatetime:
                 'use_truststore': False,
             },
             'storage': {
-                'parquet_path': str(temp_dir / 'telemetry.parquet'),
+                'parquet_path': str(temp_dir / 'telemetry'),
                 'parquet_compression': 'snappy',
             },
             'logging': {
@@ -276,13 +278,13 @@ class TestTelemetryPipelineDetermineStartDatetime:
         with config_file.open('w') as f:
             yaml.dump(config_data, f)
 
-        pipeline = TelemetryPipeline(config_file)
+        pipeline = PartitionedTelemetryPipeline(config_file)
 
         start_datetime: datetime = pipeline._determine_start_datetime()
 
         # Should be 2025-01-01 at midnight UTC
 
-        assert start_datetime.year == 2025  # noqa: PLR2004
+        assert start_datetime.year == 2025
 
         assert start_datetime.month == 1
 
@@ -293,7 +295,7 @@ class TestTelemetryPipelineDetermineStartDatetime:
         assert start_datetime.tzinfo == UTC
 
 
-class TestTelemetryPipelineGenerateBatches:
+class TestPartitionedTelemetryPipelineGenerateBatches:
     """Test _generate_batches logic."""
 
     def test_generates_single_batch_for_short_range(
@@ -325,7 +327,7 @@ class TestTelemetryPipelineGenerateBatches:
                 'use_truststore': False,
             },
             'storage': {
-                'parquet_path': str(temp_dir / 'telemetry.parquet'),
+                'parquet_path': str(temp_dir / 'telemetry'),
                 'parquet_compression': 'snappy',
             },
             'logging': {
@@ -338,7 +340,7 @@ class TestTelemetryPipelineGenerateBatches:
         with config_file.open('w') as f:
             yaml.dump(config_data, f)
 
-        pipeline = TelemetryPipeline(config_file)
+        pipeline = PartitionedTelemetryPipeline(config_file)
 
         start = datetime(2025, 1, 1, tzinfo=UTC)
 
@@ -383,7 +385,7 @@ class TestTelemetryPipelineGenerateBatches:
                 'use_truststore': False,
             },
             'storage': {
-                'parquet_path': str(temp_dir / 'telemetry.parquet'),
+                'parquet_path': str(temp_dir / 'telemetry'),
                 'parquet_compression': 'snappy',
             },
             'logging': {
@@ -396,7 +398,7 @@ class TestTelemetryPipelineGenerateBatches:
         with config_file.open('w') as f:
             yaml.dump(config_data, f)
 
-        pipeline = TelemetryPipeline(config_file)
+        pipeline = PartitionedTelemetryPipeline(config_file)
 
         start = datetime(2025, 1, 1, tzinfo=UTC)
 
@@ -408,7 +410,7 @@ class TestTelemetryPipelineGenerateBatches:
 
         # Should generate 3 batches (1 day each)
 
-        assert len(batches) == 3  # noqa: PLR2004
+        assert len(batches) == 3
 
     def test_generates_empty_list_when_start_after_end(
         self,
@@ -439,7 +441,7 @@ class TestTelemetryPipelineGenerateBatches:
                 'use_truststore': False,
             },
             'storage': {
-                'parquet_path': str(temp_dir / 'telemetry.parquet'),
+                'parquet_path': str(temp_dir / 'telemetry'),
                 'parquet_compression': 'snappy',
             },
             'logging': {
@@ -452,7 +454,7 @@ class TestTelemetryPipelineGenerateBatches:
         with config_file.open('w') as f:
             yaml.dump(config_data, f)
 
-        pipeline = TelemetryPipeline(config_file)
+        pipeline = PartitionedTelemetryPipeline(config_file)
 
         start = datetime(2025, 1, 4, tzinfo=UTC)
 
@@ -465,15 +467,15 @@ class TestTelemetryPipelineGenerateBatches:
         assert batches == []
 
 
-class TestTelemetryPipelineRun:
-    """Test TelemetryPipeline.run() method."""
+class TestPartitionedTelemetryPipelineRun:
+    """Test PartitionedTelemetryPipeline.run() method."""
 
-    def test_run_with_mocked_fetch_functions(
+    def test_run_with_mocked_fetchers(
         self,
         temp_dir: Path,
         sample_telemetry_records: list[dict[str, Any]],
     ) -> None:
-        """Should run pipeline with mocked fetch functions."""
+        """Should run pipeline with mocked fetchers."""
 
         config_file: Path = temp_dir / 'config.yaml'
 
@@ -498,7 +500,7 @@ class TestTelemetryPipelineRun:
                 'use_truststore': False,
             },
             'storage': {
-                'parquet_path': str(temp_dir / 'telemetry.parquet'),
+                'parquet_path': str(temp_dir / 'telemetry'),
                 'parquet_compression': 'snappy',
             },
             'logging': {
@@ -511,32 +513,36 @@ class TestTelemetryPipelineRun:
         with config_file.open('w') as f:
             yaml.dump(config_data, f)
 
-        pipeline = TelemetryPipeline(config_file)
+        pipeline = PartitionedTelemetryPipeline(config_file)
 
-        # Mock the fetch function to return sample data
+        # Create a mock fetcher class
 
-        def mock_fetch_motive(
-            provider: Any, start: datetime, end: datetime
-        ) -> list[dict[str, Any]]:
-            return sample_telemetry_records
+        class MockFetcher:
+            def __init__(self, provider: Any) -> None:
+                self.provider = provider
+
+            def fetch_data(
+                self, start: datetime, end: datetime
+            ) -> list[dict[str, Any]]:
+                return sample_telemetry_records
+
+        # Mock the PROVIDER_FETCHER_CLASSES
 
         with patch(
-            'fleet_telemetry_hub.pipeline.PROVIDER_FETCH_FUNCTIONS',
-            {'motive': mock_fetch_motive},
+            'fleet_telemetry_hub.pipeline_partitioned.PROVIDER_FETCHER_CLASSES',
+            {'motive': MockFetcher},
         ):
             pipeline.run()
 
-        # Should have data now
+        # Should have created partitions
 
-        assert pipeline.dataframe is not None
-
-        assert len(pipeline.dataframe) > 0
+        assert pipeline.file_handler.partition_count > 0
 
     def test_run_raises_when_all_providers_fail(
         self,
         temp_dir: Path,
     ) -> None:
-        """Should raise PipelineError when all providers fail."""
+        """Should raise PartitionedPipelineError when all providers fail."""
 
         config_file: Path = temp_dir / 'config.yaml'
 
@@ -561,7 +567,7 @@ class TestTelemetryPipelineRun:
                 'use_truststore': False,
             },
             'storage': {
-                'parquet_path': str(temp_dir / 'telemetry.parquet'),
+                'parquet_path': str(temp_dir / 'telemetry'),
                 'parquet_compression': 'snappy',
             },
             'logging': {
@@ -574,39 +580,192 @@ class TestTelemetryPipelineRun:
         with config_file.open('w') as f:
             yaml.dump(config_data, f)
 
-        pipeline = TelemetryPipeline(config_file)
+        pipeline = PartitionedTelemetryPipeline(config_file)
 
-        # Mock fetch function to always raise
+        # Create mock fetcher that always fails
 
-        def mock_fetch_fails(
-            provider: Any, start: datetime, end: datetime
-        ) -> list[dict[str, Any]]:
-            raise Exception('Fetch failed')
+        class FailingFetcher:
+            def __init__(self, provider: Any) -> None:
+                self.provider = provider
+
+            def fetch_data(
+                self, start: datetime, end: datetime
+            ) -> list[dict[str, Any]]:
+                raise Exception('Fetch failed')
 
         with (
             patch(
-                'fleet_telemetry_hub.pipeline.PROVIDER_FETCH_FUNCTIONS',
-                {'motive': mock_fetch_fails},
+                'fleet_telemetry_hub.pipeline_partitioned.PROVIDER_FETCHER_CLASSES',
+                {'motive': FailingFetcher},
             ),
-            pytest.raises(PipelineError, match='All providers failed'),
+            pytest.raises(PartitionedPipelineError, match='All providers failed'),
         ):
             pipeline.run()
 
+    def test_run_saves_to_date_partitions(
+        self,
+        temp_dir: Path,
+        sample_telemetry_records: list[dict[str, Any]],
+    ) -> None:
+        """Should save records to date-partitioned directories."""
 
-class TestTelemetryPipelineErrorHandling:
-    """Test TelemetryPipeline error handling."""
+        config_file: Path = temp_dir / 'config.yaml'
+
+        config_data: config_type = {
+            'providers': {
+                'motive': {
+                    'enabled': True,
+                    'base_url': 'https://api.gomotive.com',
+                    'api_key': 'test_key',
+                    'request_timeout': [10, 30],
+                    'max_retries': 3,
+                    'retry_backoff_factor': 2.0,
+                    'verify_ssl': True,
+                    'rate_limit_requests_per_second': 10,
+                },
+            },
+            'pipeline': {
+                'default_start_date': '2025-01-01',
+                'lookback_days': 0,
+                'batch_increment_days': 7,
+                'request_delay_seconds': 0.0,
+                'use_truststore': False,
+            },
+            'storage': {
+                'parquet_path': str(temp_dir / 'telemetry'),
+                'parquet_compression': 'snappy',
+            },
+            'logging': {
+                'file_path': str(temp_dir / 'telemetry.log'),
+                'console_level': 'WARNING',
+                'file_level': 'WARNING',
+            },
+        }
+
+        with config_file.open('w') as f:
+            yaml.dump(config_data, f)
+
+        pipeline = PartitionedTelemetryPipeline(config_file)
+
+        class MockFetcher:
+            def __init__(self, provider: Any) -> None:
+                self.provider = provider
+
+            def fetch_data(
+                self, start: datetime, end: datetime
+            ) -> list[dict[str, Any]]:
+                return sample_telemetry_records
+
+        with patch(
+            'fleet_telemetry_hub.pipeline_partitioned.PROVIDER_FETCHER_CLASSES',
+            {'motive': MockFetcher},
+        ):
+            pipeline.run()
+
+        # Check that partition directories were created
+
+        telemetry_dir = temp_dir / 'telemetry'
+
+        partition_dirs = [d for d in telemetry_dir.iterdir() if d.is_dir() and d.name.startswith('date=')]
+
+        assert len(partition_dirs) > 0
+
+        # Verify Hive-style naming
+
+        assert all(d.name.startswith('date=') for d in partition_dirs)
+
+
+class TestPartitionedTelemetryPipelineErrorHandling:
+    """Test PartitionedTelemetryPipeline error handling."""
 
     def test_pipeline_error_includes_batch_info(self) -> None:
-        """PipelineError should include batch index and partial data info."""
+        """PartitionedPipelineError should include batch index and partial data info."""
 
-        error = PipelineError(
+        error = PartitionedPipelineError(
             message='Test error',
             batch_index=5,
             partial_data_saved=True,
+            affected_partitions=[date(2024, 1, 15), date(2024, 1, 16)],
         )
 
-        assert error.batch_index == 5  # noqa: PLR2004
+        assert error.batch_index == 5
 
         assert error.partial_data_saved is True
 
+        assert error.affected_partitions == [date(2024, 1, 15), date(2024, 1, 16)]
+
         assert 'Test error' in str(error)
+
+
+class TestPartitionedTelemetryPipelineDataRetention:
+    """Test data retention and partition management features."""
+
+    def test_delete_old_partitions_removes_old_data(
+        self,
+        temp_dir: Path,
+        sample_telemetry_records: list[dict[str, Any]],
+    ) -> None:
+        """Should delete partitions older than retention period."""
+
+        config_file: Path = temp_dir / 'config.yaml'
+
+        config_data: config_type = {
+            'providers': {
+                'motive': {
+                    'enabled': True,
+                    'base_url': 'https://api.gomotive.com',
+                    'api_key': 'test_key',
+                    'request_timeout': [10, 30],
+                    'max_retries': 3,
+                    'retry_backoff_factor': 2.0,
+                    'verify_ssl': True,
+                    'rate_limit_requests_per_second': 10,
+                },
+            },
+            'pipeline': {
+                'default_start_date': '2024-01-01',
+                'lookback_days': 0,
+                'batch_increment_days': 7,
+                'request_delay_seconds': 0.0,
+                'use_truststore': False,
+            },
+            'storage': {
+                'parquet_path': str(temp_dir / 'telemetry'),
+                'parquet_compression': 'snappy',
+            },
+            'logging': {
+                'file_path': str(temp_dir / 'telemetry.log'),
+                'console_level': 'WARNING',
+                'file_level': 'WARNING',
+            },
+        }
+
+        with config_file.open('w') as f:
+            yaml.dump(config_data, f)
+
+        pipeline = PartitionedTelemetryPipeline(config_file)
+
+        # Create old partitions manually
+
+        for day in [1, 2, 3, 15, 16, 17]:
+            from fleet_telemetry_hub.schema import enforce_telemetry_schema
+            import pandas as pd
+
+            df = pd.DataFrame(sample_telemetry_records)
+            df = enforce_telemetry_schema(df)
+
+            partition_date = date(2024, 1, day)
+
+            pipeline.file_handler.save_partition(df, partition_date)
+
+        initial_count = pipeline.file_handler.partition_count
+
+        assert initial_count == 6
+
+        # Delete partitions older than 10 days (should delete days 1, 2, 3)
+
+        deleted = pipeline.delete_old_partitions(retention_days=10)
+
+        assert deleted == 3
+
+        assert pipeline.file_handler.partition_count == 3

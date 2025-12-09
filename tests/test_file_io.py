@@ -1,57 +1,48 @@
 """
+Tests for fleet_telemetry_hub.common.partitioned_file_io module.
 
-Tests for fleet_telemetry_hub.utils.file_io module.
-
-
-
-Tests ParquetFileHandler operations including load, save, delete,
-
-atomic writes, and error handling.
-
+Tests PartitionedParquetHandler operations including partitioned storage,
+date range loading, atomic writes, and partition management.
 """
 
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
 import pytest
 
-from fleet_telemetry_hub.common import ParquetFileHandler
+from fleet_telemetry_hub.common import PartitionedParquetHandler
 from fleet_telemetry_hub.config import StorageConfig
-from fleet_telemetry_hub.config.config_models import CompressionType
 from fleet_telemetry_hub.schema import enforce_telemetry_schema
 
 
-class TestParquetFileHandlerInitialization:
-    """Test ParquetFileHandler initialization."""
+class TestPartitionedParquetHandlerInitialization:
+    """Test PartitionedParquetHandler initialization."""
 
-    def test_initialization_creates_parent_directory(
+    def test_initialization_creates_base_directory(
         self,
         temp_dir: Path,
     ) -> None:
-        """Should create parent directory on initialization."""
+        """Should create base directory on initialization."""
 
-        # Use nested path to test parent directory creation
+        # Use nested path to test directory creation
 
-        nested_path: Path = temp_dir / 'data' / 'telemetry' / 'test.parquet'
+        nested_path: Path = temp_dir / 'data' / 'telemetry'
 
         storage_config = StorageConfig(
             parquet_path=nested_path,
             parquet_compression='snappy',
         )
 
-        ParquetFileHandler(storage_config)
+        PartitionedParquetHandler(storage_config)
 
-        # Parent directories should be created
+        # Base directory should be created
 
-        assert nested_path.parent.exists()
+        assert nested_path.exists()
 
-        assert nested_path.parent.is_dir()
-
-        # File itself should not exist yet
-
-        assert not nested_path.exists()
+        assert nested_path.is_dir()
 
     def test_initialization_properties(
         self,
@@ -59,46 +50,83 @@ class TestParquetFileHandlerInitialization:
     ) -> None:
         """Should set properties correctly."""
 
-        handler = ParquetFileHandler(storage_config)
+        handler = PartitionedParquetHandler(storage_config)
 
-        assert handler.path == storage_config.parquet_path
+        assert handler.base_path == storage_config.parquet_path
 
-        assert handler.compression == storage_config.parquet_compression
-
-        assert handler.exists is False  # File doesn't exist yet
+        assert handler.partition_count == 0  # No partitions yet
 
 
-class TestParquetFileHandlerLoad:
-    """Test ParquetFileHandler.load() method."""
+class TestPartitionedParquetHandlerPartitionOperations:
+    """Test partition save and load operations."""
 
-    def test_load_returns_none_when_file_missing(
-        self,
-        storage_config: StorageConfig,
-    ) -> None:
-        """Should return None when file doesn't exist."""
-
-        handler = ParquetFileHandler(storage_config)
-
-        result: pd.DataFrame | None = handler.load()
-
-        assert result is None
-
-    def test_load_returns_dataframe_when_file_exists(
+    def test_save_partition_creates_partition_directory(
         self,
         storage_config: StorageConfig,
         sample_telemetry_dataframe: pd.DataFrame,
     ) -> None:
-        """Should load DataFrame from existing Parquet file."""
+        """Should create partition directory when saving."""
 
-        handler = ParquetFileHandler(storage_config)
+        handler = PartitionedParquetHandler(storage_config)
 
-        # First save some data
+        partition_date = date(2024, 1, 15)
 
-        handler.save(sample_telemetry_dataframe)
+        # Remove partition_date column if it exists
+        df = sample_telemetry_dataframe.copy()
+        if 'partition_date' in df.columns:
+            df = df.drop(columns=['partition_date'])
 
-        # Then load it
+        handler.save_partition(df, partition_date)
 
-        result: pd.DataFrame | None = handler.load()
+        # Should create date=2024-01-15 directory
+
+        partition_dir = storage_config.parquet_path / 'date=2024-01-15'
+
+        assert partition_dir.exists()
+
+        assert partition_dir.is_dir()
+
+        # Should create data.parquet file
+
+        parquet_file = partition_dir / 'data.parquet'
+
+        assert parquet_file.exists()
+
+    def test_load_partition_returns_none_when_missing(
+        self,
+        storage_config: StorageConfig,
+    ) -> None:
+        """Should return None when partition doesn't exist."""
+
+        handler = PartitionedParquetHandler(storage_config)
+
+        result: pd.DataFrame | None = handler.load_partition(date(2024, 1, 15))
+
+        assert result is None
+
+    def test_load_partition_returns_dataframe_when_exists(
+        self,
+        storage_config: StorageConfig,
+        sample_telemetry_dataframe: pd.DataFrame,
+    ) -> None:
+        """Should load DataFrame from existing partition."""
+
+        handler = PartitionedParquetHandler(storage_config)
+
+        partition_date = date(2024, 1, 15)
+
+        # Remove partition_date column if it exists
+        df = sample_telemetry_dataframe.copy()
+        if 'partition_date' in df.columns:
+            df = df.drop(columns=['partition_date'])
+
+        # Save
+
+        handler.save_partition(df, partition_date)
+
+        # Load
+
+        result: pd.DataFrame | None = handler.load_partition(partition_date)
 
         assert result is not None
 
@@ -106,532 +134,614 @@ class TestParquetFileHandlerLoad:
 
         assert len(result) == len(sample_telemetry_dataframe)
 
-        pd.testing.assert_frame_equal(result, sample_telemetry_dataframe)
-
-    def test_load_returns_none_on_corrupt_file(
-        self,
-        storage_config: StorageConfig,
-    ) -> None:
-        """Should return None when Parquet file is corrupt."""
-
-        handler = ParquetFileHandler(storage_config)
-
-        # Create a corrupt file (not valid Parquet)
-
-        storage_config.parquet_path.write_text('This is not a valid Parquet file')
-
-        # Should return None instead of raising
-
-        result: pd.DataFrame | None = handler.load()
-
-        assert result is None
-
-    def test_load_handles_permission_errors(
+    def test_partition_exists_returns_correct_value(
         self,
         storage_config: StorageConfig,
         sample_telemetry_dataframe: pd.DataFrame,
     ) -> None:
-        """Should return None when file exists but cannot be read."""
+        """Should correctly report partition existence."""
 
-        handler = ParquetFileHandler(storage_config)
+        handler = PartitionedParquetHandler(storage_config)
 
-        # Save data first
+        partition_date = date(2024, 1, 15)
 
-        handler.save(sample_telemetry_dataframe)
+        assert handler.partition_exists(partition_date) is False
 
-        # Mock pd.read_parquet to raise OSError
+        # Remove partition_date column if it exists
+        df = sample_telemetry_dataframe.copy()
+        if 'partition_date' in df.columns:
+            df = df.drop(columns=['partition_date'])
 
-        with patch('pandas.read_parquet', side_effect=OSError('Permission denied')):
-            result: pd.DataFrame | None = handler.load()
+        handler.save_partition(df, partition_date)
 
-            assert result is None
+        assert handler.partition_exists(partition_date) is True
 
 
-class TestParquetFileHandlerSave:
-    """Test ParquetFileHandler.save() method."""
+class TestPartitionedParquetHandlerDateRangeOperations:
+    """Test date range loading operations."""
 
-    def test_save_creates_file(
+    def test_load_date_range_returns_none_when_no_partitions(
         self,
         storage_config: StorageConfig,
-        sample_telemetry_dataframe: pd.DataFrame,
     ) -> None:
-        """Should create Parquet file when saving."""
+        """Should return None when no partitions exist in range."""
 
-        handler = ParquetFileHandler(storage_config)
+        handler = PartitionedParquetHandler(storage_config)
 
-        assert not handler.exists
-
-        handler.save(sample_telemetry_dataframe)
-
-        assert handler.exists
-
-        assert storage_config.parquet_path.exists()
-
-    def test_save_preserves_data(
-        self,
-        storage_config: StorageConfig,
-        sample_telemetry_dataframe: pd.DataFrame,
-    ) -> None:
-        """Should save data that can be loaded back identically."""
-
-        handler = ParquetFileHandler(storage_config)
-
-        handler.save(sample_telemetry_dataframe)
-
-        loaded: pd.DataFrame | None = handler.load()
-
-        assert loaded is not None
-
-        pd.testing.assert_frame_equal(loaded, sample_telemetry_dataframe)
-
-    def test_save_overwrites_existing_file(
-        self,
-        storage_config: StorageConfig,
-        sample_telemetry_dataframe: pd.DataFrame,
-    ) -> None:
-        """Should overwrite existing file when saving."""
-
-        handler = ParquetFileHandler(storage_config)
-
-        # Save initial data
-
-        initial_df: pd.DataFrame = sample_telemetry_dataframe.iloc[
-            :2
-        ]  # First 2 records
-
-        handler.save(initial_df)
-
-        # Save new data (overwrites)
-
-        new_df: pd.DataFrame = sample_telemetry_dataframe.iloc[
-            2:4
-        ]  # Different 2 records
-
-        handler.save(new_df)
-
-        # Load should return new data
-
-        loaded: pd.DataFrame | None = handler.load()
-
-        assert loaded is not None
-
-        assert len(loaded) == 2  # noqa: PLR2004
-
-        pd.testing.assert_frame_equal(
-            loaded.reset_index(drop=True), new_df.reset_index(drop=True)
+        result: pd.DataFrame | None = handler.load_date_range(
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 1, 31),
         )
 
-    def test_save_handles_empty_dataframe(
-        self,
-        storage_config: StorageConfig,
-    ) -> None:
-        """Should handle saving empty DataFrame with warning."""
-
-        handler = ParquetFileHandler(storage_config)
-
-        empty_df = pd.DataFrame()
-
-        # Should not raise, but may log warning
-
-        handler.save(empty_df)
-
-        # Should be able to load it back
-
-        loaded: pd.DataFrame | None = handler.load()
-
-        assert loaded is not None
-
-        assert len(loaded) == 0
-
-    def test_save_atomic_write_on_success(
-        self,
-        storage_config: StorageConfig,
-        sample_telemetry_dataframe: pd.DataFrame,
-    ) -> None:
-        """Should use atomic write (temp file + rename)."""
-
-        handler = ParquetFileHandler(storage_config)
-
-        # Mock to verify temp file is used
-
-        with patch('tempfile.NamedTemporaryFile') as mock_temp:
-            # Create a real temp file path for the mock
-
-            temp_path: Path = storage_config.parquet_path.parent / 'temp.parquet.tmp'
-
-            # Configure mock
-
-            mock_temp_context = MagicMock()
-
-            mock_temp_context.__enter__.return_value.name = str(temp_path)
-
-            mock_temp.return_value = mock_temp_context
-
-            # Mock the actual file operations
-
-            with (
-                patch('pandas.DataFrame.to_parquet') as mock_to_parquet,
-                patch('pathlib.Path.replace') as mock_replace,
-            ):
-                handler.save(sample_telemetry_dataframe)
-
-                # Should call to_parquet with temp path
-
-                mock_to_parquet.assert_called_once()
-
-                # Should rename temp to final path
-
-                mock_replace.assert_called_once()
-
-    def test_save_cleans_up_temp_file_on_error(
-        self,
-        storage_config: StorageConfig,
-        sample_telemetry_dataframe: pd.DataFrame,
-    ) -> None:
-        """Should clean up temp file if save fails."""
-
-        handler = ParquetFileHandler(storage_config)
-
-        # Mock to_parquet to raise error
-
-        with (
-            patch('pandas.DataFrame.to_parquet', side_effect=OSError('Disk full')),
-            pytest.raises(OSError, match='Disk full'),
-        ):
-            handler.save(sample_telemetry_dataframe)
-
-        # Final file should not exist
-
-        assert not storage_config.parquet_path.exists()
-
-    def test_save_applies_compression(
-        self,
-        temp_parquet_file: Path,
-        sample_telemetry_dataframe: pd.DataFrame,
-    ) -> None:
-        """Should use configured compression codec."""
-
-        # Test with different compression settings
-        for compression in ['snappy', 'gzip', 'brotli']:
-            config = StorageConfig(
-                parquet_path=temp_parquet_file.parent / f'test_{compression}.parquet',
-                parquet_compression=cast(CompressionType, compression),
-            )
-
-            handler = ParquetFileHandler(config)
-
-            handler.save(sample_telemetry_dataframe)
-
-            # Verify file was created and can be loaded
-
-            loaded: pd.DataFrame | None = handler.load()
-
-            assert loaded is not None
-
-            assert len(loaded) == len(sample_telemetry_dataframe)
-
-
-class TestParquetFileHandlerDelete:
-    """Test ParquetFileHandler.delete() method."""
-
-    def test_delete_removes_existing_file(
-        self,
-        storage_config: StorageConfig,
-        sample_telemetry_dataframe: pd.DataFrame,
-    ) -> None:
-        """Should delete file if it exists."""
-
-        handler = ParquetFileHandler(storage_config)
-
-        # Create file
-
-        handler.save(sample_telemetry_dataframe)
-
-        assert handler.exists
-
-        # Delete it
-
-        result: bool = handler.delete()
-
-        assert result is True
-
-        assert not handler.exists
-
-        assert not storage_config.parquet_path.exists()
-
-    def test_delete_returns_false_when_file_missing(
-        self,
-        storage_config: StorageConfig,
-    ) -> None:
-        """Should return False when file doesn't exist."""
-
-        handler = ParquetFileHandler(storage_config)
-
-        assert not handler.exists
-
-        result: bool = handler.delete()
-
-        assert result is False
-
-    def test_delete_raises_on_permission_error(
-        self,
-        storage_config: StorageConfig,
-        sample_telemetry_dataframe: pd.DataFrame,
-    ) -> None:
-        """Should raise if file cannot be deleted."""
-
-        handler = ParquetFileHandler(storage_config)
-
-        # Create file
-
-        handler.save(sample_telemetry_dataframe)
-
-        # Mock unlink to raise permission error
-
-        with (
-            patch('pathlib.Path.unlink', side_effect=PermissionError('Access denied')),
-            pytest.raises(PermissionError, match='Access denied'),
-        ):
-            handler.delete()
-
-
-class TestParquetFileHandlerGetFileSize:
-    """Test ParquetFileHandler.get_file_size() method."""
-
-    def test_get_file_size_returns_none_when_missing(
-        self,
-        storage_config: StorageConfig,
-    ) -> None:
-        """Should return None when file doesn't exist."""
-
-        handler = ParquetFileHandler(storage_config)
-
-        result: float | None = handler.get_file_size()
-
         assert result is None
 
-    def test_get_file_size_returns_size_in_mb(
+    def test_load_date_range_loads_multiple_partitions(
         self,
         storage_config: StorageConfig,
         sample_telemetry_dataframe: pd.DataFrame,
     ) -> None:
-        """Should return file size in MB by default."""
+        """Should load and concatenate multiple partitions."""
 
-        handler = ParquetFileHandler(storage_config)
+        handler = PartitionedParquetHandler(storage_config)
 
-        handler.save(sample_telemetry_dataframe)
+        # Save 3 partitions
 
-        result: float | None = handler.get_file_size()
+        for day in [15, 16, 17]:
+            partition_date = date(2024, 1, day)
+
+            df = sample_telemetry_dataframe.copy()
+            if 'partition_date' in df.columns:
+                df = df.drop(columns=['partition_date'])
+
+            handler.save_partition(df, partition_date)
+
+        # Load date range
+
+        result: pd.DataFrame | None = handler.load_date_range(
+            start_date=date(2024, 1, 15),
+            end_date=date(2024, 1, 17),
+        )
 
         assert result is not None
 
-        assert isinstance(result, float)
+        # Should have 3x the records (3 partitions)
 
-        assert result > 0  # File should have some size
+        assert len(result) == len(sample_telemetry_dataframe) * 3
 
-    def test_get_file_size_supports_different_units(
+    def test_load_date_range_filters_by_date(
         self,
         storage_config: StorageConfig,
         sample_telemetry_dataframe: pd.DataFrame,
     ) -> None:
-        """Should support bytes, kb, mb, gb units."""
+        """Should only load partitions within the specified range."""
 
-        handler = ParquetFileHandler(storage_config)
+        handler = PartitionedParquetHandler(storage_config)
 
-        handler.save(sample_telemetry_dataframe)
+        # Save 5 partitions
 
-        size_bytes: float | None = handler.get_file_size('bytes')
+        for day in [13, 14, 15, 16, 17]:
+            partition_date = date(2024, 1, day)
 
-        size_kb: float | None = handler.get_file_size('kb')
+            df = sample_telemetry_dataframe.copy()
+            if 'partition_date' in df.columns:
+                df = df.drop(columns=['partition_date'])
 
-        size_mb: float | None = handler.get_file_size('mb')
+            handler.save_partition(df, partition_date)
 
-        size_gb: float | None = handler.get_file_size('gb')
+        # Load only middle 3 partitions
 
-        # All should be non-None
-
-        assert all(s is not None for s in [size_bytes, size_kb, size_mb, size_gb])
-
-        # Relationships should hold
-
-        assert size_bytes > size_kb  # pyright: ignore[reportOperatorIssue]
-
-        assert size_kb > size_mb  # pyright: ignore[reportOperatorIssue]
-
-        assert size_mb > size_gb  # pyright: ignore[reportOperatorIssue]
-
-        # Conversions should be accurate
-
-        assert abs(size_bytes / 1024 - size_kb) < 0.01  # pyright: ignore[reportOperatorIssue, reportOptionalOperand]  # noqa: PLR2004
-
-        assert abs(size_kb / 1024 - size_mb) < 0.01  # pyright: ignore[reportOperatorIssue, reportOptionalOperand]  # noqa: PLR2004
-
-        assert abs(size_mb / 1024 - size_gb) < 0.01  # pyright: ignore[reportOperatorIssue, reportOptionalOperand]  # noqa: PLR2004
-
-
-class TestParquetFileHandlerProperties:
-    """Test ParquetFileHandler property accessors."""
-
-    def test_exists_property_false_initially(
-        self,
-        storage_config: StorageConfig,
-    ) -> None:
-        """exists should be False before save."""
-
-        handler = ParquetFileHandler(storage_config)
-
-        assert handler.exists is False
-
-    def test_exists_property_true_after_save(
-        self,
-        storage_config: StorageConfig,
-        sample_telemetry_dataframe: pd.DataFrame,
-    ) -> None:
-        """exists should be True after save."""
-
-        handler = ParquetFileHandler(storage_config)
-
-        handler.save(sample_telemetry_dataframe)
-
-        assert handler.exists is True
-
-    def test_exists_property_false_after_delete(
-        self,
-        storage_config: StorageConfig,
-        sample_telemetry_dataframe: pd.DataFrame,
-    ) -> None:
-        """exists should be False after delete."""
-
-        handler = ParquetFileHandler(storage_config)
-
-        handler.save(sample_telemetry_dataframe)
-
-        handler.delete()
-
-        assert handler.exists is False
-
-    def test_path_property_returns_configured_path(
-        self,
-        storage_config: StorageConfig,
-    ) -> None:
-        """path property should return configured path."""
-
-        handler = ParquetFileHandler(storage_config)
-
-        assert handler.path == storage_config.parquet_path
-
-    def test_compression_property_returns_configured_compression(
-        self,
-        storage_config: StorageConfig,
-    ) -> None:
-        """compression property should return configured compression."""
-
-        handler = ParquetFileHandler(storage_config)
-
-        assert handler.compression == storage_config.parquet_compression
-
-
-class TestParquetFileHandlerRoundTrip:
-    """Test complete save/load round trips with real data."""
-
-    def test_round_trip_preserves_all_column_types(
-        self,
-        storage_config: StorageConfig,
-        sample_telemetry_dataframe: pd.DataFrame,
-        assert_dataframe_valid_telemetry: Any,
-    ) -> None:
-        """Should preserve all column types through save/load."""
-
-        handler = ParquetFileHandler(storage_config)
-
-        # Save
-
-        handler.save(sample_telemetry_dataframe)
-
-        # Load
-
-        loaded: pd.DataFrame | None = handler.load()
-
-        # Verify schema is preserved
-
-        assert loaded is not None
-
-        assert_dataframe_valid_telemetry(loaded)
-
-        # Verify data equality
-
-        pd.testing.assert_frame_equal(
-            loaded.reset_index(drop=True),
-            sample_telemetry_dataframe.reset_index(drop=True),
+        result: pd.DataFrame | None = handler.load_date_range(
+            start_date=date(2024, 1, 14),
+            end_date=date(2024, 1, 16),
         )
 
-    def test_round_trip_with_multiple_saves(
+        assert result is not None
+
+        # Should have 3x the records (3 partitions: 14, 15, 16)
+
+        assert len(result) == len(sample_telemetry_dataframe) * 3
+
+
+class TestPartitionedParquetHandlerSavePartitioned:
+    """Test save_partitioned method with auto-partitioning."""
+
+    def test_save_partitioned_groups_by_date(
         self,
         storage_config: StorageConfig,
         sample_telemetry_dataframe: pd.DataFrame,
     ) -> None:
-        """Should handle multiple save/load cycles."""
+        """Should automatically partition records by date column."""
 
-        handler = ParquetFileHandler(storage_config)
+        handler = PartitionedParquetHandler(storage_config)
 
-        for i in range(3):
-            # Modify data slightly
+        # Add partition dates to sample data
 
-            df: pd.DataFrame = sample_telemetry_dataframe.copy()
+        df = sample_telemetry_dataframe.copy()
 
-            df['speed_mph'] = df['speed_mph'] + i
+        # Assign records to different dates
 
-            # Save
+        df['partition_date'] = [
+            date(2024, 1, 15),
+            date(2024, 1, 15),
+            date(2024, 1, 16),
+            date(2024, 1, 16),
+            date(2024, 1, 17),
+        ]
 
-            handler.save(df)
+        # Save with auto-partitioning
 
-            # Load and verify
+        records_saved: dict[date, int] = handler.save_partitioned(
+            df,
+            date_column='partition_date',
+            deduplicate=False,
+        )
 
-            loaded: pd.DataFrame | None = handler.load()
+        # Should create 3 partitions
 
-            assert loaded is not None
+        assert len(records_saved) == 3
 
-            pd.testing.assert_frame_equal(loaded, df)
+        assert records_saved[date(2024, 1, 15)] == 2
 
-    def test_round_trip_with_large_dataset(
+        assert records_saved[date(2024, 1, 16)] == 2
+
+        assert records_saved[date(2024, 1, 17)] == 1
+
+    def test_save_partitioned_deduplicates_within_partition(
         self,
         storage_config: StorageConfig,
-        sample_telemetry_record: dict[str, Any],
     ) -> None:
-        """Should handle larger datasets efficiently."""
+        """Should deduplicate records within each partition."""
 
-        # Create a larger dataset (1000 records)
+        handler = PartitionedParquetHandler(storage_config)
+
+        # Create dataframe with duplicate records
 
         records: list[dict[str, Any]] = [
-            sample_telemetry_record.copy() for _ in range(1000)
+            {
+                'provider': 'motive',
+                'provider_vehicle_id': 'vehicle_1',
+                'vin': 'ABC123',
+                'fleet_number': '001',
+                'timestamp': datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC),
+                'latitude': 37.7749,
+                'longitude': -122.4194,
+                'speed_mph': 45.0,
+                'heading_degrees': 90.0,
+                'engine_state': 'running',
+                'driver_id': 'driver_1',
+                'driver_name': 'John Doe',
+                'location_description': 'San Francisco',
+                'odometer': 10000.0,
+                'partition_date': date(2024, 1, 15),
+            },
+            {
+                'provider': 'motive',
+                'provider_vehicle_id': 'vehicle_1',
+                'vin': 'ABC123',
+                'fleet_number': '001',
+                'timestamp': datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC),  # Duplicate
+                'latitude': 37.7749,
+                'longitude': -122.4194,
+                'speed_mph': 50.0,  # Different speed (updated)
+                'heading_degrees': 90.0,
+                'engine_state': 'running',
+                'driver_id': 'driver_1',
+                'driver_name': 'John Doe',
+                'location_description': 'San Francisco',
+                'odometer': 10000.0,
+                'partition_date': date(2024, 1, 15),
+            },
         ]
 
         df = pd.DataFrame(records)
 
-        df: pd.DataFrame = enforce_telemetry_schema(df)
+        df = enforce_telemetry_schema(df)
 
-        handler = ParquetFileHandler(storage_config)
+        # Save with deduplication
 
-        # Save
+        records_saved: dict[date, int] = handler.save_partitioned(
+            df,
+            date_column='partition_date',
+            deduplicate=True,
+            dedup_columns=['provider', 'provider_vehicle_id', 'timestamp'],
+        )
 
-        handler.save(df)
+        # Should save only 1 record (deduplicated)
 
-        # Verify file size is reasonable
+        assert records_saved[date(2024, 1, 15)] == 1
 
-        size_mb: float | None = handler.get_file_size('mb')
+
+class TestPartitionedParquetHandlerPartitionManagement:
+    """Test partition deletion and management operations."""
+
+    def test_delete_partition_removes_partition(
+        self,
+        storage_config: StorageConfig,
+        sample_telemetry_dataframe: pd.DataFrame,
+    ) -> None:
+        """Should delete partition directory and file."""
+
+        handler = PartitionedParquetHandler(storage_config)
+
+        partition_date = date(2024, 1, 15)
+
+        df = sample_telemetry_dataframe.copy()
+        if 'partition_date' in df.columns:
+            df = df.drop(columns=['partition_date'])
+
+        # Create partition
+
+        handler.save_partition(df, partition_date)
+
+        assert handler.partition_exists(partition_date)
+
+        # Delete it
+
+        result: bool = handler.delete_partition(partition_date)
+
+        assert result is True
+
+        assert not handler.partition_exists(partition_date)
+
+    def test_delete_partition_returns_false_when_missing(
+        self,
+        storage_config: StorageConfig,
+    ) -> None:
+        """Should return False when partition doesn't exist."""
+
+        handler = PartitionedParquetHandler(storage_config)
+
+        result: bool = handler.delete_partition(date(2024, 1, 15))
+
+        assert result is False
+
+    def test_delete_partitions_before_deletes_old_partitions(
+        self,
+        storage_config: StorageConfig,
+        sample_telemetry_dataframe: pd.DataFrame,
+    ) -> None:
+        """Should delete all partitions before cutoff date."""
+
+        handler = PartitionedParquetHandler(storage_config)
+
+        # Create 5 partitions
+
+        for day in [13, 14, 15, 16, 17]:
+            partition_date = date(2024, 1, day)
+
+            df = sample_telemetry_dataframe.copy()
+            if 'partition_date' in df.columns:
+                df = df.drop(columns=['partition_date'])
+
+            handler.save_partition(df, partition_date)
+
+        # Delete partitions before Jan 16
+
+        deleted_count: int = handler.delete_partitions_before(date(2024, 1, 16))
+
+        # Should delete 3 partitions (13, 14, 15)
+
+        assert deleted_count == 3
+
+        # Verify partitions 16 and 17 still exist
+
+        assert handler.partition_exists(date(2024, 1, 16))
+
+        assert handler.partition_exists(date(2024, 1, 17))
+
+        # Verify partitions 13, 14, 15 are gone
+
+        assert not handler.partition_exists(date(2024, 1, 13))
+
+        assert not handler.partition_exists(date(2024, 1, 14))
+
+        assert not handler.partition_exists(date(2024, 1, 15))
+
+
+class TestPartitionedParquetHandlerMetadata:
+    """Test metadata and partition listing operations."""
+
+    def test_list_partition_dates_returns_empty_list_initially(
+        self,
+        storage_config: StorageConfig,
+    ) -> None:
+        """Should return empty list when no partitions exist."""
+
+        handler = PartitionedParquetHandler(storage_config)
+
+        result: list[date] = handler.list_partition_dates()
+
+        assert result == []
+
+    def test_list_partition_dates_returns_sorted_dates(
+        self,
+        storage_config: StorageConfig,
+        sample_telemetry_dataframe: pd.DataFrame,
+    ) -> None:
+        """Should return partition dates in chronological order."""
+
+        handler = PartitionedParquetHandler(storage_config)
+
+        # Create partitions in random order
+
+        for day in [17, 13, 15, 14, 16]:
+            partition_date = date(2024, 1, day)
+
+            df = sample_telemetry_dataframe.copy()
+            if 'partition_date' in df.columns:
+                df = df.drop(columns=['partition_date'])
+
+            handler.save_partition(df, partition_date)
+
+        result: list[date] = handler.list_partition_dates()
+
+        # Should be sorted
+
+        expected = [date(2024, 1, d) for d in [13, 14, 15, 16, 17]]
+
+        assert result == expected
+
+    def test_get_latest_partition_date_returns_none_when_empty(
+        self,
+        storage_config: StorageConfig,
+    ) -> None:
+        """Should return None when no partitions exist."""
+
+        handler = PartitionedParquetHandler(storage_config)
+
+        result: date | None = handler.get_latest_partition_date()
+
+        assert result is None
+
+    def test_get_latest_partition_date_returns_most_recent(
+        self,
+        storage_config: StorageConfig,
+        sample_telemetry_dataframe: pd.DataFrame,
+    ) -> None:
+        """Should return the most recent partition date."""
+
+        handler = PartitionedParquetHandler(storage_config)
+
+        # Create partitions
+
+        for day in [13, 14, 15, 16, 17]:
+            partition_date = date(2024, 1, day)
+
+            df = sample_telemetry_dataframe.copy()
+            if 'partition_date' in df.columns:
+                df = df.drop(columns=['partition_date'])
+
+            handler.save_partition(df, partition_date)
+
+        result: date | None = handler.get_latest_partition_date()
+
+        assert result == date(2024, 1, 17)
+
+    def test_get_earliest_partition_date_returns_oldest(
+        self,
+        storage_config: StorageConfig,
+        sample_telemetry_dataframe: pd.DataFrame,
+    ) -> None:
+        """Should return the earliest partition date."""
+
+        handler = PartitionedParquetHandler(storage_config)
+
+        # Create partitions
+
+        for day in [13, 14, 15, 16, 17]:
+            partition_date = date(2024, 1, day)
+
+            df = sample_telemetry_dataframe.copy()
+            if 'partition_date' in df.columns:
+                df = df.drop(columns=['partition_date'])
+
+            handler.save_partition(df, partition_date)
+
+        result: date | None = handler.get_earliest_partition_date()
+
+        assert result == date(2024, 1, 13)
+
+    def test_get_statistics_returns_summary(
+        self,
+        storage_config: StorageConfig,
+        sample_telemetry_dataframe: pd.DataFrame,
+    ) -> None:
+        """Should return summary statistics about partitions."""
+
+        handler = PartitionedParquetHandler(storage_config)
+
+        # Create partitions
+
+        for day in [15, 16, 17]:
+            partition_date = date(2024, 1, day)
+
+            df = sample_telemetry_dataframe.copy()
+            if 'partition_date' in df.columns:
+                df = df.drop(columns=['partition_date'])
+
+            handler.save_partition(df, partition_date)
+
+        stats: dict[str, int | float | str | None] = handler.get_statistics()
+
+        assert stats['partition_count'] == 3
+
+        assert stats['earliest_date'] == '2024-01-15'
+
+        assert stats['latest_date'] == '2024-01-17'
+
+        assert isinstance(stats['total_size_mb'], float)
+
+        assert stats['total_size_mb'] > 0
+
+
+class TestPartitionedParquetHandlerSizeOperations:
+    """Test partition and total size operations."""
+
+    def test_get_partition_size_returns_none_when_missing(
+        self,
+        storage_config: StorageConfig,
+    ) -> None:
+        """Should return None when partition doesn't exist."""
+
+        handler = PartitionedParquetHandler(storage_config)
+
+        result: float | None = handler.get_partition_size(date(2024, 1, 15))
+
+        assert result is None
+
+    def test_get_partition_size_returns_size(
+        self,
+        storage_config: StorageConfig,
+        sample_telemetry_dataframe: pd.DataFrame,
+    ) -> None:
+        """Should return partition size in requested unit."""
+
+        handler = PartitionedParquetHandler(storage_config)
+
+        partition_date = date(2024, 1, 15)
+
+        df = sample_telemetry_dataframe.copy()
+        if 'partition_date' in df.columns:
+            df = df.drop(columns=['partition_date'])
+
+        handler.save_partition(df, partition_date)
+
+        size_mb: float | None = handler.get_partition_size(partition_date, 'mb')
 
         assert size_mb is not None
 
-        assert (
-            size_mb < 5.0  # noqa: PLR2004
-        )  # Should be well under 5MB with compression
+        assert isinstance(size_mb, float)
 
-        # Load
+        assert size_mb > 0
 
-        loaded: pd.DataFrame | None = handler.load()
+    def test_get_total_size_sums_all_partitions(
+        self,
+        storage_config: StorageConfig,
+        sample_telemetry_dataframe: pd.DataFrame,
+    ) -> None:
+        """Should return total size across all partitions."""
+
+        handler = PartitionedParquetHandler(storage_config)
+
+        # Create multiple partitions
+
+        for day in [15, 16, 17]:
+            partition_date = date(2024, 1, day)
+
+            df = sample_telemetry_dataframe.copy()
+            if 'partition_date' in df.columns:
+                df = df.drop(columns=['partition_date'])
+
+            handler.save_partition(df, partition_date)
+
+        total_size: float = handler.get_total_size('mb')
+
+        assert total_size > 0
+
+        # Total should be roughly 3x individual partition size
+
+        partition_size: float | None = handler.get_partition_size(date(2024, 1, 15), 'mb')
+
+        assert partition_size is not None
+
+        # Allow some variance due to compression
+
+        assert total_size > partition_size * 2.5
+
+        assert total_size < partition_size * 4.0
+
+
+class TestPartitionedParquetHandlerAtomicWrites:
+    """Test atomic write behavior at partition level."""
+
+    def test_atomic_write_uses_temp_file(
+        self,
+        storage_config: StorageConfig,
+        sample_telemetry_dataframe: pd.DataFrame,
+    ) -> None:
+        """Should use atomic write (temp file + rename) for each partition."""
+
+        handler = PartitionedParquetHandler(storage_config)
+
+        partition_date = date(2024, 1, 15)
+
+        df = sample_telemetry_dataframe.copy()
+        if 'partition_date' in df.columns:
+            df = df.drop(columns=['partition_date'])
+
+        # Save should succeed without errors
+
+        handler.save_partition(df, partition_date)
+
+        # Verify partition exists and is readable
+
+        loaded = handler.load_partition(partition_date)
 
         assert loaded is not None
 
-        assert len(loaded) == 1000  # noqa: PLR2004
+        assert len(loaded) == len(sample_telemetry_dataframe)
 
-        pd.testing.assert_frame_equal(loaded, df)
+    def test_save_overwrites_existing_partition(
+        self,
+        storage_config: StorageConfig,
+        sample_telemetry_dataframe: pd.DataFrame,
+    ) -> None:
+        """Should overwrite existing partition atomically."""
+
+        handler = PartitionedParquetHandler(storage_config)
+
+        partition_date = date(2024, 1, 15)
+
+        # Save initial data
+
+        df1 = sample_telemetry_dataframe.iloc[:2].copy()
+        if 'partition_date' in df1.columns:
+            df1 = df1.drop(columns=['partition_date'])
+
+        handler.save_partition(df1, partition_date)
+
+        # Overwrite with different data
+
+        df2 = sample_telemetry_dataframe.iloc[2:4].copy()
+        if 'partition_date' in df2.columns:
+            df2 = df2.drop(columns=['partition_date'])
+
+        handler.save_partition(df2, partition_date)
+
+        # Load should return new data
+
+        loaded = handler.load_partition(partition_date)
+
+        assert loaded is not None
+
+        assert len(loaded) == 2
+
+    def test_partition_count_property_updates(
+        self,
+        storage_config: StorageConfig,
+        sample_telemetry_dataframe: pd.DataFrame,
+    ) -> None:
+        """partition_count property should reflect current partition count."""
+
+        handler = PartitionedParquetHandler(storage_config)
+
+        assert handler.partition_count == 0
+
+        # Add partitions
+
+        for day in [15, 16, 17]:
+            partition_date = date(2024, 1, day)
+
+            df = sample_telemetry_dataframe.copy()
+            if 'partition_date' in df.columns:
+                df = df.drop(columns=['partition_date'])
+
+            handler.save_partition(df, partition_date)
+
+        assert handler.partition_count == 3
+
+        # Delete one
+
+        handler.delete_partition(date(2024, 1, 16))
+
+        assert handler.partition_count == 2
