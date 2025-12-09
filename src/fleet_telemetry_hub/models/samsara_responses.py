@@ -58,9 +58,9 @@ class AssignmentType(str, Enum):
     """Driver-vehicle assignment type."""
 
     HOS = 'HOS'  # Hours of Service assignment
-    DISPATCH = 'Dispatch'  # Dispatch assignment
-    MANUAL = 'Manual'  # Manual assignment
-    STATIC = 'Static'
+    DISPATCH = 'dispatch'  # Dispatch assignment
+    MANUAL = 'manual'  # Manual assignment
+    STATIC = 'static'
     IDCARD = 'idCard'
     FACEID = 'faceId'
     TACHOGRAPH = 'tachograph'

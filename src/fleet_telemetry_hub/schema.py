@@ -20,10 +20,14 @@ The schema is intentionally flat (no nested structures) to optimize for:
 - Compatibility with BI tools (Power BI, Tableau)
 """
 
-from typing import Final
+import logging
+from collections.abc import Hashable
+from typing import Any, Final
 
 import numpy as np
 import pandas as pd
+
+logger: logging.Logger = logging.getLogger(__name__)
 
 __all__: list[str] = [
     'DEDUP_COLUMNS',
@@ -57,14 +61,17 @@ TELEMETRY_COLUMNS: Final[list[str]] = [
 ]
 
 # Columns used for deduplication.
-# A record is considered duplicate if it has the same VIN and timestamp,
-# regardless of which provider reported it.
-DEDUP_COLUMNS: Final[list[str]] = ['vin', 'timestamp']
+# A record is considered duplicate if it has the same provider_vehicle_id and timestamp,
+# and provider is used in case each provider uses and identical id.
+# provider_vehicle_id is guaranteed to exist and is unique within each provider.
+# This avoids issues with missing VINs while preserving data from multiple
+# providers reporting the same physical vehicle.
+DEDUP_COLUMNS: Final[list[str]] = ['provider', 'provider_vehicle_id', 'timestamp']
 
 # Columns used for sorting the final output.
-# VIN-first enables efficient filtering by vehicle; timestamp-second
-# enables temporal analysis within each vehicle.
-SORT_COLUMNS: Final[list[str]] = ['vin', 'timestamp']
+# Provider-first groups each provider's data; vehicle-second enables
+# per-vehicle analysis; timestamp-third for temporal ordering.
+SORT_COLUMNS: Final[list[str]] = ['provider', 'provider_vehicle_id', 'timestamp']
 
 
 # =============================================================================
@@ -113,7 +120,7 @@ def enforce_telemetry_schema(dataframe: pd.DataFrame) -> pd.DataFrame:
 
     # Timestamp: ensure timezone-aware UTC datetime
     # pd.to_datetime handles strings, timestamps, and already-converted values
-    result['timestamp'] = pd.to_datetime(result['timestamp'], utc=True)
+    result['timestamp'] = pd.to_datetime(result['timestamp'], utc=True, errors='coerce')
 
     # Numeric columns: coerce to float64, invalid values become NaN
     numeric_columns: list[str] = [
@@ -133,7 +140,53 @@ def enforce_telemetry_schema(dataframe: pd.DataFrame) -> pd.DataFrame:
     for column_name in categorical_columns:
         result[column_name] = result[column_name].astype('category')
 
+    # String Identifiers: Force to string to prevent "101" (int) vs "101" (str) mismatches.
+    # We calculate this dynamically by subtracting known non-string columns from the master list.
+    non_string_columns: set[str] = (
+        set(numeric_columns) | set(categorical_columns) | {'timestamp'}
+    )
+    # Use list comprehension to preserve the order from TELEMETRY_COLUMNS
+    string_columns: list[str] = [
+        col for col in TELEMETRY_COLUMNS if col not in non_string_columns
+    ]
+
+    for column_name in string_columns:
+        # Check if the column is not empty before attempting conversion
+        if not result[column_name].empty:
+            # Vectorized approach: Create a boolean mask for non-null values
+            # This avoids the lambda loop and keeps the code strictly vectorized.
+            valid_mask: pd.Series[bool] = result[column_name].notna()
+
+            # Apply conversion only to the valid (non-null) rows.
+            # This ensures NaNs remain as NaNs and are not converted to the string "nan".
+            result.loc[valid_mask, column_name] = result.loc[
+                valid_mask, column_name
+            ].astype(str)
+
     # Ensure column order matches schema
     result = result[TELEMETRY_COLUMNS]
+
+    # Identify records with missing VINs
+    missing_vin_mask: pd.Series = result['vin'].isna()
+    missing_vin_count: int = missing_vin_mask.sum()
+
+    if missing_vin_count > 0:
+        # 1. Filter to just the bad rows
+        # 2. Select only the identity columns
+        # 3. Drop duplicates (so we see "Truck 101" once, not 500 times)
+        unique_missing_identities: pd.DataFrame = result.loc[
+            missing_vin_mask, ['provider', 'fleet_number', 'provider_vehicle_id']
+        ].drop_duplicates()
+
+        # Convert to a list of dictionaries for clean logging
+        details_list: list[dict[Hashable, Any]] = unique_missing_identities.to_dict(
+            orient='records'
+        )
+
+        logger.warning(
+            'Found %d rows missing VINs. Unique affected vehicles: %r',
+            missing_vin_count,
+            details_list,
+        )
 
     return result

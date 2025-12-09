@@ -1,4 +1,4 @@
-# fleet_telemetry_hub/utils/file_io.py
+# fleet_telemetry_hub/common/file_io.py
 """
 File input/output utilities for the fleet_telemetry_hub package.
 
@@ -22,7 +22,7 @@ file paths per writer.
 Usage:
 ------
     from fleet_telemetry_hub.config import StorageConfig
-    from fleet_telemetry_hub.utils.file_io import ParquetFileHandler
+    from fleet_telemetry_hub.common.file_io import ParquetFileHandler
 
     storage_config = StorageConfig(parquet_path='data/telemetry.parquet')
     handler = ParquetFileHandler(storage_config)

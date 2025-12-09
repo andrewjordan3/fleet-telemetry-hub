@@ -24,9 +24,18 @@ from fleet_telemetry_hub.client import (
     TelemetryClient,
     TransientAPIError,
 )
-from fleet_telemetry_hub.common import ParquetFileHandler, setup_logger
+from fleet_telemetry_hub.common import (
+    ParquetFileHandler,
+    PartitionedParquetHandler,
+    setup_logger,
+)
 from fleet_telemetry_hub.config import load_config
-from fleet_telemetry_hub.pipeline import PipelineError, TelemetryPipeline
+
+# from fleet_telemetry_hub.pipeline import PipelineError, TelemetryPipeline
+from fleet_telemetry_hub.pipeline_partitioned import (
+    PartitionedPipelineError,
+    PartitionedTelemetryPipeline,
+)
 from fleet_telemetry_hub.provider import (
     Provider,
     ProviderConfigurationError,
@@ -43,14 +52,15 @@ __all__: list[str] = [
     'EndpointNotFoundError',
     'EndpointRegistry',
     'ParquetFileHandler',
-    'PipelineError',
+    'PartitionedParquetHandler',
+    'PartitionedPipelineError',
+    'PartitionedTelemetryPipeline',
     'Provider',
     'ProviderConfigurationError',
     'ProviderManager',
     'ProviderNotFoundError',
     'RateLimitError',
     'TelemetryClient',
-    'TelemetryPipeline',
     'TransientAPIError',
     '__version__',
     'load_config',

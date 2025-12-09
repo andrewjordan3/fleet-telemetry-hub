@@ -83,7 +83,8 @@ pipeline:
 storage:
   # Main landing zone for raw telemetry data.
   # This folder will be created if it does not exist.
-  parquet_path: "data/fleet_telemetry.parquet"
+  # This should be the root folder. Each day of data gets a folder and parquet file.
+  parquet_path: "data/"
 
   # 'snappy' is the default for Parquet. fast read/write, moderate compression.
   # Use 'gzip' if disk space is critical, but it is slower to write.
