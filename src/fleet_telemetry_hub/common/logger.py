@@ -1,6 +1,6 @@
 # fleet_telemetry_hub/utils/logger.py
 """
-Logging configuration for the fuelsync package.
+Logging configuration for the fleet_telemetry_hub package.
 
 Provides centralized logging setup to ensure consistent log formatting
 and output across all modules in the package.
@@ -12,6 +12,7 @@ from pathlib import Path
 
 from fleet_telemetry_hub.config import LoggingConfig
 
+__all__: list[str] = ['setup_logger']
 
 def setup_logger(
     logging_level: int | None = None,

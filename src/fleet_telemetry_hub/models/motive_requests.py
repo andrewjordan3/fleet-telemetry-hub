@@ -15,7 +15,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .motive_responses import (
+from fleet_telemetry_hub.models.motive_responses import (
     Group,
     GroupsResponse,
     MotivePaginationInfo,
@@ -27,8 +27,8 @@ from .motive_responses import (
     VehicleLocationsResponse,
     VehiclesResponse,
 )
-from .shared_request_models import HTTPMethod, RequestSpec
-from .shared_response_models import (
+from fleet_telemetry_hub.models.shared_request_models import HTTPMethod, RequestSpec
+from fleet_telemetry_hub.models.shared_response_models import (
     EndpointDefinition,
     PaginationState,
     ParameterType,

@@ -6,7 +6,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .samsara_responses import (
+from fleet_telemetry_hub.models.samsara_responses import (
     AddressesResponse,
     DriversResponse,
     DriverVehicleAssignment,
@@ -22,8 +22,8 @@ from .samsara_responses import (
     VehicleStatsHistoryRecord,
     VehicleStatsHistoryResponse,
 )
-from .shared_request_models import HTTPMethod, RequestSpec
-from .shared_response_models import (
+from fleet_telemetry_hub.models.shared_request_models import HTTPMethod, RequestSpec
+from fleet_telemetry_hub.models.shared_response_models import (
     EndpointDefinition,
     PaginationState,
     ParameterType,

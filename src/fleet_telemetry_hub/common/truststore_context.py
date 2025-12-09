@@ -31,6 +31,7 @@ Dependencies:
 import ssl
 from ssl import SSLContext
 
+__all__: list[str] = ['build_truststore_ssl_context']
 
 def build_truststore_ssl_context() -> SSLContext:
     """

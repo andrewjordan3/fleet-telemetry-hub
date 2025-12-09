@@ -22,6 +22,8 @@ import yaml
 
 from fleet_telemetry_hub.config.config_models import TelemetryConfig
 
+__all__: list[str] = ['load_config']
+
 logger: logging.Logger = logging.getLogger(__name__)
 
 

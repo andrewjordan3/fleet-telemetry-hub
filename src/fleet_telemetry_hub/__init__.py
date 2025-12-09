@@ -25,13 +25,10 @@ from fleet_telemetry_hub.client import (
     TransientAPIError,
 )
 from fleet_telemetry_hub.common import (
-    ParquetFileHandler,
     PartitionedParquetHandler,
     setup_logger,
 )
 from fleet_telemetry_hub.config import load_config
-
-# from fleet_telemetry_hub.pipeline import PipelineError, TelemetryPipeline
 from fleet_telemetry_hub.pipeline_partitioned import (
     PartitionedPipelineError,
     PartitionedTelemetryPipeline,
@@ -51,7 +48,6 @@ __all__: list[str] = [
     'APIError',
     'EndpointNotFoundError',
     'EndpointRegistry',
-    'ParquetFileHandler',
     'PartitionedParquetHandler',
     'PartitionedPipelineError',
     'PartitionedTelemetryPipeline',

@@ -23,7 +23,7 @@ from typing import Any, Self
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 
-from .shared_request_models import HTTPMethod, RequestSpec
+from fleet_telemetry_hub.models.shared_request_models import HTTPMethod, RequestSpec
 
 logger: logging.Logger = logging.getLogger(__name__)
 

@@ -439,62 +439,6 @@ class StorageConfig(BaseModel):
         return Path(path_value)
 
 
-# ***OLD VERSION ***
-# class StorageConfig(BaseModel):
-#     """Configuration for Parquet file storage.
-
-#     Controls where extracted telemetry data is persisted and how it's
-#     compressed. The Parquet format provides efficient columnar storage
-#     with excellent compression ratios for telemetry data.
-
-#     Compression Trade-offs:
-#         - snappy: Fast compression/decompression, moderate ratio (default)
-#         - gzip: Slower but better ratio, good for archival
-#         - lz4: Fastest, lower ratio, good for frequently-read data
-#         - zstd: Best ratio with reasonable speed, good general choice
-#         - brotli: Highest ratio, slowest, best for cold storage
-#         - None: No compression, fastest writes, largest files
-
-#     Attributes:
-#         parquet_path: Path to the output Parquet file. Relative paths are
-#             resolved from the working directory. Extension .parquet is
-#             appended automatically if missing.
-#         parquet_compression: Compression codec for Parquet writer. Choose
-#             based on read/write frequency and storage constraints.
-#     """
-
-#     model_config = ConfigDict(extra='forbid')
-
-#     parquet_path: Path = Field(
-#         description='Output Parquet file path (.parquet extension auto-added)',
-#     )
-#     parquet_compression: CompressionType = Field(
-#         default='snappy',
-#         description="Compression codec: 'snappy', 'gzip', 'brotli', 'lz4', 'zstd', or None",
-#     )
-
-#     @field_validator('parquet_path', mode='before')
-#     @classmethod
-#     def normalize_parquet_path(cls, path_value: str | Path) -> Path:
-#         """Normalize path and ensure .parquet extension.
-
-#         Converts string paths to Path objects and appends .parquet extension
-#         if not already present for consistent file naming.
-
-#         Args:
-#             path_value: Path to parquet file as string or Path.
-
-#         Returns:
-#             Normalized Path with .parquet extension.
-#         """
-#         path_string: str = str(path_value)
-
-#         if not path_string.lower().endswith('.parquet'):
-#             path_string = f'{path_string}.parquet'
-
-#         return Path(path_string)
-
-
 # =============================================================================
 # Logging Configuration
 # =============================================================================
