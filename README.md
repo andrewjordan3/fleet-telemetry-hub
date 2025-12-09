@@ -34,7 +34,7 @@ Whether you need one-off API queries or continuous data collection, Fleet Teleme
 - **Batch Processing**: Configurable time-based batches for memory efficiency
 - **Atomic Writes**: No data corruption even if process crashes mid-write
 - **Automatic Deduplication**: Handles overlapping data from multiple runs
-- **Parquet Storage**: Efficient columnar storage with compression
+- **Date-Partitioned Parquet Storage**: Daily partitions for BigQuery compatibility and scalable storage
 - **Independent Provider Fetching**: One provider's failure doesn't block others
 - **Comprehensive Logging**: Track progress and debug issues
 
@@ -71,7 +71,7 @@ pip install -e ".[all]"
 
 ### Option 1: Data Pipeline (Recommended for Continuous Data Collection)
 
-The pipeline automatically collects, normalizes, and stores data from all configured providers.
+The pipeline automatically collects, normalizes, and stores data from all configured providers in date-partitioned Parquet files.
 
 **1. Create a configuration file** at `config/telemetry_config.yaml`:
 
@@ -113,39 +113,57 @@ logging:
 **2. Run the pipeline**:
 
 ```python
-from fleet_telemetry_hub.pipeline import TelemetryPipeline
+from fleet_telemetry_hub.pipeline_partitioned import PartitionedTelemetryPipeline
 
 # One-liner for scheduled jobs (cron, etc.)
-TelemetryPipeline('config/telemetry_config.yaml').run()
+PartitionedTelemetryPipeline('config/telemetry_config.yaml').run()
 
-# Or access the resulting data
-pipeline = TelemetryPipeline('config/telemetry_config.yaml')
+# Or work with specific date ranges
+pipeline = PartitionedTelemetryPipeline('config/telemetry_config.yaml')
 pipeline.run()
 
-# Work with unified DataFrame
-df = pipeline.dataframe
-print(f"Collected {len(df)} records from {df['vin'].nunique()} vehicles")
-print(f"Providers: {df['provider'].unique()}")
-print(f"Date range: {df['timestamp'].min()} to {df['timestamp'].max()}")
+# Load data for specific date range (for analysis)
+from datetime import date
+df = pipeline.load_date_range(
+    start_date=date(2024, 1, 1),
+    end_date=date(2024, 1, 31),
+)
+print(f"Loaded {len(df)} records from January 2024")
 
-# Export to various formats
-df.to_csv('telemetry.csv', index=False)
-df.to_excel('telemetry.xlsx', index=False)
+# Implement data retention (delete old partitions)
+deleted = pipeline.delete_old_partitions(retention_days=90)
+print(f"Deleted {deleted} partitions older than 90 days")
+```
+
+**Storage Structure:**
+
+The pipeline creates a Hive-style directory structure compatible with BigQuery:
+
+```
+data/telemetry/
+├── date=2024-01-15/
+│   └── data.parquet
+├── date=2024-01-16/
+│   └── data.parquet
+├── date=2024-01-17/
+│   └── data.parquet
+└── _metadata.json
 ```
 
 **3. Schedule it** (optional):
 
 ```bash
 # Run daily at 2 AM
-0 2 * * * cd /path/to/project && python -c "from fleet_telemetry_hub.pipeline import TelemetryPipeline; TelemetryPipeline('config.yaml').run()"
+0 2 * * * cd /path/to/project && python -c "from fleet_telemetry_hub.pipeline_partitioned import PartitionedTelemetryPipeline; PartitionedTelemetryPipeline('config.yaml').run()"
 ```
 
 The pipeline will:
 - Fetch data from all enabled providers
 - Normalize to unified schema (14 columns: VIN, timestamp, GPS, speed, driver, etc.)
 - Deduplicate on (VIN, timestamp)
-- Save incrementally to Parquet with atomic writes
+- Save incrementally to date-partitioned Parquet files with atomic writes
 - Resume from last run with configurable lookback
+- Organize data by date for efficient BigQuery loading and retention management
 
 ### Option 2: Direct API Access (For Custom Integrations)
 
@@ -214,35 +232,85 @@ request_timeout: [10, 30]  # [connect, read]
 
 ## Advanced Usage
 
+### Pipeline: BigQuery Integration
+
+The pipeline creates Hive-style date partitions that are natively compatible with BigQuery:
+
+```python
+from fleet_telemetry_hub.pipeline_partitioned import PartitionedTelemetryPipeline
+
+# Run pipeline to populate partitioned storage
+pipeline = PartitionedTelemetryPipeline('config.yaml')
+pipeline.run()
+```
+
+**Option 1: BigQuery External Table (recommended for GCS)**
+
+1. Upload partitioned data to Google Cloud Storage:
+```bash
+gsutil -m cp -r data/telemetry/* gs://your-bucket/telemetry/
+```
+
+2. Create external table in BigQuery:
+```sql
+CREATE EXTERNAL TABLE `project.dataset.fleet_telemetry`
+WITH PARTITION COLUMNS (
+  date DATE
+)
+OPTIONS (
+  format = 'PARQUET',
+  uris = ['gs://your-bucket/telemetry/date=*/*.parquet'],
+  hive_partition_uri_prefix = 'gs://your-bucket/telemetry/'
+);
+```
+
+**Option 2: BigQuery LOAD DATA (for one-time imports)**
+
+```sql
+LOAD DATA INTO `project.dataset.fleet_telemetry`
+FROM FILES (
+  format = 'PARQUET',
+  uris = ['gs://your-bucket/telemetry/date=*/*.parquet']
+)
+WITH PARTITION COLUMNS (date DATE);
+```
+
+**Benefits of Partitioned Storage:**
+- Query only specific date ranges (reduces cost and latency)
+- Automatic partition pruning in BigQuery
+- Efficient data retention (delete old partitions easily)
+- Scales to billions of records without memory constraints
+
 ### Pipeline: Historical Backfill
 
 Fetch historical data by overriding the default start date:
 
 ```python
-from fleet_telemetry_hub.pipeline import TelemetryPipeline
+from fleet_telemetry_hub.pipeline_partitioned import PartitionedTelemetryPipeline
 from fleet_telemetry_hub.config.loader import load_config
 
 config = load_config('config.yaml')
 config.pipeline.default_start_date = '2023-01-01'
 config.pipeline.batch_increment_days = 7.0  # Larger batches for backfill
 
-pipeline = TelemetryPipeline.from_config(config)
+pipeline = PartitionedTelemetryPipeline.from_config(config)
 pipeline.run()
 ```
 
 ### Pipeline: Production Deployment with Error Handling
 
 ```python
-from fleet_telemetry_hub.pipeline import TelemetryPipeline, PipelineError
+from fleet_telemetry_hub.pipeline_partitioned import PartitionedTelemetryPipeline, PartitionedPipelineError
 import logging
 
 logger = logging.getLogger(__name__)
 
 try:
-    pipeline = TelemetryPipeline('config.yaml')
+    pipeline = PartitionedTelemetryPipeline('config.yaml')
     pipeline.run()
-    logger.info(f"Pipeline success: {len(pipeline.dataframe)} records")
-except PipelineError as e:
+    stats = pipeline.file_handler.get_statistics()
+    logger.info(f"Pipeline success: {stats['partition_count']} partitions, {stats['total_size_mb']} MB")
+except PartitionedPipelineError as e:
     logger.error(f"Pipeline failed: {e}")
     if e.partial_data_saved:
         logger.warning(f"Partial data saved up to batch {e.batch_index}")
@@ -254,13 +322,18 @@ except PipelineError as e:
 The pipeline produces a DataFrame with standardized columns across all providers:
 
 ```python
-from fleet_telemetry_hub.pipeline import TelemetryPipeline
+from fleet_telemetry_hub.pipeline_partitioned import PartitionedTelemetryPipeline
+from datetime import date
 import pandas as pd
 
-pipeline = TelemetryPipeline('config.yaml')
+pipeline = PartitionedTelemetryPipeline('config.yaml')
 pipeline.run()
 
-df = pipeline.dataframe
+# Load specific date range
+df = pipeline.load_date_range(
+    start_date=date(2025, 1, 1),
+    end_date=date(2025, 1, 31),
+)
 
 # Columns available (14 total):
 # provider, provider_vehicle_id, vin, fleet_number, timestamp,
@@ -277,7 +350,7 @@ print(df.groupby('provider')['vin'].nunique())
 avg_speeds = df.groupby('fleet_number')['speed_mph'].mean()
 
 # Export subsets
-df[df['timestamp'] >= '2025-01-01'].to_csv('recent_data.csv')
+df.to_csv('january_data.csv', index=False)
 ```
 
 ### API: Pagination
@@ -375,17 +448,21 @@ pytest --cov=fleet_telemetry_hub --cov-report=html
 fleet-telemetry-hub/
 ├── src/
 │   └── fleet_telemetry_hub/
-│       ├── pipeline.py            # Main pipeline orchestrator
-│       ├── schema.py              # Unified telemetry schema
-│       ├── client.py              # HTTP client (API abstraction)
-│       ├── provider.py            # Provider facade (API abstraction)
-│       ├── registry.py            # Endpoint discovery
+│       ├── pipeline_partitioned.py        # Pipeline orchestrator
+│       ├── schema.py                      # Unified telemetry schema
+│       ├── client.py                      # HTTP client (API abstraction)
+│       ├── provider.py                    # Provider facade (API abstraction)
+│       ├── registry.py                    # Endpoint discovery
 │       │
-│       ├── config/                # Configuration models and loader
-│       │   ├── config_models.py   # Pydantic config models
-│       │   └── loader.py          # YAML config loader
+│       ├── common/                        # Common utilities
+│       │   ├── partitioned_file_io.py     # Date-partitioned Parquet handler
+│       │   └── logger.py                  # Centralized logging setup
 │       │
-│       ├── models/                # Request/response models
+│       ├── config/                        # Configuration models and loader
+│       │   ├── config_models.py           # Pydantic config models
+│       │   └── loader.py                  # YAML config loader
+│       │
+│       ├── models/                        # Request/response models
 │       │   ├── shared_request_models.py   # RequestSpec, HTTPMethod
 │       │   ├── shared_response_models.py  # EndpointDefinition, ParsedResponse
 │       │   ├── motive_requests.py         # Motive endpoint definitions
@@ -393,13 +470,9 @@ fleet-telemetry-hub/
 │       │   ├── samsara_requests.py        # Samsara endpoint definitions
 │       │   └── samsara_responses.py       # Samsara Pydantic models
 │       │
-│       └── utils/                 # Utility functions
-│           ├── fetch_data.py      # Provider fetch functions (pipeline)
-│           ├── file_io.py         # Parquet I/O handler (pipeline)
-│           ├── logger.py          # Centralized logging setup
-│           ├── motive_funcs.py    # Motive flatten functions
-│           ├── samsara_funcs.py   # Samsara flatten functions
-│           └── truststore_context.py  # SSL/TLS utilities
+│       └── operations/                    # Data fetcher implementations
+│           ├── motive_fetcher.py          # Motive data fetcher
+│           └── samsara_fetcher.py         # Samsara data fetcher
 │
 ├── config/
 │   └── telemetry_config.yaml     # Example configuration
@@ -491,6 +564,7 @@ Project Link: https://github.com/andrewjordan3/fleet-telemetry-hub
 - [x] Unified schema for multi-provider data normalization
 - [x] Automated ETL pipeline with incremental updates
 - [x] Parquet storage with atomic writes
+- [x] Date-partitioned storage for BigQuery compatibility
 - [x] Python 3.12+ with modern type syntax
 - [x] Comprehensive logging system
 - [x] Batch processing with configurable time windows
