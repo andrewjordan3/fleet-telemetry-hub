@@ -325,7 +325,7 @@ The Data Pipeline System orchestrates the end-to-end process of extracting telem
 │     │  ├─ For each date:                                            │
 │     │  │  ├─ Load existing partition (if any)                       │
 │     │  │  ├─ Merge new records with existing                        │
-│     │  │  ├─ Deduplicate on (vin, timestamp), keep='last'           │
+│     │  │  ├─ Deduplicate on (provider, provider_vehicle_id, timestamp), keep='last'           │
 │     │  │  └─ Save atomically to date=YYYY-MM-DD/data.parquet        │
 │     │  └─ Return dict[date, record_count]                           │
 │     │                                                               │
@@ -750,7 +750,7 @@ data/telemetry/
    - For each date group:
      - Load existing partition (if any)
      - Merge new records with existing
-     - Deduplicate on (vin, timestamp), keep='last'
+     - Deduplicate on (provider, provider_vehicle_id, timestamp), keep='last'
      - Save atomically to partition file
    - Returns dict mapping partition dates to record counts
 
@@ -813,7 +813,7 @@ Benefits:
 
 ```yaml
 storage:
-  parquet_path: "data/telemetry.parquet"
+  parquet_path: "data/telemetry"
   parquet_compression: "snappy"  # Or 'gzip', 'brotli', 'zstd'
 ```
 
@@ -1594,7 +1594,8 @@ fleet_telemetry_hub/
 │
 ├── common/                        # Common utilities
 │   ├── partitioned_file_io.py     # Date-partitioned Parquet handler
-│   └── logger.py                  # Centralized logging setup
+│   ├── logger.py                  # Centralized logging setup
+│   └── truststore_context.py      # SSL/TLS utilities
 │
 ├── config/
 │   ├── config_models.py           # Configuration Pydantic models
@@ -1608,9 +1609,10 @@ fleet_telemetry_hub/
 │   ├── samsara_requests.py        # Samsara endpoint definitions
 │   └── samsara_responses.py       # Samsara Pydantic models
 │
-└── operations/                    # Data fetcher implementations
-    ├── motive_fetcher.py          # Motive data fetcher (class-based)
-    └── samsara_fetcher.py         # Samsara data fetcher (class-based)
+└── operations/                    # Data transformation functions
+    ├── fetch_data.py              # Provider fetch orchestration
+    ├── motive_funcs.py            # Motive flatten functions
+    └── samsara_funcs.py           # Samsara flatten functions
 ```
 
 ### When to Use What
@@ -1647,7 +1649,7 @@ fleet_telemetry_hub/
 ✅ Incremental updates with lookback
 ✅ Atomic partition-level writes
 ✅ Date-partitioned storage for BigQuery compatibility
-✅ Deduplication on (VIN, timestamp)
+✅ Deduplication on (provider, provider_vehicle_id, timestamp)
 ✅ Comprehensive logging
 ✅ Zero-downtime data collection
 ✅ Scalable to billions of records

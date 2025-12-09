@@ -101,7 +101,7 @@ pipeline:
   batch_increment_days: 1.0
 
 storage:
-  parquet_path: "data/fleet_telemetry.parquet"
+  parquet_path: "data/telemetry"
   parquet_compression: "snappy"
 
 logging:
@@ -160,7 +160,7 @@ data/telemetry/
 The pipeline will:
 - Fetch data from all enabled providers
 - Normalize to unified schema (14 columns: VIN, timestamp, GPS, speed, driver, etc.)
-- Deduplicate on (VIN, timestamp)
+- Deduplicate on (provider, provider_vehicle_id, timestamp)
 - Save incrementally to date-partitioned Parquet files with atomic writes
 - Resume from last run with configurable lookback
 - Organize data by date for efficient BigQuery loading and retention management
@@ -456,7 +456,8 @@ fleet-telemetry-hub/
 │       │
 │       ├── common/                        # Common utilities
 │       │   ├── partitioned_file_io.py     # Date-partitioned Parquet handler
-│       │   └── logger.py                  # Centralized logging setup
+│       │   ├── logger.py                  # Centralized logging setup
+│       │   └── truststore_context.py      # SSL/TLS utilities
 │       │
 │       ├── config/                        # Configuration models and loader
 │       │   ├── config_models.py           # Pydantic config models
@@ -470,9 +471,10 @@ fleet-telemetry-hub/
 │       │   ├── samsara_requests.py        # Samsara endpoint definitions
 │       │   └── samsara_responses.py       # Samsara Pydantic models
 │       │
-│       └── operations/                    # Data fetcher implementations
-│           ├── motive_fetcher.py          # Motive data fetcher
-│           └── samsara_fetcher.py         # Samsara data fetcher
+│       └── operations/                    # Data transformation functions
+│           ├── fetch_data.py              # Provider fetch orchestration
+│           ├── motive_funcs.py            # Motive flatten functions
+│           └── samsara_funcs.py           # Samsara flatten functions
 │
 ├── config/
 │   └── telemetry_config.yaml     # Example configuration
