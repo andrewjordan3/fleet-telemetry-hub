@@ -496,6 +496,7 @@ class PartitionedParquetHandler:
             self._metadata_cache.write(
                 latest_date=partition_date,
                 partition_count=self.partition_count,
+                total_records=record_count,
             )
         else:
             try:
@@ -504,12 +505,14 @@ class PartitionedParquetHandler:
                     self._metadata_cache.write(
                         latest_date=partition_date,
                         partition_count=self.partition_count,
+                        total_records=record_count,
                     )
             except ValueError:
                 # Corrupted cache, rewrite
                 self._metadata_cache.write(
                     latest_date=partition_date,
                     partition_count=self.partition_count,
+                    total_records=record_count,
                 )
 
     def save_partitioned(
