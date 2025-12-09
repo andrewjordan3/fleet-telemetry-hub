@@ -9,10 +9,11 @@ date partitioning, and error handling.
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 import yaml
+from pandas import DataFrame
 
 from fleet_telemetry_hub.config import TelemetryConfig
 from fleet_telemetry_hub.pipeline_partitioned import (
@@ -284,7 +285,7 @@ class TestPartitionedTelemetryPipelineDetermineStartDatetime:
 
         # Should be 2025-01-01 at midnight UTC
 
-        assert start_datetime.year == 2025
+        assert start_datetime.year == 2025  # noqa: PLR2004
 
         assert start_datetime.month == 1
 
@@ -410,7 +411,7 @@ class TestPartitionedTelemetryPipelineGenerateBatches:
 
         # Should generate 3 batches (1 day each)
 
-        assert len(batches) == 3
+        assert len(batches) == 3  # noqa: PLR2004
 
     def test_generates_empty_list_when_start_after_end(
         self,
@@ -664,9 +665,13 @@ class TestPartitionedTelemetryPipelineRun:
 
         # Check that partition directories were created
 
-        telemetry_dir = temp_dir / 'telemetry'
+        telemetry_dir: Path = temp_dir / 'telemetry'
 
-        partition_dirs = [d for d in telemetry_dir.iterdir() if d.is_dir() and d.name.startswith('date=')]
+        partition_dirs: list[Path] = [
+            d
+            for d in telemetry_dir.iterdir()
+            if d.is_dir() and d.name.startswith('date=')
+        ]
 
         assert len(partition_dirs) > 0
 
@@ -688,7 +693,7 @@ class TestPartitionedTelemetryPipelineErrorHandling:
             affected_partitions=[date(2024, 1, 15), date(2024, 1, 16)],
         )
 
-        assert error.batch_index == 5
+        assert error.batch_index == 5  # noqa: PLR2004
 
         assert error.partial_data_saved is True
 
@@ -748,24 +753,27 @@ class TestPartitionedTelemetryPipelineDataRetention:
         # Create old partitions manually
 
         for day in [1, 2, 3, 15, 16, 17]:
-            from fleet_telemetry_hub.schema import enforce_telemetry_schema
-            import pandas as pd
+            import pandas as pd  # noqa: PLC0415
+
+            from fleet_telemetry_hub.schema import (  # noqa: PLC0415
+                enforce_telemetry_schema,
+            )
 
             df = pd.DataFrame(sample_telemetry_records)
-            df = enforce_telemetry_schema(df)
+            df: DataFrame = enforce_telemetry_schema(df)
 
             partition_date = date(2024, 1, day)
 
             pipeline.file_handler.save_partition(df, partition_date)
 
-        initial_count = pipeline.file_handler.partition_count
+        initial_count: int = pipeline.file_handler.partition_count
 
-        assert initial_count == 6
+        assert initial_count == 6  # noqa: PLR2004
 
         # Delete partitions older than 10 days (should delete days 1, 2, 3)
 
-        deleted = pipeline.delete_old_partitions(retention_days=10)
+        deleted: int = pipeline.delete_old_partitions(retention_days=10)
 
-        assert deleted == 3
+        assert deleted == 3  # noqa: PLR2004
 
-        assert pipeline.file_handler.partition_count == 3
+        assert pipeline.file_handler.partition_count == 3  # noqa: PLR2004

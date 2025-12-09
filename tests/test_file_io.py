@@ -5,13 +5,11 @@ Tests PartitionedParquetHandler operations including partitioned storage,
 date range loading, atomic writes, and partition management.
 """
 
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock, patch
 
 import pandas as pd
-import pytest
 
 from fleet_telemetry_hub.common import PartitionedParquetHandler
 from fleet_telemetry_hub.config import StorageConfig
@@ -72,7 +70,7 @@ class TestPartitionedParquetHandlerPartitionOperations:
         partition_date = date(2024, 1, 15)
 
         # Remove partition_date column if it exists
-        df = sample_telemetry_dataframe.copy()
+        df: pd.DataFrame = sample_telemetry_dataframe.copy()
         if 'partition_date' in df.columns:
             df = df.drop(columns=['partition_date'])
 
@@ -80,7 +78,7 @@ class TestPartitionedParquetHandlerPartitionOperations:
 
         # Should create date=2024-01-15 directory
 
-        partition_dir = storage_config.parquet_path / 'date=2024-01-15'
+        partition_dir: Path = storage_config.parquet_path / 'date=2024-01-15'
 
         assert partition_dir.exists()
 
@@ -88,7 +86,7 @@ class TestPartitionedParquetHandlerPartitionOperations:
 
         # Should create data.parquet file
 
-        parquet_file = partition_dir / 'data.parquet'
+        parquet_file: Path = partition_dir / 'data.parquet'
 
         assert parquet_file.exists()
 
@@ -116,7 +114,7 @@ class TestPartitionedParquetHandlerPartitionOperations:
         partition_date = date(2024, 1, 15)
 
         # Remove partition_date column if it exists
-        df = sample_telemetry_dataframe.copy()
+        df: pd.DataFrame = sample_telemetry_dataframe.copy()
         if 'partition_date' in df.columns:
             df = df.drop(columns=['partition_date'])
 
@@ -148,7 +146,7 @@ class TestPartitionedParquetHandlerPartitionOperations:
         assert handler.partition_exists(partition_date) is False
 
         # Remove partition_date column if it exists
-        df = sample_telemetry_dataframe.copy()
+        df: pd.DataFrame = sample_telemetry_dataframe.copy()
         if 'partition_date' in df.columns:
             df = df.drop(columns=['partition_date'])
 
@@ -189,7 +187,7 @@ class TestPartitionedParquetHandlerDateRangeOperations:
         for day in [15, 16, 17]:
             partition_date = date(2024, 1, day)
 
-            df = sample_telemetry_dataframe.copy()
+            df: pd.DataFrame = sample_telemetry_dataframe.copy()
             if 'partition_date' in df.columns:
                 df = df.drop(columns=['partition_date'])
 
@@ -222,7 +220,7 @@ class TestPartitionedParquetHandlerDateRangeOperations:
         for day in [13, 14, 15, 16, 17]:
             partition_date = date(2024, 1, day)
 
-            df = sample_telemetry_dataframe.copy()
+            df: pd.DataFrame = sample_telemetry_dataframe.copy()
             if 'partition_date' in df.columns:
                 df = df.drop(columns=['partition_date'])
 
@@ -256,7 +254,7 @@ class TestPartitionedParquetHandlerSavePartitioned:
 
         # Add partition dates to sample data
 
-        df = sample_telemetry_dataframe.copy()
+        df: pd.DataFrame = sample_telemetry_dataframe.copy()
 
         # Assign records to different dates
 
@@ -278,11 +276,11 @@ class TestPartitionedParquetHandlerSavePartitioned:
 
         # Should create 3 partitions
 
-        assert len(records_saved) == 3
+        assert len(records_saved) == 3  # noqa: PLR2004
 
-        assert records_saved[date(2024, 1, 15)] == 2
+        assert records_saved[date(2024, 1, 15)] == 2  # noqa: PLR2004
 
-        assert records_saved[date(2024, 1, 16)] == 2
+        assert records_saved[date(2024, 1, 16)] == 2  # noqa: PLR2004
 
         assert records_saved[date(2024, 1, 17)] == 1
 
@@ -335,7 +333,7 @@ class TestPartitionedParquetHandlerSavePartitioned:
 
         df = pd.DataFrame(records)
 
-        df = enforce_telemetry_schema(df)
+        df: pd.DataFrame = enforce_telemetry_schema(df)
 
         # Save with deduplication
 
@@ -365,7 +363,7 @@ class TestPartitionedParquetHandlerPartitionManagement:
 
         partition_date = date(2024, 1, 15)
 
-        df = sample_telemetry_dataframe.copy()
+        df: pd.DataFrame = sample_telemetry_dataframe.copy()
         if 'partition_date' in df.columns:
             df = df.drop(columns=['partition_date'])
 
@@ -409,7 +407,7 @@ class TestPartitionedParquetHandlerPartitionManagement:
         for day in [13, 14, 15, 16, 17]:
             partition_date = date(2024, 1, day)
 
-            df = sample_telemetry_dataframe.copy()
+            df: pd.DataFrame = sample_telemetry_dataframe.copy()
             if 'partition_date' in df.columns:
                 df = df.drop(columns=['partition_date'])
 
@@ -421,7 +419,7 @@ class TestPartitionedParquetHandlerPartitionManagement:
 
         # Should delete 3 partitions (13, 14, 15)
 
-        assert deleted_count == 3
+        assert deleted_count == 3  # noqa: PLR2004
 
         # Verify partitions 16 and 17 still exist
 
@@ -467,7 +465,7 @@ class TestPartitionedParquetHandlerMetadata:
         for day in [17, 13, 15, 14, 16]:
             partition_date = date(2024, 1, day)
 
-            df = sample_telemetry_dataframe.copy()
+            df: pd.DataFrame = sample_telemetry_dataframe.copy()
             if 'partition_date' in df.columns:
                 df = df.drop(columns=['partition_date'])
 
@@ -477,7 +475,7 @@ class TestPartitionedParquetHandlerMetadata:
 
         # Should be sorted
 
-        expected = [date(2024, 1, d) for d in [13, 14, 15, 16, 17]]
+        expected: list[date] = [date(2024, 1, d) for d in [13, 14, 15, 16, 17]]
 
         assert result == expected
 
@@ -507,7 +505,7 @@ class TestPartitionedParquetHandlerMetadata:
         for day in [13, 14, 15, 16, 17]:
             partition_date = date(2024, 1, day)
 
-            df = sample_telemetry_dataframe.copy()
+            df: pd.DataFrame = sample_telemetry_dataframe.copy()
             if 'partition_date' in df.columns:
                 df = df.drop(columns=['partition_date'])
 
@@ -531,7 +529,7 @@ class TestPartitionedParquetHandlerMetadata:
         for day in [13, 14, 15, 16, 17]:
             partition_date = date(2024, 1, day)
 
-            df = sample_telemetry_dataframe.copy()
+            df: pd.DataFrame = sample_telemetry_dataframe.copy()
             if 'partition_date' in df.columns:
                 df = df.drop(columns=['partition_date'])
 
@@ -555,7 +553,7 @@ class TestPartitionedParquetHandlerMetadata:
         for day in [15, 16, 17]:
             partition_date = date(2024, 1, day)
 
-            df = sample_telemetry_dataframe.copy()
+            df: pd.DataFrame = sample_telemetry_dataframe.copy()
             if 'partition_date' in df.columns:
                 df = df.drop(columns=['partition_date'])
 
@@ -563,7 +561,7 @@ class TestPartitionedParquetHandlerMetadata:
 
         stats: dict[str, int | float | str | None] = handler.get_statistics()
 
-        assert stats['partition_count'] == 3
+        assert stats['partition_count'] == 3  # noqa: PLR2004
 
         assert stats['earliest_date'] == '2024-01-15'
 
@@ -600,7 +598,7 @@ class TestPartitionedParquetHandlerSizeOperations:
 
         partition_date = date(2024, 1, 15)
 
-        df = sample_telemetry_dataframe.copy()
+        df: pd.DataFrame = sample_telemetry_dataframe.copy()
         if 'partition_date' in df.columns:
             df = df.drop(columns=['partition_date'])
 
@@ -628,7 +626,7 @@ class TestPartitionedParquetHandlerSizeOperations:
         for day in [15, 16, 17]:
             partition_date = date(2024, 1, day)
 
-            df = sample_telemetry_dataframe.copy()
+            df: pd.DataFrame = sample_telemetry_dataframe.copy()
             if 'partition_date' in df.columns:
                 df = df.drop(columns=['partition_date'])
 
@@ -640,7 +638,9 @@ class TestPartitionedParquetHandlerSizeOperations:
 
         # Total should be roughly 3x individual partition size
 
-        partition_size: float | None = handler.get_partition_size(date(2024, 1, 15), 'mb')
+        partition_size: float | None = handler.get_partition_size(
+            date(2024, 1, 15), 'mb'
+        )
 
         assert partition_size is not None
 
@@ -665,7 +665,7 @@ class TestPartitionedParquetHandlerAtomicWrites:
 
         partition_date = date(2024, 1, 15)
 
-        df = sample_telemetry_dataframe.copy()
+        df: pd.DataFrame = sample_telemetry_dataframe.copy()
         if 'partition_date' in df.columns:
             df = df.drop(columns=['partition_date'])
 
@@ -694,7 +694,7 @@ class TestPartitionedParquetHandlerAtomicWrites:
 
         # Save initial data
 
-        df1 = sample_telemetry_dataframe.iloc[:2].copy()
+        df1: pd.DataFrame = sample_telemetry_dataframe.iloc[:2].copy()
         if 'partition_date' in df1.columns:
             df1 = df1.drop(columns=['partition_date'])
 
@@ -702,7 +702,7 @@ class TestPartitionedParquetHandlerAtomicWrites:
 
         # Overwrite with different data
 
-        df2 = sample_telemetry_dataframe.iloc[2:4].copy()
+        df2: pd.DataFrame = sample_telemetry_dataframe.iloc[2:4].copy()
         if 'partition_date' in df2.columns:
             df2 = df2.drop(columns=['partition_date'])
 
@@ -710,11 +710,11 @@ class TestPartitionedParquetHandlerAtomicWrites:
 
         # Load should return new data
 
-        loaded = handler.load_partition(partition_date)
+        loaded: pd.DataFrame | None = handler.load_partition(partition_date)
 
         assert loaded is not None
 
-        assert len(loaded) == 2
+        assert len(loaded) == 2  # noqa: PLR2004
 
     def test_partition_count_property_updates(
         self,
@@ -732,16 +732,16 @@ class TestPartitionedParquetHandlerAtomicWrites:
         for day in [15, 16, 17]:
             partition_date = date(2024, 1, day)
 
-            df = sample_telemetry_dataframe.copy()
+            df: pd.DataFrame = sample_telemetry_dataframe.copy()
             if 'partition_date' in df.columns:
                 df = df.drop(columns=['partition_date'])
 
             handler.save_partition(df, partition_date)
 
-        assert handler.partition_count == 3
+        assert handler.partition_count == 3  # noqa: PLR2004
 
         # Delete one
 
         handler.delete_partition(date(2024, 1, 16))
 
-        assert handler.partition_count == 2
+        assert handler.partition_count == 2  # noqa: PLR2004

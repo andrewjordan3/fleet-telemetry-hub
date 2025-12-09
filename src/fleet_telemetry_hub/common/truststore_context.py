@@ -33,6 +33,7 @@ from ssl import SSLContext
 
 __all__: list[str] = ['build_truststore_ssl_context']
 
+
 def build_truststore_ssl_context() -> SSLContext:
     """
     Create an SSLContext using truststore for system certificate validation.

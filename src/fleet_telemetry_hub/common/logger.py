@@ -14,6 +14,7 @@ from fleet_telemetry_hub.config import LoggingConfig
 
 __all__: list[str] = ['setup_logger']
 
+
 def setup_logger(
     logging_level: int | None = None,
     config: LoggingConfig | None = None,
