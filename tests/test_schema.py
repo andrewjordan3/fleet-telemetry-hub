@@ -49,16 +49,16 @@ class TestSchemaConstants:
             assert field in TELEMETRY_COLUMNS, f'Missing required field: {field}'
 
     def test_dedup_columns(self) -> None:
-        """DEDUP_COLUMNS should be (vin, timestamp)."""
+        """DEDUP_COLUMNS should be (provider, provider_vehicle_id, timestamp)."""
 
-        assert DEDUP_COLUMNS == ['vin', 'timestamp']
+        assert DEDUP_COLUMNS == ['provider', 'provider_vehicle_id', 'timestamp']
 
         assert all(col in TELEMETRY_COLUMNS for col in DEDUP_COLUMNS)
 
     def test_sort_columns(self) -> None:
-        """SORT_COLUMNS should be (vin, timestamp)."""
+        """SORT_COLUMNS should be (provider, provider_vehicle_id, timestamp)."""
 
-        assert SORT_COLUMNS == ['vin', 'timestamp']
+        assert SORT_COLUMNS == ['provider', 'provider_vehicle_id', 'timestamp']
 
         assert all(col in TELEMETRY_COLUMNS for col in SORT_COLUMNS)
 
@@ -107,9 +107,15 @@ class TestEnforceTelemetrySchema:
 
         result: pd.DataFrame = enforce_telemetry_schema(df)
 
-        # Should be timezone-aware UTC
+        # Should be timezone-aware UTC. pandas 2.x preserves input resolution
+        # (e.g. `[us]` for Python datetime, `[ns]` for ISO strings), so the
+        # contract is "tz-aware UTC datetime" rather than a specific resolution.
 
-        assert result['timestamp'].dtype == 'datetime64[ns, UTC]'
+        timestamp_dtype = result['timestamp'].dtype
+
+        assert isinstance(timestamp_dtype, pd.DatetimeTZDtype)
+
+        assert str(timestamp_dtype.tz) == 'UTC'
 
         assert result['timestamp'].iloc[0].tzinfo is not None
 
@@ -346,7 +352,7 @@ class TestDeduplication:
         self,
         sample_timestamp: datetime,
     ) -> None:
-        """Should remove records with same VIN and timestamp."""
+        """Should collapse records sharing (provider, provider_vehicle_id, timestamp)."""
 
         records: list[dict[str, str | datetime | float]] = [
             {
@@ -366,18 +372,18 @@ class TestDeduplication:
                 'odometer': 125000.5,
             },
             {
-                'provider': 'samsara',  # Different provider
-                'provider_vehicle_id': 'vehicle_002',  # Different vehicle ID
-                'vin': 'ABC123XYZ45678901',  # Same VIN
+                'provider': 'motive',  # Same provider
+                'provider_vehicle_id': 'vehicle_001',  # Same vehicle ID
+                'vin': 'ABC123XYZ45678901',
                 'fleet_number': 'TRUCK-001',
                 'timestamp': sample_timestamp,  # Same timestamp
-                'latitude': 37.8,  # Different location
+                'latitude': 37.8,  # Different non-key fields below
                 'longitude': -122.5,
-                'speed_mph': 60.0,  # Different speed
+                'speed_mph': 60.0,
                 'heading_degrees': 180.0,
                 'engine_state': 'On',
-                'driver_id': 'driver_002',
-                'driver_name': 'Jane Smith',
+                'driver_id': 'driver_001',
+                'driver_name': 'John Doe',
                 'location_description': 'Oakland, CA',
                 'odometer': 126000.0,
             },
@@ -391,11 +397,11 @@ class TestDeduplication:
 
         result: pd.DataFrame = df.drop_duplicates(subset=DEDUP_COLUMNS, keep='last')
 
-        # Should keep only the last record (samsara)
+        # Should keep only the last record (the updated one)
 
         assert len(result) == 1
 
-        assert result['provider'].iloc[0] == 'samsara'
+        assert result['speed_mph'].iloc[0] == 60.0  # noqa: PLR2004
 
     def test_deduplication_keeps_different_timestamps(
         self,
@@ -459,7 +465,7 @@ class TestSorting:
         self,
         sample_telemetry_records: list[dict[str, Any]],
     ) -> None:
-        """Should sort by VIN then timestamp."""
+        """Should sort by provider, then provider_vehicle_id, then timestamp."""
 
         df = pd.DataFrame(sample_telemetry_records)
 
@@ -479,13 +485,23 @@ class TestSorting:
 
         # Check sorting
 
-        # VINs should be in ascending order
+        # Providers should be in ascending order
 
-        assert sorted_df['vin'].is_monotonic_increasing
+        assert sorted_df['provider'].astype(str).is_monotonic_increasing
 
-        # Within each VIN, timestamps should be in ascending order
+        # Within each provider, provider_vehicle_id should be ascending,
+        # and within each (provider, provider_vehicle_id), timestamps too.
 
-        for vin in sorted_df['vin'].unique():
-            vin_records: pd.DataFrame = sorted_df[sorted_df['vin'] == vin]  # pyright: ignore[reportUnknownVariableType]
+        for provider_name in sorted_df['provider'].unique():
+            provider_records: pd.DataFrame = sorted_df[
+                sorted_df['provider'] == provider_name
+            ]
 
-            assert vin_records['timestamp'].is_monotonic_increasing
+            assert provider_records['provider_vehicle_id'].is_monotonic_increasing
+
+            for vehicle_id in provider_records['provider_vehicle_id'].unique():
+                vehicle_records: pd.DataFrame = provider_records[
+                    provider_records['provider_vehicle_id'] == vehicle_id
+                ]
+
+                assert vehicle_records['timestamp'].is_monotonic_increasing

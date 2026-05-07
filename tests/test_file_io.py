@@ -331,20 +331,36 @@ class TestPartitionedParquetHandlerSavePartitioned:
             },
         ]
 
-        df = pd.DataFrame(records)
+        # `enforce_telemetry_schema` strips columns to TELEMETRY_COLUMNS, so
+        # re-add `partition_date` afterward (matching how the pipeline derives
+        # it from `timestamp` before calling `save_partitioned`).
+        # `save_partitioned(deduplicate=True)` dedupes against *existing*
+        # partition data, so save each record in a separate call to exercise
+        # that path; the second save must collapse the duplicate.
 
-        df: pd.DataFrame = enforce_telemetry_schema(df)
+        first_df = pd.DataFrame([records[0]])
+        first_df = enforce_telemetry_schema(first_df)
+        first_df['partition_date'] = first_df['timestamp'].dt.date
 
-        # Save with deduplication
-
-        records_saved: dict[date, int] = handler.save_partitioned(
-            df,
+        handler.save_partitioned(
+            first_df,
             date_column='partition_date',
             deduplicate=True,
             dedup_columns=['provider', 'provider_vehicle_id', 'timestamp'],
         )
 
-        # Should save only 1 record (deduplicated)
+        second_df = pd.DataFrame([records[1]])
+        second_df = enforce_telemetry_schema(second_df)
+        second_df['partition_date'] = second_df['timestamp'].dt.date
+
+        records_saved: dict[date, int] = handler.save_partitioned(
+            second_df,
+            date_column='partition_date',
+            deduplicate=True,
+            dedup_columns=['provider', 'provider_vehicle_id', 'timestamp'],
+        )
+
+        # Should save only 1 record (deduplicated against existing partition)
 
         assert records_saved[date(2024, 1, 15)] == 1
 

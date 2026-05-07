@@ -376,7 +376,7 @@ The Data Pipeline System orchestrates the end-to-end process of extracting telem
 ```
 Run 1 (Jan 1): Fetch Jan 1-7    → Save 100 records
 Run 2 (Jan 8): Fetch Jan 1-8    → 7-day lookback catches late records
-               Dedupe on (vin, timestamp) → Stale data replaced
+               Dedupe on (provider, provider_vehicle_id, timestamp) → Stale data replaced
 ```
 
 #### 4. Atomic Writes
@@ -505,11 +505,13 @@ df = enforce_telemetry_schema(df)  # Coerce types, validate columns
 ### Deduplication and Sorting
 
 ```python
-# Deduplication keys
-DEDUP_COLUMNS = ['vin', 'timestamp']
+# Deduplication keys (provider_vehicle_id is guaranteed non-null;
+# provider keeps records distinct when two providers report the same
+# physical vehicle).
+DEDUP_COLUMNS = ['provider', 'provider_vehicle_id', 'timestamp']
 
-# Sort order (VIN-first for efficient filtering, timestamp for temporal analysis)
-SORT_COLUMNS = ['vin', 'timestamp']
+# Sort order (provider, then provider's vehicle id, then timestamp).
+SORT_COLUMNS = ['provider', 'provider_vehicle_id', 'timestamp']
 ```
 
 ### Design Rationale
