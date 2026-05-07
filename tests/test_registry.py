@@ -240,6 +240,17 @@ class TestEndpointRegistryListEndpoints:
 
         assert 'vehicles' in endpoints
 
+    def test_list_endpoints_motive_includes_vehicle_utilization(
+        self,
+    ) -> None:
+        """Should include the new vehicle_utilization endpoint."""
+
+        registry = EndpointRegistry()
+
+        endpoints: list[str] = registry.list_endpoints('motive')
+
+        assert 'vehicle_utilization' in endpoints
+
     def test_list_endpoints_for_samsara(self) -> None:
         """Should return list of Samsara endpoints."""
 
