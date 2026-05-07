@@ -1,7 +1,7 @@
 # fleet_telemetry_hub/models/samsara_requests.py
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -213,16 +213,35 @@ class SamsaraEndpointDefinition[ResponseModelT: BaseModel, ItemT: BaseModel](
         parameter_type: ParameterType,
     ) -> str:
         """
-        Override serialization to enforce Samsara's strict RFC 3339 format (Z suffix).
+        Override serialization to enforce Samsara's strict RFC 3339 format
+        (Z suffix) for DATETIME query parameters.
 
-        Standard isoformat() often produces +00:00, but Samsara explicitly
-        documents 'Z' for UTC timestamps.
+        Samsara documents UTC timestamps with the literal 'Z' suffix rather
+        than the '+00:00' offset that datetime.isoformat() produces by
+        default. Timezone-aware datetimes are converted to UTC before
+        formatting; naive datetimes are assumed to be UTC. This ensures
+        a non-UTC tz-aware input (e.g., America/Chicago) emits the correct
+        UTC instant rather than stamping local-time numerals with a 'Z'.
+
+        All non-DATETIME parameter types delegate to the parent class.
+
+        Args:
+            value: The value to serialize.
+            parameter_type: Expected type for format selection.
+
+        Returns:
+            String representation suitable for URL/query string. DATETIME
+            values are formatted as 'YYYY-MM-DDTHH:MM:SSZ'.
         """
-        if parameter_type == ParameterType.DATETIME and isinstance(value, datetime):
-            # Force format: 2024-01-01T00:00:00Z
-            return value.strftime('%Y-%m-%dT%H:%M:%SZ')
+        if parameter_type == ParameterType.DATETIME and isinstance(
+            value, datetime
+        ):
+            if value.tzinfo is not None:
+                utc_value: datetime = value.astimezone(timezone.utc)
+            else:
+                utc_value = value
+            return utc_value.strftime('%Y-%m-%dT%H:%M:%SZ')
 
-        # Fallback to shared serialization for other types (int, date, bool)
         return super()._serialize_parameter_value(value, parameter_type)
 
 

@@ -11,6 +11,7 @@ a uniform interface, never needing to know endpoint-specific details.
 """
 
 import logging
+from datetime import datetime, timezone
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -26,6 +27,8 @@ from fleet_telemetry_hub.models.motive_responses import (
     VehicleLocation,
     VehicleLocationsResponse,
     VehiclesResponse,
+    VehicleUtilization,
+    VehicleUtilizationsResponse,
 )
 from fleet_telemetry_hub.models.shared_request_models import HTTPMethod, RequestSpec
 from fleet_telemetry_hub.models.shared_response_models import (
@@ -232,6 +235,65 @@ class MotiveEndpointDefinition[ResponseModelT: BaseModel, ItemT: ResponseModelBa
 
 
 # =============================================================================
+# Z-Suffix Datetime Variant
+# =============================================================================
+
+
+class MotiveZSuffixDatetimeEndpointDefinition[
+    ResponseModelT: BaseModel, ItemT: ResponseModelBase
+](MotiveEndpointDefinition[ResponseModelT, ItemT]):
+    """
+    Motive endpoint variant that serializes DATETIME query parameters
+    with an explicit 'Z' UTC suffix (RFC 3339).
+
+    Motive's newer endpoints (e.g., /v2/vehicle_utilization) require
+    timestamps in the form '2026-05-06T00:00:00Z' rather than the
+    '+00:00' offset that datetime.isoformat() produces by default. This
+    subclass overrides _serialize_parameter_value to enforce that
+    format for DATETIME params only; all other parameter types delegate
+    to the parent implementation.
+
+    Timezone-aware datetimes are converted to UTC before formatting.
+    Naive datetimes are assumed to be UTC and formatted as-is. This
+    matches the documented contract of the affected endpoints, which
+    accept only UTC timestamps.
+
+    Use this subclass for new Motive endpoints that require Z-suffix
+    datetimes. Existing Motive endpoints on the parent class continue
+    to use the default isoformat() behavior.
+    """
+
+    def _serialize_parameter_value(
+        self,
+        value: Any,
+        parameter_type: ParameterType,
+    ) -> str:
+        """
+        Serialize a parameter value, forcing Z-suffix on DATETIME
+        values.
+
+        Args:
+            value: The value to serialize.
+            parameter_type: Expected type for format selection.
+
+        Returns:
+            String representation suitable for URL/query string.
+            DATETIME values are formatted as 'YYYY-MM-DDTHH:MM:SSZ'.
+            All other types delegate to the parent class.
+        """
+        if parameter_type == ParameterType.DATETIME and isinstance(
+            value, datetime
+        ):
+            if value.tzinfo is not None:
+                utc_value: datetime = value.astimezone(timezone.utc)
+            else:
+                utc_value = value
+            return utc_value.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+        return super()._serialize_parameter_value(value, parameter_type)
+
+
+# =============================================================================
 # Motive Endpoint Registry
 # =============================================================================
 
@@ -321,6 +383,42 @@ class MotiveEndpoints:
         is_paginated=True,
         response_model=UsersResponse,
         item_extractor_method='get_users',
+        max_per_page=100,
+    )
+
+    VEHICLE_UTILIZATION: MotiveZSuffixDatetimeEndpointDefinition[
+        VehicleUtilizationsResponse, VehicleUtilization
+    ] = MotiveZSuffixDatetimeEndpointDefinition(
+        endpoint_path='/v2/vehicle_utilization',
+        http_method=HTTPMethod.GET,
+        description=(
+            'Pre-aggregated vehicle utilization for a time window. '
+            'Returns one row per vehicle covering the entire requested '
+            'window (not a time series).'
+        ),
+        query_parameters=(
+            QueryParameterSpec(
+                name='start_at',
+                parameter_type=ParameterType.DATETIME,
+                required=True,
+                description=(
+                    'Start of time range (ISO 8601 UTC, '
+                    "e.g., '2026-05-06T00:00:00Z')"
+                ),
+            ),
+            QueryParameterSpec(
+                name='end_at',
+                parameter_type=ParameterType.DATETIME,
+                required=True,
+                description=(
+                    'End of time range (ISO 8601 UTC, '
+                    "e.g., '2026-05-07T00:00:00Z')"
+                ),
+            ),
+        ),
+        is_paginated=True,
+        response_model=VehicleUtilizationsResponse,
+        item_extractor_method='get_vehicle_utilizations',
         max_per_page=100,
     )
 
