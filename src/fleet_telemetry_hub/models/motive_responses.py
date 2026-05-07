@@ -134,6 +134,26 @@ class ResponseModelBase(BaseModel):
     )
 
 
+class FrozenResponseModelBase(ResponseModelBase):
+    """
+    Base class for immutable Motive API response models.
+
+    Inherits all behavior from ResponseModelBase (extra='ignore',
+    populate_by_name=True, str_strip_whitespace=True) and adds frozen=True
+    to make instances hashable and prevent accidental mutation.
+
+    Use this for newly-added response models. Existing models continue to
+    inherit from ResponseModelBase to avoid disturbing their callers.
+    """
+
+    model_config = ConfigDict(
+        extra='ignore',
+        populate_by_name=True,
+        str_strip_whitespace=True,
+        frozen=True,
+    )
+
+
 # =============================================================================
 # Embedded/Shared Models (Used Across Multiple Endpoints)
 # =============================================================================
@@ -236,6 +256,33 @@ class GroupUserSummary(ResponseModelBase):
     driver_company_id: str | None = None
     status: UserStatus
     role: UserRole
+
+
+class VehicleSummary(FrozenResponseModelBase):
+    """
+    Abbreviated vehicle information embedded in other responses.
+
+    This compact representation appears when a vehicle is referenced from
+    another entity (e.g., the `vehicle` block on a VehicleUtilization). For
+    full vehicle metadata, query the /v1/vehicles endpoint.
+
+    Attributes:
+        vehicle_id: Motive's internal vehicle identifier.
+        number: Fleet/unit number (user-assigned).
+        year: Model year as string (Motive's convention).
+        make: Vehicle manufacturer (e.g., "Kenworth").
+        model: Vehicle model name.
+        vin: Vehicle Identification Number (17 characters).
+        metric_units: Whether vehicle reports metric units.
+    """
+
+    vehicle_id: int = Field(alias='id')
+    number: str
+    year: str | None = None
+    make: str | None = None
+    model: str | None = None
+    vin: str | None = None
+    metric_units: bool = False
 
 
 # =============================================================================
@@ -590,6 +637,75 @@ class User(ResponseModelBase):
         return f'{self.terminal_city}, {self.terminal_state}'
 
 
+class VehicleUtilization(FrozenResponseModelBase):
+    """
+    Aggregate utilization metrics for a single vehicle over the requested window.
+
+    Returned by /v2/vehicle_utilization. Numeric metrics are pre-calculated by
+    Motive and should not be recomputed downstream. Fuel and distance units
+    depend on the embedded vehicle's `metric_units` flag.
+
+    Attributes:
+        message: Diagnostic string describing a communication gap; normalized
+            from Motive's empty-string default to None when the vehicle is
+            communicating normally.
+        last_located_at: Timezone-aware timestamp of the most recent location
+            fix in the window (None if the vehicle never reported).
+        utilization_percentage: Percentage of the window the vehicle was
+            utilized, pre-calculated by Motive.
+        idle_time: Engine-on-but-idle duration in seconds.
+        idle_fuel: Fuel consumed while idle (gallons when
+            vehicle.metric_units=False, liters when True).
+        driving_time: Engine-on-and-moving duration in seconds.
+        driving_fuel: Fuel consumed while driving (same units as idle_fuel).
+        total_fuel: Total fuel consumed in the window (same units as idle_fuel).
+        total_distance: Distance traveled in the window (miles when
+            vehicle.metric_units=False, kilometers when True).
+        vehicle: Embedded summary of the vehicle this record describes.
+    """
+
+    message: str | None = None
+    last_located_at: datetime | None = None
+    utilization_percentage: float
+    idle_time: int
+    idle_fuel: float
+    driving_time: int
+    driving_fuel: float
+    total_fuel: float
+    total_distance: float
+    vehicle: VehicleSummary
+
+    @field_validator('message', mode='before')
+    @classmethod
+    def normalize_empty_message(cls, message_value: str | None) -> str | None:
+        """
+        Convert Motive's empty-string default for `message` to None.
+
+        Motive returns `message=""` when the vehicle is communicating normally
+        and a populated diagnostic string when there's a communication gap.
+        Normalizing the empty case to None means downstream code can use a
+        single truthiness check instead of comparing to two sentinel values.
+        """
+        if message_value is None or message_value == '':
+            return None
+        return message_value
+
+    @property
+    def engine_on_seconds(self) -> int:
+        """Total engine-on duration (idle + driving) in seconds."""
+        return self.idle_time + self.driving_time
+
+    @property
+    def engine_on_hours(self) -> float:
+        """Total engine-on duration in hours."""
+        return self.engine_on_seconds / 3600
+
+    @property
+    def has_communication_issue(self) -> bool:
+        """True when Motive reported a diagnostic message for this vehicle."""
+        return self.message is not None
+
+
 # =============================================================================
 # Wrapper Models for API Response Unpacking
 # =============================================================================
@@ -619,6 +735,12 @@ class UserWrapper(ResponseModelBase):
     """Wrapper for single user in response array."""
 
     user: User
+
+
+class VehicleUtilizationWrapper(FrozenResponseModelBase):
+    """Wrapper for single utilization record in response array."""
+
+    vehicle_utilization: VehicleUtilization
 
 
 # =============================================================================
@@ -746,3 +868,27 @@ class UsersResponse(ResponseModelBase):
             List of User objects without wrapper nesting.
         """
         return [wrapper.user for wrapper in self.users]
+
+
+class VehicleUtilizationsResponse(FrozenResponseModelBase):
+    """
+    Complete response from GET /v2/vehicle_utilization.
+
+    Attributes:
+        vehicle_utilizations: List of utilization wrappers (one per vehicle).
+        pagination: Pagination metadata.
+    """
+
+    vehicle_utilizations: list[VehicleUtilizationWrapper]
+    pagination: MotivePaginationInfo
+
+    def get_vehicle_utilizations(self) -> list[VehicleUtilization]:
+        """
+        Extract unwrapped VehicleUtilization objects from response.
+
+        Returns:
+            List of VehicleUtilization objects without wrapper nesting.
+        """
+        return [
+            wrapper.vehicle_utilization for wrapper in self.vehicle_utilizations
+        ]
