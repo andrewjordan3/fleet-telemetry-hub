@@ -395,7 +395,7 @@ class SamsaraVehicle(SamsaraModelBase):
 
     Attributes:
         vehicle_id: Samsara's internal vehicle identifier (string, not int).
-        name: Vehicle display name (often includes description like "PT-275 (Supervisor Truck)").
+        name: Vehicle display name (often includes description like "VH-001 (Service Vehicle)").
         vin: Vehicle Identification Number.
         make: Vehicle manufacturer.
         model: Vehicle model name.
