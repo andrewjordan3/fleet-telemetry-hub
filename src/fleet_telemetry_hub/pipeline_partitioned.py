@@ -103,7 +103,7 @@ class PartitionedTelemetryPipeline:
         1. Find the latest partition date
         2. Fetch data starting from (latest_date - lookback_days)
         3. For each affected partition, merge new records with existing data
-        4. Deduplicate on (vin, timestamp), keeping the latest record
+        4. Deduplicate on DEDUP_COLUMNS, keeping the latest record
 
     Attributes:
         config: The loaded TelemetryConfig instance (read-only).
@@ -583,7 +583,7 @@ class PartitionedTelemetryPipeline:
 
         Returns:
             Combined DataFrame from all partitions in the range, sorted by
-            (vin, timestamp), or None if no data exists in the range.
+            SORT_COLUMNS, or None if no data exists in the range.
         """
         dataframe: pd.DataFrame | None = self._file_handler.load_date_range(
             start_date=start_date,

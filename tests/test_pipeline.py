@@ -514,9 +514,9 @@ class TestPartitionedTelemetryPipelineRun:
         with config_file.open('w') as f:
             yaml.dump(config_data, f)
 
-        pipeline = PartitionedTelemetryPipeline(config_file)
-
-        # Create a mock fetcher class
+        # `PartitionedTelemetryPipeline.__init__` resolves fetcher classes
+        # eagerly from PROVIDER_FETCHER_CLASSES, so the patch must be applied
+        # before construction or the pipeline captures the real fetcher.
 
         class MockFetcher:
             def __init__(self, provider: Any) -> None:
@@ -527,12 +527,12 @@ class TestPartitionedTelemetryPipelineRun:
             ) -> list[dict[str, Any]]:
                 return sample_telemetry_records
 
-        # Mock the PROVIDER_FETCHER_CLASSES
-
         with patch(
             'fleet_telemetry_hub.pipeline_partitioned.PROVIDER_FETCHER_CLASSES',
             {'motive': MockFetcher},
         ):
+            pipeline = PartitionedTelemetryPipeline(config_file)
+
             pipeline.run()
 
         # Should have created partitions
@@ -646,7 +646,7 @@ class TestPartitionedTelemetryPipelineRun:
         with config_file.open('w') as f:
             yaml.dump(config_data, f)
 
-        pipeline = PartitionedTelemetryPipeline(config_file)
+        # Patch must wrap construction (see test_run_with_mocked_fetchers).
 
         class MockFetcher:
             def __init__(self, provider: Any) -> None:
@@ -661,6 +661,8 @@ class TestPartitionedTelemetryPipelineRun:
             'fleet_telemetry_hub.pipeline_partitioned.PROVIDER_FETCHER_CLASSES',
             {'motive': MockFetcher},
         ):
+            pipeline = PartitionedTelemetryPipeline(config_file)
+
             pipeline.run()
 
         # Check that partition directories were created
@@ -750,19 +752,28 @@ class TestPartitionedTelemetryPipelineDataRetention:
 
         pipeline = PartitionedTelemetryPipeline(config_file)
 
-        # Create old partitions manually
+        # Create six partitions relative to today: three older than the
+        # retention cutoff and three within it. `delete_old_partitions` uses
+        # `datetime.now(UTC)` internally, so anchoring to today keeps this
+        # test stable as wall-clock time advances.
 
-        for day in [1, 2, 3, 15, 16, 17]:
-            import pandas as pd  # noqa: PLC0415
+        from datetime import timedelta  # noqa: PLC0415
 
-            from fleet_telemetry_hub.schema import (  # noqa: PLC0415
-                enforce_telemetry_schema,
-            )
+        import pandas as pd  # noqa: PLC0415
 
+        from fleet_telemetry_hub.schema import (  # noqa: PLC0415
+            enforce_telemetry_schema,
+        )
+
+        today: date = datetime.now(UTC).date()
+
+        days_old: list[int] = [30, 25, 20, 5, 3, 1]
+
+        for offset in days_old:
             df = pd.DataFrame(sample_telemetry_records)
             df: DataFrame = enforce_telemetry_schema(df)
 
-            partition_date = date(2024, 1, day)
+            partition_date: date = today - timedelta(days=offset)
 
             pipeline.file_handler.save_partition(df, partition_date)
 
@@ -770,7 +781,8 @@ class TestPartitionedTelemetryPipelineDataRetention:
 
         assert initial_count == 6  # noqa: PLR2004
 
-        # Delete partitions older than 10 days (should delete days 1, 2, 3)
+        # Delete partitions older than 10 days (should delete the three
+        # offsets >10: 30, 25, 20).
 
         deleted: int = pipeline.delete_old_partitions(retention_days=10)
 

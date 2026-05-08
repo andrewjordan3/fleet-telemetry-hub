@@ -554,7 +554,7 @@ class PartitionedParquetHandler:
                 dataframe=batch_df,
                 date_column='partition_date',
                 deduplicate=True,
-                dedup_columns=['vin', 'timestamp'],
+                dedup_columns=['provider', 'provider_vehicle_id', 'timestamp'],
             )
         """
         if date_column not in dataframe.columns:

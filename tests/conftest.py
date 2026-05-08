@@ -432,14 +432,13 @@ def duplicate_telemetry_records(
 
         records.append(record)
 
-    # Add duplicates with slightly different data
+    # Add duplicates with slightly different non-key data so they collapse
+    # under DEDUP_COLUMNS = (provider, provider_vehicle_id, timestamp).
 
     for i in range(5):
         duplicate = records[i].copy()
 
-        duplicate['speed_mph'] = 60.0  # Different speed
-
-        duplicate['provider'] = 'samsara'  # Different provider
+        duplicate['speed_mph'] = 60.0  # Different speed (non-key field)
 
         records.append(duplicate)
 
@@ -610,11 +609,19 @@ def assert_dataframe_valid_telemetry() -> Any:
             f'Expected: {TELEMETRY_COLUMNS}, Got: {list(df.columns)}'
         )
 
-        # Check timestamp is timezone-aware UTC
+        # Check timestamp is timezone-aware UTC. pandas 2.x preserves the
+        # resolution of the input (e.g. `[us]` for Python datetime objects,
+        # `[ns]` for ISO strings), so accept any UTC-aware resolution.
 
-        assert df['timestamp'].dtype == 'datetime64[ns, UTC]', (
-            f"Timestamp column should be 'datetime64[ns, UTC]', "
-            f'got {df["timestamp"].dtype}'
+        timestamp_dtype = df['timestamp'].dtype
+
+        assert isinstance(timestamp_dtype, pd.DatetimeTZDtype), (
+            f'Timestamp column should be a tz-aware datetime, '
+            f'got {timestamp_dtype}'
+        )
+
+        assert str(timestamp_dtype.tz) == 'UTC', (
+            f'Timestamp column should be UTC, got tz={timestamp_dtype.tz}'
         )
 
         # Check numeric columns

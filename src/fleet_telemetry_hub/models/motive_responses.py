@@ -168,7 +168,7 @@ class EldDeviceInfo(ResponseModelBase):
 
     Attributes:
         device_id: Motive's internal device identifier.
-        identifier: Device serial number or hardware ID (e.g., "AABL36SE164048").
+        identifier: Device serial number or hardware ID (e.g., "XXXX99XX999999").
         model: Device model name (e.g., "lbb-3.6ca" for Motive's LBB device).
     """
 
@@ -191,7 +191,7 @@ class DriverSummary(ResponseModelBase):
         last_name: Driver's last name.
         username: Login username (may be null if not set).
         email: Driver's email address.
-        driver_company_id: Company-assigned driver ID (e.g., "34311-AFSR").
+        driver_company_id: Company-assigned driver ID (e.g., "12345-WXYZ").
         status: Account status (active, inactive, deactivated).
         role: User role (typically "driver" in this context).
     """
@@ -482,7 +482,7 @@ class Group(ResponseModelBase):
 
     Attributes:
         group_id: Motive's internal group identifier.
-        name: Display name (e.g., "D1 - R1 - Chicago South").
+        name: Display name (e.g., "Region A - District 1 - Headquarters").
         company_id: Parent company identifier.
         parent_id: Parent group ID for hierarchy (null if top-level).
         user: Manager/owner of this group.

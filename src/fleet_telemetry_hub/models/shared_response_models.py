@@ -310,9 +310,9 @@ class EndpointDefinition[ItemT: BaseModel](ABC, BaseModel):
         Example:
             >>> endpoint.build_url(
             ...     "https://api.gomotive.com",
-            ...     vehicle_id=543179
+            ...     vehicle_id=12345
             ... )
-            'https://api.gomotive.com/v3/vehicle_locations/543179'
+            'https://api.gomotive.com/v3/vehicle_locations/12345'
         """
         resolved_path: str = self.endpoint_path
 
