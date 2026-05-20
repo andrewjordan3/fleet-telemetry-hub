@@ -154,6 +154,22 @@ class SamsaraGateway(SamsaraModelBase):
     model: str
 
 
+class SamsaraExternalIds(SamsaraModelBase):
+    """
+    External identifier mappings from the Samsara platform.
+
+    The real API keys contain literal dots (e.g. ``samsara.vin``); Pydantic
+    handles dotted aliases as plain string lookups against the JSON payload.
+
+    Attributes:
+        samsara_vin: Vehicle Identification Number when reported.
+        samsara_serial: Telematics gateway serial number when reported.
+    """
+
+    samsara_vin: str | None = Field(default=None, alias='samsara.vin')
+    samsara_serial: str | None = Field(default=None, alias='samsara.serial')
+
+
 class DriverReference(SamsaraModelBase):
     """
     Abbreviated driver reference embedded in vehicle records.
@@ -1030,3 +1046,388 @@ class DriverVehicleAssignmentsResponse(SamsaraModelBase):
             ):
                 return assignment.driver.name
         return None
+
+
+# =============================================================================
+# Fuel & Energy Report Models
+# =============================================================================
+
+
+class EstFuelEnergyCost(SamsaraModelBase):
+    """
+    Estimated fuel/energy cost for a vehicle report.
+
+    Attributes:
+        amount: Cost amount as a floating-point number.
+        currency_code: ISO 4217 currency code in uppercase (e.g. "USD").
+    """
+
+    amount: float
+    currency_code: str = Field(alias='currencyCode')
+
+
+class FuelEnergyVehicle(SamsaraModelBase):
+    """
+    Vehicle reference embedded in a fuel-energy report row.
+
+    Attributes:
+        energy_type: Energy source classification (e.g. "fuel").
+        vehicle_id: Samsara's internal vehicle identifier.
+        name: Vehicle display name.
+        external_ids: External identifier mappings (VIN, gateway serial).
+    """
+
+    energy_type: str = Field(alias='energyType')
+    vehicle_id: str = Field(alias='id')
+    name: str
+    external_ids: SamsaraExternalIds | None = Field(
+        default=None,
+        alias='externalIds',
+    )
+
+
+class FuelEnergyVehicleReport(SamsaraModelBase):
+    """
+    One vehicle's aggregated fuel/energy report for the requested window.
+
+    Attributes:
+        vehicle: Vehicle reference for this report row.
+        efficiency_mpge: Fuel efficiency in miles-per-gallon-equivalent.
+        energy_used_kwh: Electrical energy consumed in kilowatt-hours.
+        fuel_consumed_ml: Liquid fuel consumed in milliliters.
+        distance_traveled_meters: Distance driven in meters.
+        est_carbon_emissions_kg: Estimated CO2 emissions in kilograms.
+        est_fuel_energy_cost: Estimated cost of consumed fuel/energy.
+        engine_run_time_duration_ms: Engine-on time in milliseconds.
+        engine_idle_time_duration_ms: Engine-idle time in milliseconds.
+    """
+
+    vehicle: FuelEnergyVehicle
+    efficiency_mpge: float = Field(alias='efficiencyMpge')
+    energy_used_kwh: float = Field(alias='energyUsedKwh')
+    fuel_consumed_ml: int = Field(alias='fuelConsumedMl')
+    distance_traveled_meters: int = Field(alias='distanceTraveledMeters')
+    est_carbon_emissions_kg: float = Field(alias='estCarbonEmissionsKg')
+    est_fuel_energy_cost: EstFuelEnergyCost = Field(alias='estFuelEnergyCost')
+    engine_run_time_duration_ms: int = Field(alias='engineRunTimeDurationMs')
+    engine_idle_time_duration_ms: int = Field(alias='engineIdleTimeDurationMs')
+
+
+class FuelEnergyData(SamsaraModelBase):
+    """
+    Container for the ``vehicleReports`` array in fuel-energy responses.
+
+    The fuel-energy endpoint is the only Samsara response that nests its
+    list under ``data.vehicleReports`` instead of placing it directly at
+    ``data``. This intermediate model keeps the asymmetry contained.
+
+    Attributes:
+        vehicle_reports: Per-vehicle fuel/energy report rows.
+    """
+
+    vehicle_reports: list[FuelEnergyVehicleReport] = Field(alias='vehicleReports')
+
+
+class FuelEnergyResponse(SamsaraModelBase):
+    """
+    Complete response from GET /fleet/reports/vehicles/fuel-energy.
+
+    Attributes:
+        data: Nested container holding the vehicle report list.
+        pagination: Cursor-based pagination metadata.
+    """
+
+    data: FuelEnergyData
+    pagination: SamsaraPaginationInfo | None = None
+
+    def get_items(self) -> list[FuelEnergyVehicleReport]:
+        """Extract the flat list of vehicle reports (uniform interface method)."""
+        return self.data.vehicle_reports
+
+
+# =============================================================================
+# Hours of Service (HoS) Daily Logs Models
+# =============================================================================
+
+
+class HosDriver(SamsaraModelBase):
+    """
+    Driver reference embedded in an HoS daily log.
+
+    Attributes:
+        timezone: IANA timezone string for the driver (e.g. "America/Los_Angeles").
+        eld_settings: HOS ruleset configuration applied to this driver.
+        driver_id: Samsara's internal driver identifier.
+        name: Driver's full name.
+    """
+
+    timezone: str
+    eld_settings: EldSettings = Field(alias='eldSettings')
+    driver_id: str = Field(alias='id')
+    name: str
+
+
+class HosVehicleReference(SamsaraModelBase):
+    """
+    Vehicle reference embedded in HoS log metadata.
+
+    Attributes:
+        vehicle_id: Samsara's internal vehicle identifier.
+        name: Vehicle display name.
+        external_ids: External identifier mappings (VIN, gateway serial).
+    """
+
+    vehicle_id: str = Field(alias='id')
+    name: str
+    external_ids: SamsaraExternalIds | None = Field(
+        default=None,
+        alias='externalIds',
+    )
+
+
+class HosLogMetaData(SamsaraModelBase):
+    """
+    Metadata block describing an HoS daily log.
+
+    The ``vehicles`` and ``trailerNames`` keys may be omitted entirely on
+    days where the driver had no equipment assigned; both default to an
+    empty list. ``certifiedAtTime`` is only present when ``isCertified``
+    is true.
+
+    Attributes:
+        shipping_docs: Free-form shipping document identifier.
+        vehicles: Vehicles operated during the log day.
+        trailer_names: Trailer identifiers attached during the log day.
+        is_certified: Whether the driver has certified this log.
+        certified_at_time: When the driver certified the log, if certified.
+        adverse_driving_claimed: Adverse driving exemption claim flag.
+        big_day_claimed: Big day exemption claim flag.
+        is_us_short_haul_active: US short-haul rule active flag.
+        carrier_name: Carrier legal name.
+        carrier_formatted_address: Carrier formatted address string.
+        carrier_us_dot_number: Carrier USDOT number.
+        home_terminal_name: Driver's home terminal name.
+        home_terminal_formatted_address: Driver's home terminal address.
+    """
+
+    shipping_docs: str = Field(alias='shippingDocs')
+    vehicles: list[HosVehicleReference] = Field(default_factory=list)
+    trailer_names: list[str] = Field(default_factory=list, alias='trailerNames')
+    is_certified: bool = Field(alias='isCertified')
+    certified_at_time: datetime | None = Field(default=None, alias='certifiedAtTime')
+    adverse_driving_claimed: bool = Field(alias='adverseDrivingClaimed')
+    big_day_claimed: bool = Field(alias='bigDayClaimed')
+    is_us_short_haul_active: bool = Field(alias='isUsShortHaulActive')
+    carrier_name: str = Field(alias='carrierName')
+    carrier_formatted_address: str = Field(alias='carrierFormattedAddress')
+    carrier_us_dot_number: int = Field(alias='carrierUsDotNumber')
+    home_terminal_name: str = Field(alias='homeTerminalName')
+    home_terminal_formatted_address: str = Field(alias='homeTerminalFormattedAddress')
+
+
+class HosDistanceTraveled(SamsaraModelBase):
+    """
+    Distance summary for an HoS daily log.
+
+    Attributes:
+        drive_distance_meters: Distance driven during the log period.
+    """
+
+    drive_distance_meters: int = Field(alias='driveDistanceMeters')
+
+
+class HosDutyStatusDurations(SamsaraModelBase):
+    """
+    Per-duty-status duration totals (in milliseconds) for an HoS daily log.
+
+    Attributes:
+        active_duration_ms: Active duty (driving + on-duty) total.
+        on_duty_duration_ms: On-duty-not-driving total.
+        drive_duration_ms: Driving total.
+        off_duty_duration_ms: Off-duty total.
+        sleeper_berth_duration_ms: Sleeper berth total.
+        yard_move_duration_ms: Yard move total.
+        personal_conveyance_duration_ms: Personal conveyance total.
+        waiting_time_duration_ms: Waiting time total.
+    """
+
+    active_duration_ms: int = Field(alias='activeDurationMs')
+    on_duty_duration_ms: int = Field(alias='onDutyDurationMs')
+    drive_duration_ms: int = Field(alias='driveDurationMs')
+    off_duty_duration_ms: int = Field(alias='offDutyDurationMs')
+    sleeper_berth_duration_ms: int = Field(alias='sleeperBerthDurationMs')
+    yard_move_duration_ms: int = Field(alias='yardMoveDurationMs')
+    personal_conveyance_duration_ms: int = Field(alias='personalConveyanceDurationMs')
+    waiting_time_duration_ms: int = Field(alias='waitingTimeDurationMs')
+
+
+class HosDailyLog(SamsaraModelBase):
+    """
+    One driver-day HoS daily log entry.
+
+    Attributes:
+        driver: Driver associated with this log.
+        start_time: Start of the log day in the driver's timezone (as UTC).
+        end_time: End of the log day in the driver's timezone (as UTC).
+        log_meta_data: Carrier, equipment, and certification metadata.
+        distance_traveled: Distance summary for the log day.
+        duty_status_durations: Finalized per-duty-status durations.
+        pending_duty_status_durations: Pending (uncertified) duty status totals.
+    """
+
+    driver: HosDriver
+    start_time: datetime = Field(alias='startTime')
+    end_time: datetime = Field(alias='endTime')
+    log_meta_data: HosLogMetaData = Field(alias='logMetaData')
+    distance_traveled: HosDistanceTraveled = Field(alias='distanceTraveled')
+    duty_status_durations: HosDutyStatusDurations = Field(alias='dutyStatusDurations')
+    pending_duty_status_durations: HosDutyStatusDurations = Field(
+        alias='pendingDutyStatusDurations',
+    )
+
+
+class HosDailyLogsResponse(SamsaraModelBase):
+    """
+    Complete response from GET /fleet/hos/daily-logs.
+
+    Attributes:
+        data: List of driver-day HoS daily log entries.
+        pagination: Cursor-based pagination metadata.
+    """
+
+    data: list[HosDailyLog]
+    pagination: SamsaraPaginationInfo | None = None
+
+    def get_items(self) -> list[HosDailyLog]:
+        """Extract HoS daily log list (uniform interface method)."""
+        return self.data
+
+
+# =============================================================================
+# Idling Events Models
+# =============================================================================
+
+
+class IdlingAsset(SamsaraModelBase):
+    """
+    Asset reference embedded in an idling event.
+
+    The ``/idling/events`` endpoint returns ``asset.id`` as a JSON integer
+    while every other Samsara endpoint returns the same ID space as a
+    string. The validator below coerces to ``str`` so downstream join
+    logic doesn't need to cast.
+
+    Attributes:
+        asset_id: Samsara's internal asset/vehicle identifier as a string.
+    """
+
+    asset_id: str = Field(alias='id')
+
+    @field_validator('asset_id', mode='before')
+    @classmethod
+    def _coerce_id_to_str(cls, value: int | str) -> str:
+        return str(value)
+
+
+class IdlingOperator(SamsaraModelBase):
+    """
+    Operator (driver) reference embedded in an idling event.
+
+    Like ``IdlingAsset.asset_id``, ``operator.id`` is an integer in
+    idling responses but a string everywhere else in Samsara. Coerce
+    to ``str`` at parse time.
+
+    Attributes:
+        operator_id: Samsara's internal driver identifier as a string.
+    """
+
+    operator_id: str = Field(alias='id')
+
+    @field_validator('operator_id', mode='before')
+    @classmethod
+    def _coerce_id_to_str(cls, value: int | str) -> str:
+        return str(value)
+
+
+class IdlingFuelCost(SamsaraModelBase):
+    """
+    Fuel cost reported on an idling event.
+
+    The ``/idling/events`` endpoint returns ``amount`` as a JSON string
+    (e.g. ``"0.66"``) and ``currency`` in lowercase (e.g. ``"usd"``).
+    The fuel-energy endpoint uses different field shapes and is modeled
+    separately by ``EstFuelEnergyCost``. The validator below coerces
+    the amount to ``float``.
+
+    Attributes:
+        amount: Cost amount as a floating-point number.
+        currency: ISO 4217 currency code in lowercase as returned by the API.
+    """
+
+    amount: float
+    currency: str
+
+    @field_validator('amount', mode='before')
+    @classmethod
+    def _coerce_amount_to_float(cls, value: str | float | int) -> float:
+        return float(value)
+
+
+class IdlingEvent(SamsaraModelBase):
+    """
+    Single idling event for a vehicle.
+
+    Idling events provide ``startTime`` plus ``durationMilliseconds``; the
+    API does not emit an ``endTime`` so it is not modeled here.
+    ``airTemperatureMillicelsius`` is optional and may be omitted on
+    individual events.
+
+    Attributes:
+        air_temperature_millicelsius: Ambient temperature in millicelsius if reported.
+        asset: Asset/vehicle reference.
+        duration_milliseconds: Event duration in milliseconds.
+        event_uuid: Stable UUID for the event.
+        fuel_consumed_milliliters: Liquid fuel consumed during idling.
+        fuel_cost: Estimated liquid fuel cost.
+        gaseous_fuel_consumed_grams: Gaseous fuel consumed during idling.
+        gaseous_fuel_cost: Estimated gaseous fuel cost.
+        operator: Driver assigned at the time of the event.
+        pto_state: Power take-off state (e.g. "inactive").
+        start_time: Event start timestamp.
+        latitude: Event location latitude.
+        longitude: Event location longitude.
+    """
+
+    air_temperature_millicelsius: int | None = Field(
+        default=None,
+        alias='airTemperatureMillicelsius',
+    )
+    asset: IdlingAsset
+    duration_milliseconds: int = Field(alias='durationMilliseconds')
+    event_uuid: str = Field(alias='eventUuid')
+    fuel_consumed_milliliters: float = Field(alias='fuelConsumedMilliliters')
+    fuel_cost: IdlingFuelCost = Field(alias='fuelCost')
+    gaseous_fuel_consumed_grams: int = Field(alias='gaseousFuelConsumedGrams')
+    gaseous_fuel_cost: IdlingFuelCost = Field(alias='gaseousFuelCost')
+    operator: IdlingOperator
+    pto_state: str = Field(alias='ptoState')
+    start_time: datetime = Field(alias='startTime')
+    latitude: float
+    longitude: float
+
+
+class IdlingEventsResponse(SamsaraModelBase):
+    """
+    Complete response from GET /idling/events.
+
+    Attributes:
+        data: List of idling events.
+        pagination: Cursor-based pagination metadata.
+    """
+
+    data: list[IdlingEvent]
+    pagination: SamsaraPaginationInfo | None = None
+
+    def get_items(self) -> list[IdlingEvent]:
+        """Extract idling event list (uniform interface method)."""
+        return self.data
