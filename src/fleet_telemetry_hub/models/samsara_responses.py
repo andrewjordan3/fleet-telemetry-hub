@@ -11,7 +11,7 @@ Samsara uses a cleaner response structure than Motive:
 
 import logging
 from datetime import datetime
-from enum import Enum
+from enum import StrEnum
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -24,21 +24,21 @@ logger: logging.Logger = logging.getLogger(__name__)
 # =============================================================================
 
 
-class DriverActivationStatus(str, Enum):
+class DriverActivationStatus(StrEnum):
     """Driver account activation status."""
 
     ACTIVE = 'active'
     DEACTIVATED = 'deactivated'
 
 
-class VehicleRegulationMode(str, Enum):
+class VehicleRegulationMode(StrEnum):
     """ELD regulation mode for vehicle."""
 
     REGULATED = 'regulated'
     UNREGULATED = 'unregulated'
 
 
-class EngineState(str, Enum):
+class EngineState(StrEnum):
     """Vehicle engine state values."""
 
     ON = 'On'
@@ -46,7 +46,7 @@ class EngineState(str, Enum):
     IDLE = 'Idle'
 
 
-class HarshAccelerationSettingType(str, Enum):
+class HarshAccelerationSettingType(StrEnum):
     """Harsh acceleration detection setting."""
 
     AUTOMATIC = 'automatic'
@@ -54,7 +54,7 @@ class HarshAccelerationSettingType(str, Enum):
     OFF = 'off'
 
 
-class AssignmentType(str, Enum):
+class AssignmentType(StrEnum):
     """Driver-vehicle assignment type."""
 
     HOS = 'HOS'  # Hours of Service assignment
@@ -73,7 +73,7 @@ class AssignmentType(str, Enum):
     UNKNOWN = 'unknown'
 
 
-class FilterBy(str, Enum):
+class FilterBy(StrEnum):
     """Filter mode for driver-vehicle assignments."""
 
     VEHICLES = 'vehicles'
@@ -1117,9 +1117,10 @@ class FuelEnergyData(SamsaraModelBase):
     """
     Container for the ``vehicleReports`` array in fuel-energy responses.
 
-    The fuel-energy endpoint is the only Samsara response that nests its
-    list under ``data.vehicleReports`` instead of placing it directly at
-    ``data``. This intermediate model keeps the asymmetry contained.
+    The fuel-energy endpoints (vehicle and driver grain) are the only
+    Samsara responses that nest their list under ``data.<grain>Reports``
+    instead of placing it directly at ``data``. This intermediate model
+    keeps the asymmetry contained.
 
     Attributes:
         vehicle_reports: Per-vehicle fuel/energy report rows.
@@ -1145,162 +1146,72 @@ class FuelEnergyResponse(SamsaraModelBase):
         return self.data.vehicle_reports
 
 
-# =============================================================================
-# Hours of Service (HoS) Daily Logs Models
-# =============================================================================
-
-
-class HosDriver(SamsaraModelBase):
+class FuelEnergyDriver(SamsaraModelBase):
     """
-    Driver reference embedded in an HoS daily log.
+    Driver reference embedded in a driver fuel-energy report row.
 
     Attributes:
-        timezone: IANA timezone string for the driver (e.g. "America/Los_Angeles").
-        eld_settings: HOS ruleset configuration applied to this driver.
         driver_id: Samsara's internal driver identifier.
         name: Driver's full name.
     """
 
-    timezone: str
-    eld_settings: EldSettings = Field(alias='eldSettings')
     driver_id: str = Field(alias='id')
     name: str
 
 
-class HosVehicleReference(SamsaraModelBase):
+class DriverFuelEnergyReport(SamsaraModelBase):
     """
-    Vehicle reference embedded in HoS log metadata.
+    One driver's aggregated fuel/energy report for the requested window.
 
     Attributes:
-        vehicle_id: Samsara's internal vehicle identifier.
-        name: Vehicle display name.
-        external_ids: External identifier mappings (VIN, gateway serial).
+        driver: Driver reference for this report row.
+        efficiency_mpge: Fuel efficiency in miles-per-gallon-equivalent.
+        energy_used_kwh: Electrical energy consumed in kilowatt-hours.
+        fuel_consumed_ml: Liquid fuel consumed in milliliters.
+        distance_traveled_meters: Distance driven in meters.
+        est_carbon_emissions_kg: Estimated CO2 emissions in kilograms.
+        est_fuel_energy_cost: Estimated cost of consumed fuel/energy.
+        engine_run_time_duration_ms: Engine-on time in milliseconds.
+        engine_idle_time_duration_ms: Engine-idle time in milliseconds.
     """
 
-    vehicle_id: str = Field(alias='id')
-    name: str
-    external_ids: SamsaraExternalIds | None = Field(
-        default=None,
-        alias='externalIds',
-    )
+    driver: FuelEnergyDriver
+    efficiency_mpge: float = Field(alias='efficiencyMpge')
+    energy_used_kwh: float = Field(alias='energyUsedKwh')
+    fuel_consumed_ml: int = Field(alias='fuelConsumedMl')
+    distance_traveled_meters: int = Field(alias='distanceTraveledMeters')
+    est_carbon_emissions_kg: float = Field(alias='estCarbonEmissionsKg')
+    est_fuel_energy_cost: EstFuelEnergyCost = Field(alias='estFuelEnergyCost')
+    engine_run_time_duration_ms: int = Field(alias='engineRunTimeDurationMs')
+    engine_idle_time_duration_ms: int = Field(alias='engineIdleTimeDurationMs')
 
 
-class HosLogMetaData(SamsaraModelBase):
+class DriverFuelEnergyData(SamsaraModelBase):
     """
-    Metadata block describing an HoS daily log.
-
-    The ``vehicles`` and ``trailerNames`` keys may be omitted entirely on
-    days where the driver had no equipment assigned; both default to an
-    empty list. ``certifiedAtTime`` is only present when ``isCertified``
-    is true.
+    Container for the ``driverReports`` array in driver fuel-energy responses.
 
     Attributes:
-        shipping_docs: Free-form shipping document identifier.
-        vehicles: Vehicles operated during the log day.
-        trailer_names: Trailer identifiers attached during the log day.
-        is_certified: Whether the driver has certified this log.
-        certified_at_time: When the driver certified the log, if certified.
-        adverse_driving_claimed: Adverse driving exemption claim flag.
-        big_day_claimed: Big day exemption claim flag.
-        is_us_short_haul_active: US short-haul rule active flag.
-        carrier_name: Carrier legal name.
-        carrier_formatted_address: Carrier formatted address string.
-        carrier_us_dot_number: Carrier USDOT number.
-        home_terminal_name: Driver's home terminal name.
-        home_terminal_formatted_address: Driver's home terminal address.
+        driver_reports: Per-driver fuel/energy report rows.
     """
 
-    shipping_docs: str = Field(alias='shippingDocs')
-    vehicles: list[HosVehicleReference] = Field(default_factory=list)
-    trailer_names: list[str] = Field(default_factory=list, alias='trailerNames')
-    is_certified: bool = Field(alias='isCertified')
-    certified_at_time: datetime | None = Field(default=None, alias='certifiedAtTime')
-    adverse_driving_claimed: bool = Field(alias='adverseDrivingClaimed')
-    big_day_claimed: bool = Field(alias='bigDayClaimed')
-    is_us_short_haul_active: bool = Field(alias='isUsShortHaulActive')
-    carrier_name: str = Field(alias='carrierName')
-    carrier_formatted_address: str = Field(alias='carrierFormattedAddress')
-    carrier_us_dot_number: int = Field(alias='carrierUsDotNumber')
-    home_terminal_name: str = Field(alias='homeTerminalName')
-    home_terminal_formatted_address: str = Field(alias='homeTerminalFormattedAddress')
+    driver_reports: list[DriverFuelEnergyReport] = Field(alias='driverReports')
 
 
-class HosDistanceTraveled(SamsaraModelBase):
+class DriverFuelEnergyResponse(SamsaraModelBase):
     """
-    Distance summary for an HoS daily log.
+    Complete response from GET /fleet/reports/drivers/fuel-energy.
 
     Attributes:
-        drive_distance_meters: Distance driven during the log period.
-    """
-
-    drive_distance_meters: int = Field(alias='driveDistanceMeters')
-
-
-class HosDutyStatusDurations(SamsaraModelBase):
-    """
-    Per-duty-status duration totals (in milliseconds) for an HoS daily log.
-
-    Attributes:
-        active_duration_ms: Active duty (driving + on-duty) total.
-        on_duty_duration_ms: On-duty-not-driving total.
-        drive_duration_ms: Driving total.
-        off_duty_duration_ms: Off-duty total.
-        sleeper_berth_duration_ms: Sleeper berth total.
-        yard_move_duration_ms: Yard move total.
-        personal_conveyance_duration_ms: Personal conveyance total.
-        waiting_time_duration_ms: Waiting time total.
-    """
-
-    active_duration_ms: int = Field(alias='activeDurationMs')
-    on_duty_duration_ms: int = Field(alias='onDutyDurationMs')
-    drive_duration_ms: int = Field(alias='driveDurationMs')
-    off_duty_duration_ms: int = Field(alias='offDutyDurationMs')
-    sleeper_berth_duration_ms: int = Field(alias='sleeperBerthDurationMs')
-    yard_move_duration_ms: int = Field(alias='yardMoveDurationMs')
-    personal_conveyance_duration_ms: int = Field(alias='personalConveyanceDurationMs')
-    waiting_time_duration_ms: int = Field(alias='waitingTimeDurationMs')
-
-
-class HosDailyLog(SamsaraModelBase):
-    """
-    One driver-day HoS daily log entry.
-
-    Attributes:
-        driver: Driver associated with this log.
-        start_time: Start of the log day in the driver's timezone (as UTC).
-        end_time: End of the log day in the driver's timezone (as UTC).
-        log_meta_data: Carrier, equipment, and certification metadata.
-        distance_traveled: Distance summary for the log day.
-        duty_status_durations: Finalized per-duty-status durations.
-        pending_duty_status_durations: Pending (uncertified) duty status totals.
-    """
-
-    driver: HosDriver
-    start_time: datetime = Field(alias='startTime')
-    end_time: datetime = Field(alias='endTime')
-    log_meta_data: HosLogMetaData = Field(alias='logMetaData')
-    distance_traveled: HosDistanceTraveled = Field(alias='distanceTraveled')
-    duty_status_durations: HosDutyStatusDurations = Field(alias='dutyStatusDurations')
-    pending_duty_status_durations: HosDutyStatusDurations = Field(
-        alias='pendingDutyStatusDurations',
-    )
-
-
-class HosDailyLogsResponse(SamsaraModelBase):
-    """
-    Complete response from GET /fleet/hos/daily-logs.
-
-    Attributes:
-        data: List of driver-day HoS daily log entries.
+        data: Nested container holding the driver report list.
         pagination: Cursor-based pagination metadata.
     """
 
-    data: list[HosDailyLog]
+    data: DriverFuelEnergyData
     pagination: SamsaraPaginationInfo | None = None
 
-    def get_items(self) -> list[HosDailyLog]:
-        """Extract HoS daily log list (uniform interface method)."""
-        return self.data
+    def get_items(self) -> list[DriverFuelEnergyReport]:
+        """Extract the flat list of driver reports (uniform interface method)."""
+        return self.data.driver_reports
 
 
 # =============================================================================
