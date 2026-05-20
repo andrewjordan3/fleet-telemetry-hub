@@ -8,6 +8,7 @@ from fleet_telemetry_hub.models.motive_requests import MotiveEndpoints
 from fleet_telemetry_hub.models.motive_responses import (
     DriverIdleRollup,
     DrivingPeriod,
+    IdleEvent,
     VehicleUtilization,
 )
 from fleet_telemetry_hub.provider import Provider
@@ -46,6 +47,10 @@ class MotiveUtilizationBundle:
             range, including any cross-midnight periods that started
             within the range. Order matches the API response order
             (no client-side sorting).
+        idle_events: Idle event records spanning the full date range,
+            including any cross-midnight events that started within
+            the range. Order matches the API response order (no
+            client-side sorting).
         date_range: Inclusive (start_date, end_date) the bundle was
             fetched for. Useful for downstream code to verify coverage
             without recomputing from dict keys.
@@ -54,6 +59,7 @@ class MotiveUtilizationBundle:
     vehicle_utilizations_by_date: dict[date, list[VehicleUtilization]]
     driver_idle_rollups_by_date: dict[date, list[DriverIdleRollup]]
     driving_periods: list[DrivingPeriod]
+    idle_events: list[IdleEvent]
     date_range: tuple[date, date]
 
 
@@ -61,12 +67,13 @@ class MotiveUtilizationFetcher:
     """
     Fetcher for Motive utilization data across a UTC date range.
 
-    Wraps a configured Motive Provider and orchestrates the three
+    Wraps a configured Motive Provider and orchestrates the four
     endpoint calls needed for utilization attribution:
 
         - vehicle_utilization: per-day call
         - driver_utilization:  per-day call
         - driving_periods:     single call across the full range
+        - idle_events:         single call across the full range
 
     The fetcher does no transformation of returned records -- it
     fetches and assembles them into a typed bundle. Unit conversions,
@@ -169,6 +176,15 @@ class MotiveUtilizationFetcher:
             )
             logger.debug('driving_periods: %d records', len(driving_periods))
 
+            idle_events: list[IdleEvent] = list(
+                client.fetch_all(
+                    MotiveEndpoints.IDLE_EVENTS,
+                    start_date=start_date,
+                    end_date=end_date,
+                )
+            )
+            logger.debug('idle_events: %d records', len(idle_events))
+
         total_vehicle_rows: int = sum(
             len(rows) for rows in vehicle_utilizations_by_date.values()
         )
@@ -176,16 +192,19 @@ class MotiveUtilizationFetcher:
             len(rows) for rows in driver_idle_rollups_by_date.values()
         )
         logger.info(
-            'Motive fetch complete: %d vehicle rows, %d driver rows, %d periods',
+            'Motive fetch complete: %d vehicle rows, %d driver rows, '
+            '%d periods, %d idle events',
             total_vehicle_rows,
             total_driver_rows,
             len(driving_periods),
+            len(idle_events),
         )
 
         return MotiveUtilizationBundle(
             vehicle_utilizations_by_date=vehicle_utilizations_by_date,
             driver_idle_rollups_by_date=driver_idle_rollups_by_date,
             driving_periods=driving_periods,
+            idle_events=idle_events,
             date_range=(start_date, end_date),
         )
 

@@ -43,6 +43,9 @@ from fleet_telemetry_hub.models.motive_responses import (
     DrivingPeriod,
     DrivingPeriodsResponse,
     DrivingPeriodWrapper,
+    EldDeviceInfo,
+    IdleEvent,
+    IdleEventsResponse,
     VehicleSummary,
 )
 from fleet_telemetry_hub.models.shared_request_models import HTTPMethod
@@ -735,3 +738,350 @@ class TestMotiveUtilizationEndpointsRegistryResolution:
         assert isinstance(endpoint, MotiveEndpointDefinition)
         assert not isinstance(endpoint, MotiveZSuffixDatetimeEndpointDefinition)
         assert endpoint.endpoint_path == '/v1/driving_periods'
+
+    def test_idle_events_resolves(self) -> None:
+        """Should resolve 'idle_events' from the motive provider."""
+
+        registry = EndpointRegistry()
+
+        endpoint: EndpointDefinition[BaseModel] = registry.get('motive', 'idle_events')
+
+        assert isinstance(endpoint, EndpointDefinition)
+        assert isinstance(endpoint, MotiveEndpointDefinition)
+        assert not isinstance(endpoint, MotiveZSuffixDatetimeEndpointDefinition)
+        assert endpoint.endpoint_path == '/v1/idle_events'
+
+
+_IDLE_EVENTS_FIXTURE: dict[str, Any] = {
+    'idle_events': [
+        {
+            'idle_event': {
+                'id': 4864227475,
+                'start_time': '2026-05-14T07:05:29Z',
+                'end_time': '2026-05-14T07:09:52Z',
+                'veh_fuel_start': 132572.46875,
+                'veh_fuel_end': 132572.734375,
+                'lat': 30.0,
+                'lon': -90.0,
+                'city': 'Testville',
+                'state': 'TX',
+                'rg_brg': 62.084,
+                'rg_km': 1.614,
+                'rg_match': True,
+                'end_type': 'vehicle_moving',
+                'driver': None,
+                'vehicle': {
+                    'id': 8000004,
+                    'number': 'TEST-103',
+                    'year': '2020',
+                    'make': 'TestMake',
+                    'model': 'TestModel',
+                    'vin': 'TESTVIN0000000103',
+                    'metric_units': False,
+                },
+                'eld_device': {
+                    'id': 8800004,
+                    'identifier': 'TESTELD0004',
+                    'model': 'lbb-3.6ca',
+                },
+                'location': 'Testville, TX',
+            },
+        },
+        {
+            'idle_event': {
+                'id': 4900000001,
+                'start_time': '2026-05-15T23:55:00Z',
+                'end_time': '2026-05-16T00:15:30Z',
+                'veh_fuel_start': 250000.0,
+                'veh_fuel_end': 250000.875,
+                'lat': 30.2,
+                'lon': -90.2,
+                'city': 'Testville',
+                'state': 'TX',
+                'rg_brg': 124.819,
+                'rg_km': 3.721,
+                'rg_match': True,
+                'end_type': 'vehicle_moving',
+                'driver': {
+                    'id': 9000002,
+                    'first_name': 'Suzy',
+                    'last_name': 'Snowflake',
+                    'username': None,
+                    'email': 'suzy.snowflake@example.com',
+                    'driver_company_id': 'TEST-002-SSR',
+                    'status': 'active',
+                    'role': 'driver',
+                },
+                'vehicle': {
+                    'id': 8000003,
+                    'number': 'TEST-102',
+                    'year': '2018',
+                    'make': 'TestMake',
+                    'model': 'TestModel',
+                    'vin': 'TESTVIN0000000102',
+                    'metric_units': False,
+                },
+                'eld_device': {
+                    'id': 8800003,
+                    'identifier': 'TESTELD0003',
+                    'model': 'lbb-3.6ca',
+                },
+                'location': 'Testville, TX',
+            },
+        },
+        {
+            'idle_event': {
+                'id': 4864274598,
+                'start_time': '2026-05-14T07:00:09Z',
+                'end_time': '2026-05-14T07:53:50Z',
+                'veh_fuel_start': 48106.73828125,
+                'veh_fuel_end': 48108.54296875,
+                'lat': 30.1,
+                'lon': -90.1,
+                'city': 'Testville',
+                'state': 'TX',
+                'rg_brg': 63.786,
+                'rg_km': 1.574,
+                'rg_match': True,
+                'end_type': 'vehicle_moving',
+                'driver': {
+                    'id': 9000001,
+                    'first_name': 'Sam',
+                    'last_name': 'Snowflake',
+                    'username': 'sam.snowflake',
+                    'email': 'sam.snowflake@example.com',
+                    'driver_company_id': 'TEST-001-OTR',
+                    'status': 'active',
+                    'role': 'driver',
+                },
+                'vehicle': {
+                    'id': 8000001,
+                    'number': 'TEST-100',
+                    'year': '2011',
+                    'make': 'TestMake',
+                    'model': 'TestModel',
+                    'vin': 'TESTVIN0000000100',
+                    'metric_units': False,
+                },
+                'eld_device': {
+                    'id': 8800001,
+                    'identifier': 'TESTELD0001',
+                    'model': 'lbb-3.6ca',
+                },
+                'location': 'Testville, TX',
+            },
+        },
+    ],
+    'pagination': {'per_page': 25, 'page_no': 1, 'total': 11871},
+}
+
+_FIRST_IDLE_RAW: dict[str, Any] = _IDLE_EVENTS_FIXTURE['idle_events'][0]['idle_event']
+_SECOND_IDLE_RAW: dict[str, Any] = _IDLE_EVENTS_FIXTURE['idle_events'][1]['idle_event']
+_THIRD_IDLE_RAW: dict[str, Any] = _IDLE_EVENTS_FIXTURE['idle_events'][2]['idle_event']
+_EXPECTED_IDLE_COUNT: int = len(_IDLE_EVENTS_FIXTURE['idle_events'])
+
+# Tolerances for floating-point comparisons in convenience-property tests.
+_DURATION_SECONDS_TOLERANCE = 1e-6
+_FUEL_DELTA_TOLERANCE = 1e-9
+
+
+class TestIdleEventsEndpointDefinition:
+    """Surface assertions on MotiveEndpoints.IDLE_EVENTS."""
+
+    def test_endpoint_path(self) -> None:
+        """Should expose the /v1/idle_events path."""
+
+        assert MotiveEndpoints.IDLE_EVENTS.endpoint_path == '/v1/idle_events'
+
+    def test_http_method_is_get(self) -> None:
+        """Should use HTTP GET."""
+
+        assert MotiveEndpoints.IDLE_EVENTS.http_method == HTTPMethod.GET
+
+    def test_endpoint_is_paginated(self) -> None:
+        """Should be marked paginated."""
+
+        assert MotiveEndpoints.IDLE_EVENTS.is_paginated is True
+
+    def test_max_per_page(self) -> None:
+        """Should cap page size at Motive's documented maximum of 100."""
+
+        assert MotiveEndpoints.IDLE_EVENTS.max_per_page == _MAX_PER_PAGE
+
+    def test_response_model(self) -> None:
+        """Should parse responses with IdleEventsResponse."""
+
+        assert MotiveEndpoints.IDLE_EVENTS.response_model is IdleEventsResponse
+
+    def test_item_extractor_method(self) -> None:
+        """Should extract items via get_idle_events."""
+
+        assert MotiveEndpoints.IDLE_EVENTS.item_extractor_method == 'get_idle_events'
+
+    def test_description_is_non_empty(self) -> None:
+        """Should declare a non-empty description for registry introspection."""
+
+        assert MotiveEndpoints.IDLE_EVENTS.description
+
+    def test_is_not_z_suffix_subclass(self) -> None:
+        """Should NOT be a Z-suffix subclass instance (bare DATE params only)."""
+
+        assert not isinstance(
+            MotiveEndpoints.IDLE_EVENTS,
+            MotiveZSuffixDatetimeEndpointDefinition,
+        )
+        assert isinstance(MotiveEndpoints.IDLE_EVENTS, MotiveEndpointDefinition)
+
+    def test_query_parameter_shape(self) -> None:
+        """Should declare start_date and end_date as required DATE params."""
+
+        specs_by_name = {
+            spec.name: spec for spec in MotiveEndpoints.IDLE_EVENTS.query_parameters
+        }
+        assert set(specs_by_name) == {'start_date', 'end_date'}
+        for spec in specs_by_name.values():
+            assert spec.required is True
+            assert spec.parameter_type == ParameterType.DATE
+
+    def test_build_query_params_emits_bare_date(self) -> None:
+        """Should serialize date values as YYYY-MM-DD (no time, no Z suffix)."""
+
+        query = MotiveEndpoints.IDLE_EVENTS.build_query_params(
+            start_date=date(2026, 5, 14),
+            end_date=date(2026, 5, 15),
+        )
+
+        assert query['start_date'] == '2026-05-14'
+        assert query['end_date'] == '2026-05-15'
+
+
+class TestIdleEventsResponseParsing:
+    """Tests against IdleEventsResponse.model_validate."""
+
+    def test_full_fixture_parses_without_error(self) -> None:
+        """Should parse the full fixture without raising ValidationError."""
+
+        IdleEventsResponse.model_validate(_IDLE_EVENTS_FIXTURE)
+
+    def test_get_idle_events_unwraps(self) -> None:
+        """Should unwrap into a flat list of IdleEvent instances."""
+
+        parsed = IdleEventsResponse.model_validate(_IDLE_EVENTS_FIXTURE)
+
+        items = parsed.get_idle_events()
+
+        assert len(items) == _EXPECTED_IDLE_COUNT
+        assert all(isinstance(item, IdleEvent) for item in items)
+
+    def test_pagination_metadata_parsed(self) -> None:
+        """Should parse pagination metadata."""
+
+        parsed = IdleEventsResponse.model_validate(_IDLE_EVENTS_FIXTURE)
+
+        assert (
+            parsed.pagination.per_page == _IDLE_EVENTS_FIXTURE['pagination']['per_page']
+        )
+        assert parsed.pagination.total == _IDLE_EVENTS_FIXTURE['pagination']['total']
+
+
+class TestIdleEventEdgeCases:
+    """Edge-case assertions on null-driver, cross-midnight, and same-day events."""
+
+    def test_null_driver_same_day_record(self) -> None:
+        """Should parse the null-driver same-day record."""
+
+        items = IdleEventsResponse.model_validate(
+            _IDLE_EVENTS_FIXTURE,
+        ).get_idle_events()
+
+        first = items[0]
+
+        assert first.driver is None
+        assert first.event_id == _FIRST_IDLE_RAW['id']
+        assert isinstance(first.start_time, datetime)
+        assert isinstance(first.end_time, datetime)
+        assert first.start_time.tzinfo is not None
+        assert first.end_time.tzinfo is not None
+        assert first.start_time.date() == first.end_time.date()
+
+    def test_cross_midnight_attributed_record(self) -> None:
+        """Should parse the cross-midnight attributed record."""
+
+        items = IdleEventsResponse.model_validate(
+            _IDLE_EVENTS_FIXTURE,
+        ).get_idle_events()
+
+        second = items[1]
+
+        assert isinstance(second.driver, DriverSummary)
+        assert second.driver.driver_id == _SECOND_IDLE_RAW['driver']['id']
+        assert second.end_time.date() != second.start_time.date()
+
+    def test_same_day_attributed_record(self) -> None:
+        """Should parse the long-duration same-day attributed record."""
+
+        items = IdleEventsResponse.model_validate(
+            _IDLE_EVENTS_FIXTURE,
+        ).get_idle_events()
+
+        third = items[2]
+
+        assert third.driver is not None
+        assert third.start_time.date() == third.end_time.date()
+        assert third.event_id == _THIRD_IDLE_RAW['id']
+
+    def test_nested_models_reuse_existing_types(self) -> None:
+        """Should reuse VehicleSummary and EldDeviceInfo on every record."""
+
+        items = IdleEventsResponse.model_validate(
+            _IDLE_EVENTS_FIXTURE,
+        ).get_idle_events()
+
+        for event in items:
+            assert isinstance(event.vehicle, VehicleSummary)
+            assert isinstance(event.eld_device, EldDeviceInfo)
+
+
+class TestIdleEventConvenienceProperties:
+    """Tests for is_unattributed, duration_seconds, and fuel_consumed."""
+
+    def test_is_unattributed_true_for_null_driver(self) -> None:
+        """Should return True for the null-driver record."""
+
+        items = IdleEventsResponse.model_validate(
+            _IDLE_EVENTS_FIXTURE,
+        ).get_idle_events()
+
+        assert items[0].is_unattributed is True
+
+    def test_is_unattributed_false_for_attributed_records(self) -> None:
+        """Should return False whenever a driver is attached."""
+
+        items = IdleEventsResponse.model_validate(
+            _IDLE_EVENTS_FIXTURE,
+        ).get_idle_events()
+
+        assert items[1].is_unattributed is False
+        assert items[2].is_unattributed is False
+
+    def test_duration_seconds_matches_elapsed_time(self) -> None:
+        """Should equal (end_time - start_time).total_seconds()."""
+
+        items = IdleEventsResponse.model_validate(
+            _IDLE_EVENTS_FIXTURE,
+        ).get_idle_events()
+
+        first = items[0]
+        elapsed = (first.end_time - first.start_time).total_seconds()
+        assert abs(first.duration_seconds - elapsed) < _DURATION_SECONDS_TOLERANCE
+
+    def test_fuel_consumed_is_cumulative_delta(self) -> None:
+        """Should equal veh_fuel_end - veh_fuel_start."""
+
+        items = IdleEventsResponse.model_validate(
+            _IDLE_EVENTS_FIXTURE,
+        ).get_idle_events()
+
+        first = items[0]
+        expected = _FIRST_IDLE_RAW['veh_fuel_end'] - _FIRST_IDLE_RAW['veh_fuel_start']
+        assert abs(first.fuel_consumed - expected) < _FUEL_DELTA_TOLERANCE

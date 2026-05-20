@@ -822,6 +822,81 @@ class DrivingPeriod(FrozenResponseModelBase):
         return self.end_kilometers - self.start_kilometers
 
 
+class IdleEvent(FrozenResponseModelBase):
+    """
+    Single contiguous idle event from /v1/idle_events.
+
+    Each event captures an interval during which a vehicle was idling.
+    Cross-midnight events are possible; callers aggregating per day
+    must clip to target-day boundaries themselves -- this model does
+    not clip.
+
+    ``veh_fuel_start`` and ``veh_fuel_end`` are cumulative fuel readings
+    (like a fuel odometer); the consumption during the idle is the
+    delta, exposed as ``fuel_consumed``. The ``rg_*`` fields are
+    Motive-internal reverse-geocode metadata and are preserved
+    verbatim without interpretation. ``end_type`` is a free-form string
+    code (e.g. ``"vehicle_moving"``) and is modeled as ``str`` rather
+    than an enum because the full universe of values is not
+    documented.
+
+    Attributes:
+        event_id: Motive's internal identifier for this idle event.
+        start_time: Event start timestamp (timezone-aware UTC).
+        end_time: Event end timestamp (timezone-aware UTC).
+        veh_fuel_start: Cumulative vehicle fuel reading at event start.
+        veh_fuel_end: Cumulative vehicle fuel reading at event end.
+        lat: Event latitude in decimal degrees.
+        lon: Event longitude in decimal degrees.
+        city: Reverse-geocoded city name.
+        state: Reverse-geocoded state/province code.
+        rg_brg: Motive-internal reverse-geocode bearing metric.
+        rg_km: Motive-internal reverse-geocode distance metric.
+        rg_match: Motive-internal reverse-geocode match flag.
+        end_type: Code describing how the idle ended
+            (e.g. ``"vehicle_moving"``).
+        driver: Embedded driver summary, or None when no driver was
+            logged in.
+        vehicle: Embedded summary of the vehicle that was idling.
+        eld_device: Embedded ELD device hardware information.
+        location: Human-readable location string (typically
+            ``"<city>, <state>"``).
+    """
+
+    event_id: int = Field(alias='id')
+    start_time: datetime
+    end_time: datetime
+    veh_fuel_start: float
+    veh_fuel_end: float
+    lat: float
+    lon: float
+    city: str
+    state: str
+    rg_brg: float
+    rg_km: float
+    rg_match: bool
+    end_type: str
+    driver: DriverSummary | None = None
+    vehicle: VehicleSummary
+    eld_device: EldDeviceInfo
+    location: str
+
+    @property
+    def is_unattributed(self) -> bool:
+        """True when the event has no logged-in driver."""
+        return self.driver is None
+
+    @property
+    def duration_seconds(self) -> float:
+        """Elapsed event duration in seconds."""
+        return (self.end_time - self.start_time).total_seconds()
+
+    @property
+    def fuel_consumed(self) -> float:
+        """Cumulative-fuel delta over the event (veh_fuel_end - veh_fuel_start)."""
+        return self.veh_fuel_end - self.veh_fuel_start
+
+
 # =============================================================================
 # Wrapper Models for API Response Unpacking
 # =============================================================================
@@ -869,6 +944,12 @@ class DrivingPeriodWrapper(FrozenResponseModelBase):
     """Wrapper for single driving period record in response array."""
 
     driving_period: DrivingPeriod
+
+
+class IdleEventWrapper(FrozenResponseModelBase):
+    """Wrapper for a single idle event in the response array."""
+
+    idle_event: IdleEvent
 
 
 # =============================================================================
@@ -1064,3 +1145,26 @@ class DrivingPeriodsResponse(FrozenResponseModelBase):
             List of DrivingPeriod objects without wrapper nesting.
         """
         return [wrapper.driving_period for wrapper in self.driving_periods]
+
+
+class IdleEventsResponse(FrozenResponseModelBase):
+    """
+    Complete response from GET /v1/idle_events.
+
+    Attributes:
+        idle_events: List of idle event wrappers (one per idling
+            interval; cross-midnight events are not clipped).
+        pagination: Pagination metadata.
+    """
+
+    idle_events: list[IdleEventWrapper]
+    pagination: MotivePaginationInfo
+
+    def get_idle_events(self) -> list[IdleEvent]:
+        """
+        Extract unwrapped IdleEvent objects from response.
+
+        Returns:
+            List of IdleEvent objects without wrapper nesting.
+        """
+        return [wrapper.idle_event for wrapper in self.idle_events]
