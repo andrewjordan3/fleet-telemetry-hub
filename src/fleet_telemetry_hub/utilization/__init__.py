@@ -5,9 +5,15 @@ from fleet_telemetry_hub.utilization.motive_fetcher import (
     MotiveUtilizationBundle,
     MotiveUtilizationFetcher,
 )
+from fleet_telemetry_hub.utilization.samsara_fetcher import (
+    SamsaraUtilizationBundle,
+    SamsaraUtilizationFetcher,
+)
 
 __all__: list[str] = [
     'MotiveUtilizationBundle',
     'MotiveUtilizationFetcher',
+    'SamsaraUtilizationBundle',
+    'SamsaraUtilizationFetcher',
     'UtilizationFetcher',
 ]
