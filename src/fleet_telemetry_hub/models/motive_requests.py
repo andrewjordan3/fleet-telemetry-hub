@@ -17,6 +17,10 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field
 
 from fleet_telemetry_hub.models.motive_responses import (
+    DriverIdleRollup,
+    DriverUtilizationsResponse,
+    DrivingPeriod,
+    DrivingPeriodsResponse,
     Group,
     GroupsResponse,
     MotivePaginationInfo,
@@ -240,7 +244,8 @@ class MotiveEndpointDefinition[ResponseModelT: BaseModel, ItemT: ResponseModelBa
 
 
 class MotiveZSuffixDatetimeEndpointDefinition[
-    ResponseModelT: BaseModel, ItemT: ResponseModelBase
+    ResponseModelT: BaseModel,
+    ItemT: ResponseModelBase,
 ](MotiveEndpointDefinition[ResponseModelT, ItemT]):
     """
     Motive endpoint variant that serializes DATETIME query parameters
@@ -281,9 +286,7 @@ class MotiveZSuffixDatetimeEndpointDefinition[
             DATETIME values are formatted as 'YYYY-MM-DDTHH:MM:SSZ'.
             All other types delegate to the parent class.
         """
-        if parameter_type == ParameterType.DATETIME and isinstance(
-            value, datetime
-        ):
+        if parameter_type == ParameterType.DATETIME and isinstance(value, datetime):
             if value.tzinfo is not None:
                 utc_value: datetime = value.astimezone(timezone.utc)
             else:
@@ -402,8 +405,7 @@ class MotiveEndpoints:
                 parameter_type=ParameterType.DATETIME,
                 required=True,
                 description=(
-                    'Start of time range (ISO 8601 UTC, '
-                    "e.g., '2026-05-06T00:00:00Z')"
+                    "Start of time range (ISO 8601 UTC, e.g., '2026-05-06T00:00:00Z')"
                 ),
             ),
             QueryParameterSpec(
@@ -411,8 +413,7 @@ class MotiveEndpoints:
                 parameter_type=ParameterType.DATETIME,
                 required=True,
                 description=(
-                    'End of time range (ISO 8601 UTC, '
-                    "e.g., '2026-05-07T00:00:00Z')"
+                    "End of time range (ISO 8601 UTC, e.g., '2026-05-07T00:00:00Z')"
                 ),
             ),
         ),
@@ -420,6 +421,75 @@ class MotiveEndpoints:
         response_model=VehicleUtilizationsResponse,
         item_extractor_method='get_vehicle_utilizations',
         max_per_page=100,
+    )
+
+    DRIVER_UTILIZATION: MotiveZSuffixDatetimeEndpointDefinition[
+        DriverUtilizationsResponse, DriverIdleRollup
+    ] = MotiveZSuffixDatetimeEndpointDefinition(
+        endpoint_path='/v2/driver_utilization',
+        http_method=HTTPMethod.GET,
+        description=(
+            'Per-driver aggregated idle and driving time for a time window. '
+            'Includes a single null-driver bucket aggregating activity that '
+            'could not be attributed to any logged-in driver.'
+        ),
+        query_parameters=(
+            QueryParameterSpec(
+                name='start_date',
+                parameter_type=ParameterType.DATETIME,
+                required=True,
+                description=(
+                    'Start of time range (ISO 8601 UTC with Z suffix, '
+                    "e.g., '2026-05-14T00:00:00Z'). Despite the parameter "
+                    'name, this endpoint accepts a full datetime, not a date.'
+                ),
+            ),
+            QueryParameterSpec(
+                name='end_date',
+                parameter_type=ParameterType.DATETIME,
+                required=True,
+                description=(
+                    'End of time range (ISO 8601 UTC with Z suffix, '
+                    "e.g., '2026-05-15T00:00:00Z'). Despite the parameter "
+                    'name, this endpoint accepts a full datetime, not a date.'
+                ),
+            ),
+        ),
+        is_paginated=True,
+        response_model=DriverUtilizationsResponse,
+        item_extractor_method='get_driver_idle_rollups',
+        max_per_page=100,
+    )
+
+    DRIVING_PERIODS: MotiveEndpointDefinition[DrivingPeriodsResponse, DrivingPeriod] = (
+        MotiveEndpointDefinition(
+            endpoint_path='/v1/driving_periods',
+            http_method=HTTPMethod.GET,
+            description=(
+                'Contiguous driving intervals for a date range. Each record '
+                'represents one driving period for a (driver-or-null, vehicle) '
+                'pair. Cross-midnight periods are possible; callers must clip '
+                'to target-day boundaries when aggregating per day.'
+            ),
+            query_parameters=(
+                QueryParameterSpec(
+                    name='start_date',
+                    parameter_type=ParameterType.DATE,
+                    required=True,
+                    description='Start of date range (YYYY-MM-DD)',
+                ),
+                QueryParameterSpec(
+                    name='end_date',
+                    parameter_type=ParameterType.DATE,
+                    required=True,
+                    description='End of date range (YYYY-MM-DD)',
+                ),
+            ),
+            is_paginated=True,
+            response_model=DrivingPeriodsResponse,
+            item_extractor_method='get_driving_periods',
+            max_per_page=100,
+        )
     )
 
     @classmethod

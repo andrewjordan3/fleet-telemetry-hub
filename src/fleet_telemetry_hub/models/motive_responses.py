@@ -706,6 +706,122 @@ class VehicleUtilization(FrozenResponseModelBase):
         return self.message is not None
 
 
+class DriverIdleRollup(FrozenResponseModelBase):
+    """
+    Aggregate idle/driving metrics for a single driver over the requested window.
+
+    Returned by /v2/driver_utilization. Motive emits one record per driver who
+    operated a vehicle in the window, plus a single ``driver=None`` bucket
+    aggregating activity that could not be attributed to any logged-in driver.
+
+    Durations are reported in seconds (note: this differs from Samsara's
+    ``*DurationMs`` fields). Fuel amounts are in whatever unit the vehicle
+    reports (gallons when the underlying vehicle's ``metric_units=False``,
+    liters when True); the model does not normalize.
+
+    Attributes:
+        utilization: Percentage of the window the driver was utilized,
+            pre-calculated by Motive (0-100).
+        idle_time: Engine-on-but-idle duration in seconds.
+        driving_time: Engine-on-and-moving duration in seconds.
+        driver: Embedded driver summary, or None for the unattributed-activity
+            bucket aggregating periods with no logged-in driver.
+        idle_fuel: Fuel consumed while idle.
+        driving_fuel: Fuel consumed while driving.
+    """
+
+    utilization: float
+    idle_time: int
+    driving_time: int
+    driver: DriverSummary | None = None
+    idle_fuel: float
+    driving_fuel: float
+
+    @property
+    def is_unattributed_bucket(self) -> bool:
+        """True for the null-driver bucket aggregating unattributed activity."""
+        return self.driver is None
+
+    @property
+    def total_engine_seconds(self) -> int:
+        """Total engine-on duration (idle + driving) in seconds."""
+        return self.idle_time + self.driving_time
+
+
+class DrivingPeriod(FrozenResponseModelBase):
+    """
+    One contiguous driving interval for a (driver-or-null, vehicle) pair.
+
+    Returned by /v1/driving_periods. Periods can cross UTC midnight; callers
+    aggregating per day must clip to target-day boundaries themselves -- this
+    model does not clip.
+
+    The ``distance`` field is a formatted string emitted by Motive (e.g.
+    ``"22.3 mi"``) and is not useful for arithmetic. Callers wanting real
+    distance should compute it from ``end_kilometers - start_kilometers``
+    (also exposed as ``kilometers_traveled``).
+
+    The HVB (high-voltage battery) fields are EV-only; they are always null
+    for fuel vehicles in the current fleet.
+
+    Attributes:
+        period_id: Motive's internal identifier for this driving period.
+        start_time: Period start timestamp (timezone-aware UTC).
+        end_time: Period end timestamp (timezone-aware UTC).
+        status: Lifecycle status (e.g., ``"complete"``).
+        type: Period classification (e.g., ``"driving"``).
+        annotation_status: Optional review/annotation status flag.
+        notes: Free-form driver notes attached to the period.
+        duration: Period length in seconds.
+        start_kilometers: Vehicle odometer reading at period start (km).
+        end_kilometers: Vehicle odometer reading at period end (km).
+        source: Numeric source code identifying how the period was recorded.
+        driver: Embedded driver summary, or None when no driver was logged in.
+        vehicle: Embedded summary of the vehicle that operated the period.
+        origin: Reverse-geocoded origin description.
+        origin_lat: Origin latitude in decimal degrees.
+        origin_lon: Origin longitude in decimal degrees.
+        destination: Reverse-geocoded destination description.
+        destination_lat: Destination latitude in decimal degrees.
+        destination_lon: Destination longitude in decimal degrees.
+        distance: Formatted distance string from Motive (not arithmetic-safe).
+        start_hvb_state_of_charge: EV battery state of charge at period start.
+        end_hvb_state_of_charge: EV battery state of charge at period end.
+        start_hvb_lifetime_energy_output: EV battery lifetime energy at start.
+        end_hvb_lifetime_energy_output: EV battery lifetime energy at end.
+    """
+
+    period_id: int = Field(alias='id')
+    start_time: datetime
+    end_time: datetime
+    status: str
+    type: str
+    annotation_status: str | None = None
+    notes: str | None = None
+    duration: int
+    start_kilometers: float
+    end_kilometers: float
+    source: int
+    driver: DriverSummary | None = None
+    vehicle: VehicleSummary
+    origin: str | None = None
+    origin_lat: float | None = None
+    origin_lon: float | None = None
+    destination: str | None = None
+    destination_lat: float | None = None
+    destination_lon: float | None = None
+    distance: str | None = None
+    start_hvb_state_of_charge: float | None = None
+    end_hvb_state_of_charge: float | None = None
+    start_hvb_lifetime_energy_output: float | None = None
+    end_hvb_lifetime_energy_output: float | None = None
+
+    @property
+    def kilometers_traveled(self) -> float:
+        """Odometer-delta distance for this period, in kilometers."""
+        return self.end_kilometers - self.start_kilometers
+
+
 # =============================================================================
 # Wrapper Models for API Response Unpacking
 # =============================================================================
@@ -741,6 +857,18 @@ class VehicleUtilizationWrapper(FrozenResponseModelBase):
     """Wrapper for single utilization record in response array."""
 
     vehicle_utilization: VehicleUtilization
+
+
+class DriverIdleRollupWrapper(FrozenResponseModelBase):
+    """Wrapper for single driver idle rollup record in response array."""
+
+    driver_idle_rollup: DriverIdleRollup
+
+
+class DrivingPeriodWrapper(FrozenResponseModelBase):
+    """Wrapper for single driving period record in response array."""
+
+    driving_period: DrivingPeriod
 
 
 # =============================================================================
@@ -889,6 +1017,50 @@ class VehicleUtilizationsResponse(FrozenResponseModelBase):
         Returns:
             List of VehicleUtilization objects without wrapper nesting.
         """
-        return [
-            wrapper.vehicle_utilization for wrapper in self.vehicle_utilizations
-        ]
+        return [wrapper.vehicle_utilization for wrapper in self.vehicle_utilizations]
+
+
+class DriverUtilizationsResponse(FrozenResponseModelBase):
+    """
+    Complete response from GET /v2/driver_utilization.
+
+    Attributes:
+        driver_idle_rollups: List of rollup wrappers (one per driver, plus
+            an optional null-driver bucket aggregating unattributed activity).
+        pagination: Pagination metadata.
+    """
+
+    driver_idle_rollups: list[DriverIdleRollupWrapper]
+    pagination: MotivePaginationInfo
+
+    def get_driver_idle_rollups(self) -> list[DriverIdleRollup]:
+        """
+        Extract unwrapped DriverIdleRollup objects from response.
+
+        Returns:
+            List of DriverIdleRollup objects without wrapper nesting.
+        """
+        return [wrapper.driver_idle_rollup for wrapper in self.driver_idle_rollups]
+
+
+class DrivingPeriodsResponse(FrozenResponseModelBase):
+    """
+    Complete response from GET /v1/driving_periods.
+
+    Attributes:
+        driving_periods: List of period wrappers (one per (driver-or-null,
+            vehicle, time-window) record).
+        pagination: Pagination metadata.
+    """
+
+    driving_periods: list[DrivingPeriodWrapper]
+    pagination: MotivePaginationInfo
+
+    def get_driving_periods(self) -> list[DrivingPeriod]:
+        """
+        Extract unwrapped DrivingPeriod objects from response.
+
+        Returns:
+            List of DrivingPeriod objects without wrapper nesting.
+        """
+        return [wrapper.driving_period for wrapper in self.driving_periods]
