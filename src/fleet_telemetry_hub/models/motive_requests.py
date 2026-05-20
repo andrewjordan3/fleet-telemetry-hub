@@ -23,6 +23,8 @@ from fleet_telemetry_hub.models.motive_responses import (
     DrivingPeriodsResponse,
     Group,
     GroupsResponse,
+    IdleEvent,
+    IdleEventsResponse,
     MotivePaginationInfo,
     ResponseModelBase,
     User,
@@ -488,6 +490,37 @@ class MotiveEndpoints:
             is_paginated=True,
             response_model=DrivingPeriodsResponse,
             item_extractor_method='get_driving_periods',
+            max_per_page=100,
+        )
+    )
+
+    IDLE_EVENTS: MotiveEndpointDefinition[IdleEventsResponse, IdleEvent] = (
+        MotiveEndpointDefinition(
+            endpoint_path='/v1/idle_events',
+            http_method=HTTPMethod.GET,
+            description=(
+                'Idle event records for a date range. Each record represents '
+                'a contiguous interval during which a vehicle was idling. '
+                'Cross-midnight events are possible; callers must clip to '
+                'target-day boundaries when aggregating per day.'
+            ),
+            query_parameters=(
+                QueryParameterSpec(
+                    name='start_date',
+                    parameter_type=ParameterType.DATE,
+                    required=True,
+                    description='Start of date range (YYYY-MM-DD)',
+                ),
+                QueryParameterSpec(
+                    name='end_date',
+                    parameter_type=ParameterType.DATE,
+                    required=True,
+                    description='End of date range (YYYY-MM-DD)',
+                ),
+            ),
+            is_paginated=True,
+            response_model=IdleEventsResponse,
+            item_extractor_method='get_idle_events',
             max_per_page=100,
         )
     )
