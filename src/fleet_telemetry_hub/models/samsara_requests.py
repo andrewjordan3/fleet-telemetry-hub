@@ -1,16 +1,22 @@
 # fleet_telemetry_hub/models/samsara_requests.py
 
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from fleet_telemetry_hub.models.samsara_responses import (
     AddressesResponse,
+    DriverFuelEnergyReport,
+    DriverFuelEnergyResponse,
     DriversResponse,
     DriverVehicleAssignment,
     DriverVehicleAssignmentsResponse,
+    FuelEnergyResponse,
+    FuelEnergyVehicleReport,
+    IdlingEvent,
+    IdlingEventsResponse,
     LocationStreamRecord,
     LocationStreamResponse,
     SamsaraAddress,
@@ -233,11 +239,9 @@ class SamsaraEndpointDefinition[ResponseModelT: BaseModel, ItemT: BaseModel](
             String representation suitable for URL/query string. DATETIME
             values are formatted as 'YYYY-MM-DDTHH:MM:SSZ'.
         """
-        if parameter_type == ParameterType.DATETIME and isinstance(
-            value, datetime
-        ):
+        if parameter_type == ParameterType.DATETIME and isinstance(value, datetime):
             if value.tzinfo is not None:
-                utc_value: datetime = value.astimezone(timezone.utc)
+                utc_value: datetime = value.astimezone(UTC)
             else:
                 utc_value = value
             return utc_value.strftime('%Y-%m-%dT%H:%M:%SZ')
@@ -423,6 +427,129 @@ class SamsaraEndpoints:
         ),
         is_paginated=True,
         response_model=DriverVehicleAssignmentsResponse,
+        item_extractor_method='get_items',
+    )
+
+    VEHICLE_FUEL_ENERGY: SamsaraEndpointDefinition[
+        FuelEnergyResponse,
+        FuelEnergyVehicleReport,
+    ] = SamsaraEndpointDefinition(
+        endpoint_path='/fleet/reports/vehicles/fuel-energy',
+        http_method=HTTPMethod.GET,
+        description=(
+            'Per-vehicle aggregated fuel/energy metrics '
+            '(distance, runtime, idle) for a time window.'
+        ),
+        query_parameters=(
+            QueryParameterSpec(
+                name='start_date',
+                parameter_type=ParameterType.DATETIME,
+                required=True,
+                api_name='startDate',
+                description=(
+                    'Start of time range (ISO-8601 UTC with Z suffix, '
+                    "e.g., '2026-05-14T00:00:00Z'). Despite the parameter "
+                    'name, this endpoint accepts a full datetime, not a date.'
+                ),
+            ),
+            QueryParameterSpec(
+                name='end_date',
+                parameter_type=ParameterType.DATETIME,
+                required=True,
+                api_name='endDate',
+                description=(
+                    'End of time range (ISO-8601 UTC with Z suffix, '
+                    "e.g., '2026-05-15T00:00:00Z'). Despite the parameter "
+                    'name, this endpoint accepts a full datetime, not a date.'
+                ),
+            ),
+        ),
+        is_paginated=True,
+        response_model=FuelEnergyResponse,
+        item_extractor_method='get_items',
+    )
+
+    DRIVER_FUEL_ENERGY: SamsaraEndpointDefinition[
+        DriverFuelEnergyResponse,
+        DriverFuelEnergyReport,
+    ] = SamsaraEndpointDefinition(
+        endpoint_path='/fleet/reports/drivers/fuel-energy',
+        http_method=HTTPMethod.GET,
+        description=(
+            'Per-driver aggregated fuel/energy metrics '
+            '(distance, runtime, idle) for a time window.'
+        ),
+        query_parameters=(
+            QueryParameterSpec(
+                name='start_date',
+                parameter_type=ParameterType.DATETIME,
+                required=True,
+                api_name='startDate',
+                description=(
+                    'Start of time range (ISO-8601 UTC with Z suffix, '
+                    "e.g., '2026-05-14T00:00:00Z'). Despite the parameter "
+                    'name, this endpoint accepts a full datetime, not a date.'
+                ),
+            ),
+            QueryParameterSpec(
+                name='end_date',
+                parameter_type=ParameterType.DATETIME,
+                required=True,
+                api_name='endDate',
+                description=(
+                    'End of time range (ISO-8601 UTC with Z suffix, '
+                    "e.g., '2026-05-15T00:00:00Z'). Despite the parameter "
+                    'name, this endpoint accepts a full datetime, not a date.'
+                ),
+            ),
+        ),
+        is_paginated=True,
+        response_model=DriverFuelEnergyResponse,
+        item_extractor_method='get_items',
+    )
+
+    IDLING_EVENTS: SamsaraEndpointDefinition[
+        IdlingEventsResponse,
+        IdlingEvent,
+    ] = SamsaraEndpointDefinition(
+        endpoint_path='/idling/events',
+        http_method=HTTPMethod.GET,
+        description=(
+            'Per-event idling records (driver, vehicle, duration, location) '
+            'for a time window.'
+        ),
+        query_parameters=(
+            QueryParameterSpec(
+                name='start_time',
+                parameter_type=ParameterType.DATETIME,
+                required=True,
+                api_name='startTime',
+                description='Start of time range (ISO-8601 UTC)',
+            ),
+            QueryParameterSpec(
+                name='end_time',
+                parameter_type=ParameterType.DATETIME,
+                required=True,
+                api_name='endTime',
+                description='End of time range (ISO-8601 UTC)',
+            ),
+            QueryParameterSpec(
+                name='operator_ids',
+                parameter_type=ParameterType.STRING_LIST,
+                required=False,
+                api_name='operatorIds',
+                description='Optional comma-separated driver IDs to filter by.',
+            ),
+            QueryParameterSpec(
+                name='asset_ids',
+                parameter_type=ParameterType.STRING_LIST,
+                required=False,
+                api_name='assetIds',
+                description='Optional comma-separated vehicle IDs to filter by.',
+            ),
+        ),
+        is_paginated=True,
+        response_model=IdlingEventsResponse,
         item_extractor_method='get_items',
     )
 
