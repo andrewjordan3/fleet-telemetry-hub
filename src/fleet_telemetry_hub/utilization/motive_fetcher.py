@@ -62,6 +62,9 @@ class MotiveUtilizationBundle:
         date_range: Inclusive (start_date, end_date) the bundle was
             fetched for. Useful for downstream code to verify coverage
             without recomputing from dict keys.
+        company: Company identifier configured on the source Provider,
+            propagated into the unified output's ``company`` column.
+            ``None`` when the Provider was constructed without one.
     """
 
     vehicle_utilizations_by_date: dict[date, list[VehicleUtilization]]
@@ -69,6 +72,7 @@ class MotiveUtilizationBundle:
     driving_periods: list[DrivingPeriod]
     idle_events: list[IdleEvent]
     date_range: tuple[date, date]
+    company: str | None
 
 
 class MotiveUtilizationFetcher:
@@ -214,6 +218,7 @@ class MotiveUtilizationFetcher:
             driving_periods=driving_periods,
             idle_events=idle_events,
             date_range=(start_date, end_date),
+            company=self._provider.company,
         )
 
     @staticmethod

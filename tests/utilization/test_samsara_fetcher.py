@@ -170,7 +170,14 @@ class TestSamsaraUtilizationBundleShape:
 
         fields = {f.name for f in dataclasses.fields(SamsaraUtilizationBundle)}
 
-        assert fields == {'vehicles', 'drivers', 'trips', 'idling_events', 'date_range'}
+        assert fields == {
+            'vehicles',
+            'drivers',
+            'trips',
+            'idling_events',
+            'date_range',
+            'company',
+        }
 
     def test_bundle_is_frozen_dataclass(self) -> None:
         """Assigning to a bundle attribute raises FrozenInstanceError."""
@@ -181,6 +188,7 @@ class TestSamsaraUtilizationBundleShape:
             trips=[],
             idling_events=[],
             date_range=(_MAY_14, _MAY_14),
+            company=None,
         )
 
         with pytest.raises(dataclasses.FrozenInstanceError):

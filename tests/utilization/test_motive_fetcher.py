@@ -509,6 +509,7 @@ class TestMotiveUtilizationFetcherBundleMetadata:
             driving_periods=[],
             idle_events=[],
             date_range=(_MAY_14, _MAY_14),
+            company=None,
         )
 
         with pytest.raises(dataclasses.FrozenInstanceError):

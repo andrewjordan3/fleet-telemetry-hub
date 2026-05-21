@@ -70,6 +70,9 @@ class SamsaraUtilizationBundle:
         date_range: Inclusive ``(start_date, end_date)`` the bundle was
             fetched for. Useful for downstream code to verify coverage
             without recomputing from chunk arithmetic.
+        company: Company identifier configured on the source Provider,
+            propagated into the unified output's ``company`` column.
+            ``None`` when the Provider was constructed without one.
     """
 
     vehicles: list[SamsaraVehicle]
@@ -77,6 +80,7 @@ class SamsaraUtilizationBundle:
     trips: list[Trip]
     idling_events: list[IdlingEvent]
     date_range: tuple[date, date]
+    company: str | None
 
 
 class SamsaraUtilizationFetcher:
@@ -233,6 +237,7 @@ class SamsaraUtilizationFetcher:
             trips=trips,
             idling_events=idling_events,
             date_range=(start_date, end_date),
+            company=self._provider.company,
         )
 
 
