@@ -32,6 +32,7 @@ from fleet_telemetry_hub.unifier.text_normalization import (
     normalize_driver_name,
     nullify_tokens,
 )
+from fleet_telemetry_hub.unifier.unify import unify
 
 __all__: list[str] = [
     'COLUMNS',
@@ -52,4 +53,5 @@ __all__: list[str] = [
     'sum_overlap_seconds',
     'transform_motive_bundle',
     'transform_samsara_bundle',
+    'unify',
 ]
