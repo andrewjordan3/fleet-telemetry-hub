@@ -19,6 +19,7 @@ from fleet_telemetry_hub.unifier.overlap import (
     compute_driving_duration_seconds,
     sum_overlap_seconds,
 )
+from fleet_telemetry_hub.unifier.samsara_transform import transform_samsara_bundle
 from fleet_telemetry_hub.unifier.schema import (
     COLUMNS,
     DTYPES,
@@ -50,4 +51,5 @@ __all__: list[str] = [
     'nullify_tokens',
     'sum_overlap_seconds',
     'transform_motive_bundle',
+    'transform_samsara_bundle',
 ]
