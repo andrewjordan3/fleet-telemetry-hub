@@ -36,6 +36,14 @@ class MotiveUtilizationBundle:
     unclipped -- the unifier handles clipping when it computes
     per-day attribution.
 
+    Note on bundle field consumption: ``vehicle_utilizations_by_date``
+    and ``driver_idle_rollups_by_date`` are populated by the fetcher
+    but are not currently consumed by the downstream unifier path,
+    which sources its event-grain output from ``driving_periods`` and
+    ``idle_events``. The aggregate-grain fields are retained for now
+    so downstream callers that previously depended on them keep
+    working; they will be revisited when the unifier work consolidates.
+
     Attributes:
         vehicle_utilizations_by_date: Per-vehicle aggregates, keyed by
             UTC date. Every date in date_range is present as a key.
