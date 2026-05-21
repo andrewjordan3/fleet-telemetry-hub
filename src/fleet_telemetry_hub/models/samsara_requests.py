@@ -24,6 +24,8 @@ from fleet_telemetry_hub.models.samsara_responses import (
     SamsaraModelBase,
     SamsaraPaginationInfo,
     SamsaraVehicle,
+    Trip,
+    TripsResponse,
     VehiclesResponse,
     VehicleStatsHistoryRecord,
     VehicleStatsHistoryResponse,
@@ -550,6 +552,49 @@ class SamsaraEndpoints:
         ),
         is_paginated=True,
         response_model=IdlingEventsResponse,
+        item_extractor_method='get_items',
+    )
+
+    TRIPS: SamsaraEndpointDefinition[TripsResponse, Trip] = SamsaraEndpointDefinition(
+        endpoint_path='/v1/fleet/trips',
+        http_method=HTTPMethod.GET,
+        description=(
+            'Per-vehicle trip records (driver, vehicle, time bounds, distance) '
+            'for a time window. Callers must loop over active vehicles -- the '
+            'endpoint accepts only a single vehicleId per call, not a list. '
+            'Time bounds are integer Unix epoch-milliseconds; the response '
+            'also carries odometer, coordinate, address, and tag fields '
+            'that are intentionally not modeled in V1.'
+        ),
+        query_parameters=(
+            QueryParameterSpec(
+                name='vehicle_id',
+                parameter_type=ParameterType.STRING,
+                required=True,
+                api_name='vehicleId',
+                description=(
+                    'Single Samsara vehicle ID to query. This endpoint does '
+                    'not accept a comma-separated list -- callers must loop '
+                    'over vehicles externally.'
+                ),
+            ),
+            QueryParameterSpec(
+                name='start_time',
+                parameter_type=ParameterType.UNIX_MS,
+                required=True,
+                api_name='startMs',
+                description='Start of time range (integer Unix epoch-milliseconds)',
+            ),
+            QueryParameterSpec(
+                name='end_time',
+                parameter_type=ParameterType.UNIX_MS,
+                required=True,
+                api_name='endMs',
+                description='End of time range (integer Unix epoch-milliseconds)',
+            ),
+        ),
+        is_paginated=True,
+        response_model=TripsResponse,
         item_extractor_method='get_items',
     )
 

@@ -17,7 +17,7 @@ Key Components:
 import logging
 from abc import ABC, abstractmethod
 from collections.abc import Callable
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from enum import Enum
 from typing import Any, Self
 
@@ -43,6 +43,7 @@ class ParameterType(str, Enum):
     DATETIME = 'datetime'
     BOOLEAN = 'boolean'
     STRING_LIST = 'string_list'
+    UNIX_MS = 'unix_ms'
 
 
 class PathParameterSpec(BaseModel):
@@ -441,6 +442,7 @@ class EndpointDefinition[ItemT: BaseModel](ABC, BaseModel):
             ParameterType.DATETIME: self._serialize_datetime,
             ParameterType.BOOLEAN: self._serialize_boolean,
             ParameterType.STRING_LIST: self._serialize_string_list,
+            ParameterType.UNIX_MS: self._serialize_unix_ms,
         }
 
         # Use handler if registered, otherwise default to string conversion
@@ -466,6 +468,38 @@ class EndpointDefinition[ItemT: BaseModel](ABC, BaseModel):
         if isinstance(value, (list, tuple)):
             return ','.join(str(v) for v in value)  # pyright: ignore[reportUnknownVariableType]
         return str(value)
+
+    def _serialize_unix_ms(self, value: Any) -> str:
+        """
+        Serialize a datetime to an integer Unix epoch-milliseconds string.
+
+        Used for APIs (e.g. Samsara's /v1/fleet/trips) that take
+        ``startMs`` / ``endMs`` as integer epoch-milliseconds rather
+        than ISO-8601 strings. Timezone-aware datetimes are converted
+        to UTC before the conversion; naive datetimes are assumed to
+        be UTC, matching the convention used by SamsaraEndpointDefinition's
+        DATETIME override.
+
+        Args:
+            value: A ``datetime`` instance.
+
+        Returns:
+            Integer Unix epoch-milliseconds rendered as a string (no
+            decimal point).
+
+        Raises:
+            TypeError: If ``value`` is not a ``datetime`` instance.
+        """
+        if not isinstance(value, datetime):
+            raise TypeError(
+                f'UNIX_MS parameter requires datetime input, got {type(value).__name__}'
+            )
+
+        if value.tzinfo is not None:
+            utc_value: datetime = value.astimezone(UTC)
+        else:
+            utc_value = value.replace(tzinfo=UTC)
+        return str(int(utc_value.timestamp() * 1000))
 
     # -------------------------------------------------------------------------
     # Response Parsing (Abstract - Provider-Specific)
