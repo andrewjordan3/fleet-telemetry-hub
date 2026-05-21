@@ -10,7 +10,7 @@ Samsara uses a cleaner response structure than Motive:
 # pyright: reportUnknownVariableType=false
 
 import logging
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Any
 
@@ -1341,4 +1341,75 @@ class IdlingEventsResponse(SamsaraModelBase):
 
     def get_items(self) -> list[IdlingEvent]:
         """Extract idling event list (uniform interface method)."""
+        return self.data
+
+
+# =============================================================================
+# Trips Models
+# =============================================================================
+
+
+class Trip(SamsaraModelBase):
+    """
+    Single trip record from GET /v1/fleet/trips.
+
+    Each record covers one contiguous driving interval for a vehicle.
+    The endpoint reports its time bounds as integer Unix
+    epoch-milliseconds; the validator below coerces those ints to
+    timezone-aware UTC ``datetime`` instances so downstream code can
+    treat them uniformly with the other Samsara time fields. Direct
+    construction with ``datetime`` values is supported and
+    pass-through.
+
+    Other fields the Samsara API returns on this endpoint
+    (``startOdometer`` / ``endOdometer``, ``startCoordinates`` /
+    ``endCoordinates``, addresses, tags) are intentionally not
+    modeled here -- they're silently dropped by the base class's
+    ``extra='ignore'`` config. They can be added in a future
+    iteration without breaking existing callers.
+
+    Attributes:
+        trip_id: Samsara's internal trip identifier, if reported.
+        driver_id: Samsara driver identifier, or None when the trip
+            was driven without an attributed driver.
+        vehicle_id: Samsara vehicle identifier (required).
+        start_time: Trip start as a tz-aware UTC datetime, parsed
+            from ``startMs``.
+        end_time: Trip end as a tz-aware UTC datetime, parsed from
+            ``endMs``.
+        distance_meters: Trip distance in meters, pass-through with
+            no unit conversion at the model layer.
+    """
+
+    trip_id: str | None = Field(default=None, alias='id')
+    driver_id: str | None = Field(default=None, alias='driverId')
+    vehicle_id: str = Field(alias='vehicleId')
+    start_time: datetime = Field(alias='startMs')
+    end_time: datetime = Field(alias='endMs')
+    distance_meters: int = Field(alias='distanceMeters')
+
+    @field_validator('start_time', 'end_time', mode='before')
+    @classmethod
+    def _coerce_epoch_ms_to_datetime(cls, value: int | datetime) -> datetime:
+        """Coerce integer epoch-ms to tz-aware UTC datetime; pass datetime through."""
+        if isinstance(value, int):
+            return datetime(1970, 1, 1, tzinfo=UTC) + timedelta(milliseconds=value)
+        return value
+
+
+class TripsResponse(SamsaraModelBase):
+    """
+    Complete response from GET /v1/fleet/trips.
+
+    Attributes:
+        data: List of trip records for the queried vehicle and
+            time window.
+        pagination: Cursor-based pagination metadata.
+    """
+
+    data: list[Trip]
+    pagination: SamsaraPaginationInfo | None = None
+
+    def get_items(self) -> list[Trip]:
+        """Extract trip list (uniform interface method)."""
         return self.data
