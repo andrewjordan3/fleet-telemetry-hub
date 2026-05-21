@@ -104,6 +104,7 @@ from fleet_telemetry_hub.registry import (
     EndpointRegistry,
     ProviderNotFoundError,
 )
+from fleet_telemetry_hub.utilization_pipeline import UtilizationPipeline
 
 __all__: list[str] = [
     'APIError',
@@ -122,4 +123,5 @@ __all__: list[str] = [
     '__version__',
     'load_config',
     'setup_logger',
+    'UtilizationPipeline',
 ]
