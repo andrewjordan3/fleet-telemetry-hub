@@ -3,7 +3,7 @@
 A comprehensive Python framework for fleet telemetry data. Provides both a **type-safe API client** for direct provider interaction and an **automated ETL pipeline** for building unified datasets from multiple telematics platforms (Motive, Samsara).
 
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Type Checked: mypy](https://img.shields.io/badge/type_checked-mypy-blue.svg)](http://mypy-lang.org/)
 [![Code Style: Ruff](https://img.shields.io/badge/code_style-ruff-black.svg)](https://github.com/astral-sh/ruff)
 
@@ -677,7 +677,7 @@ Please ensure:
 
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+This project is licensed under the Apache License, Version 2.0 - see the LICENSE file for details.
 
 ## Contact
 

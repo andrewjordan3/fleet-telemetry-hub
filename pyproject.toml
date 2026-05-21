@@ -13,7 +13,7 @@ version = "0.1.0"
 authors = [{ name = "Andrew Jordan", email = "andrewjordan3@gmail.com" }]
 description = "Comprehensive Python framework for fleet telemetry data with type-safe API client and automated ETL pipeline for multiple telematics platforms"
 readme = "README.md"
-license = { text = "MIT" }
+license = "Apache-2.0"
 requires-python = ">=3.12"
 keywords = ["samsara", "motive", "fleet", "telemetry", "eld", "api", "etl", "pipeline", "parquet", "telematics"]
 classifiers = [
