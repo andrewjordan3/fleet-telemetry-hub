@@ -3,7 +3,7 @@
 A comprehensive Python framework for fleet telemetry data. Provides both a **type-safe API client** for direct provider interaction and an **automated ETL pipeline** for building unified datasets from multiple telematics platforms (Motive, Samsara).
 
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Type Checked: mypy](https://img.shields.io/badge/type_checked-mypy-blue.svg)](http://mypy-lang.org/)
 [![Code Style: Ruff](https://img.shields.io/badge/code_style-ruff-black.svg)](https://github.com/astral-sh/ruff)
 
@@ -14,7 +14,12 @@ Fleet Telemetry Hub is a **dual-purpose system**:
 1. **API Abstraction Framework** - Type-safe, provider-agnostic interface for direct API interaction
 2. **Data Pipeline System** - Automated ETL for collecting, normalizing, and persisting telemetry data
 
-Whether you need one-off API queries or continuous data collection, Fleet Telemetry Hub provides the right abstraction.
+The pipeline layer ships **two ETL pipelines for different grains of data**, which coexist and serve different downstream consumers:
+
+- **`PartitionedTelemetryPipeline`** — breadcrumb-grain (location point) data, date-partitioned Parquet output. Designed for scale (billions of records) and BigQuery external-table consumption. See [Quick Start Option 1](#option-1-data-pipeline-recommended-for-continuous-data-collection).
+- **`UtilizationPipeline`** — event-grain driving and idle utilization data, single-file Parquet output with a companion metadata JSON. Sized for self-service Power BI semantic models with no Power Query transformations. See [Quick Start Option 2](#option-2-utilization-pipeline-event-grain-driving-and-idle-data).
+
+Whether you need one-off API queries, scalable breadcrumb collection, or daily utilization rollups, Fleet Telemetry Hub provides the right abstraction.
 
 ## Features
 
@@ -37,6 +42,16 @@ Whether you need one-off API queries or continuous data collection, Fleet Teleme
 - **Date-Partitioned Parquet Storage**: Daily partitions for BigQuery compatibility and scalable storage
 - **Independent Provider Fetching**: One provider's failure doesn't block others
 - **Comprehensive Logging**: Track progress and debug issues
+
+### Utilization Pipeline Features
+- **Event-Grain Unified Schema**: Driving and idle events from Motive and Samsara normalized to a single 9-column table
+- **Single-File Output**: One Parquet file plus a companion metadata JSON — suitable for self-service Power BI semantic models with no Power Query transformations
+- **Automatic Window Resolution**: Pipeline derives its fetch window from the previous run's metadata; no scheduling logic needed inside the codebase
+- **Today-Minus-One End Cutoff**: Never fetches the current incomplete UTC day, eliminating partial-day artifacts
+- **Per-Provider Failure Isolation**: A single provider's API outage produces a partial DataFrame rather than failing the run
+- **Idle-Adjusted Driving Durations**: True driving time computed by subtracting overlapping idle from raw driving-period or trip duration
+- **Null-Driver Gap-Fill**: Idle events without an attributed driver are filled by most-overlap matching against driving events on the same vehicle
+- **Loud VIN Fallback**: Samsara vehicles whose VIN can't be resolved get the literal value `unknown_vin` with a WARNING log, preserving data while flagging the gap
 
 ## Installation
 
@@ -171,7 +186,39 @@ The pipeline will:
 - Resume from last run with configurable lookback
 - Organize data by date for efficient BigQuery loading and retention management
 
-### Option 2: Direct API Access (For Custom Integrations)
+### Option 2: Utilization Pipeline (Event-Grain Driving and Idle Data)
+
+The utilization pipeline produces a single Parquet file plus a metadata JSON describing driving and idle events normalized across Motive and Samsara. It runs as a cron-invoked daily job and figures out its own fetch window from prior metadata.
+
+**1. Configuration** — uses the same `config/telemetry_config.yaml` file shown in Option 1. The fields the utilization pipeline cares about:
+
+- `providers.motive.company` and `providers.samsara.company` — emitted as the `company` column value in the output. Leave null to emit null company values.
+- `pipeline.default_start_date` — used only on the first run, when no metadata file exists yet.
+- `pipeline.lookback_days` — on subsequent runs, the fetch window starts at `latest_data_date - lookback_days` to catch late-arriving data.
+- `storage.parquet_path` — base directory. Utilization output lands in `{parquet_path}/utilization/`.
+- `storage.parquet_compression` — shared with the legacy pipeline.
+
+The remaining `pipeline` fields (`batch_increment_days`, `request_delay_seconds`, `use_truststore`) are consumed by the legacy `PartitionedTelemetryPipeline` and ignored by the utilization pipeline.
+
+**2. Run the pipeline**:
+
+```python
+from fleet_telemetry_hub.utilization_pipeline import UtilizationPipeline
+
+# One-liner for scheduled jobs (cron, etc.)
+UtilizationPipeline('config/telemetry_config.yaml').run()
+```
+
+The pipeline determines its own fetch window from the metadata file — no command-line arguments needed.
+
+**3. Schedule it** (cron example):
+
+```bash
+# Run daily at 2 AM (host time)
+0 2 * * * cd /path/to/project && python -c "from fleet_telemetry_hub.utilization_pipeline import UtilizationPipeline; UtilizationPipeline('config/telemetry_config.yaml').run()"
+```
+
+### Option 3: Direct API Access (For Custom Integrations)
 
 For one-off queries or custom integrations, use the Provider interface:
 
@@ -193,6 +240,86 @@ for vehicle in motive.fetch_all('vehicles'):
 df = motive.to_dataframe('vehicles')
 print(df.head())
 ```
+
+## Utilization Pipeline: Output Layout
+
+The utilization pipeline writes two files under the `utilization/` subdirectory of `storage.parquet_path`:
+
+```
+{parquet_path}/utilization/
+├── data.parquet
+└── metadata.json
+```
+
+Both files are atomically written (temp file + rename), so a crash mid-write leaves the previous version intact. There are no date partitions — the entire window's events live in the single `data.parquet`.
+
+## Unified Utilization Schema
+
+`data.parquet` is a 9-column event-grain table. Both pipelines emit pandas extension types so the schema survives a Parquet round-trip without silent coercion.
+
+| Column | Pandas Dtype | Nullable | Description |
+|---|---|---|---|
+| `company` | StringDtype | yes | Per-provider company identifier from config; null when unconfigured |
+| `event_type` | StringDtype | no | `'driving'` or `'idle'` |
+| `driver_id` | StringDtype | yes | Provider's internal driver identifier; null when no driver was logged in |
+| `driver_name` | StringDtype | yes | Driver's full name; null when unattributed or unresolvable |
+| `vin` | StringDtype | no | Vehicle Identification Number; the literal value `unknown_vin` when the Samsara vehicle ID could not be resolved |
+| `start_time_utc` | datetime64[ns, UTC] | no | Event start time, always UTC |
+| `end_time_utc` | datetime64[ns, UTC] | no | Event end time, always UTC |
+| `duration_seconds` | Int64Dtype | no | For driving rows: trip/period total minus overlapping idle. For idle rows: full duration as reported by the provider |
+| `distance_miles` | Float64Dtype | yes | Driving rows only; rounded to one decimal place. Null for idle rows |
+
+Semantic notes:
+
+- **Grain:** one row per event; no aggregation, no date column. Consumers derive any date or business-day grouping in their own tools.
+- **Row order:** sorted by `(company, start_time_utc, event_type)` ascending. Null-company rows sort before any non-null-company string.
+- **PC and YM driving types** (Motive HoS classifications for personal conveyance and yard moves) are emitted as `event_type='driving'` rather than filtered or differentiated. Real-world misuse of these statuses is handled in downstream analysis, not at the pipeline boundary.
+- **Multi-driver overlap on idle events** triggers a WARNING log with the bucket distribution; the row's driver fields are filled with the most-overlap winner.
+
+## Utilization Pipeline: Metadata
+
+Each run writes a `metadata.json` alongside the Parquet. The next run reads it to compute its own fetch window.
+
+```json
+{
+  "last_run_started_utc": "2026-05-21T02:00:00Z",
+  "last_run_completed_utc": "2026-05-21T02:03:42Z",
+  "fetch_window_start_utc": "2026-05-14T00:00:00Z",
+  "fetch_window_end_utc": "2026-05-21T00:00:00Z",
+  "latest_event_end_utc": "2026-05-20T22:47:13Z",
+  "latest_data_date": "2026-05-20",
+  "row_count": 4837,
+  "by_company": {"crystal_clean": 3201, "patriot": 1636},
+  "providers_present": ["motive", "samsara"],
+  "providers_skipped": [],
+  "providers_failed": [],
+  "schema_version": 1
+}
+```
+
+Field notes:
+
+- `latest_data_date` is the operational anchor for the next run's window start (subtracts `lookback_days`). On an empty run, the prior value is preserved so a failed run doesn't reset the anchor.
+- `providers_present` / `providers_skipped` / `providers_failed` reflect each provider's outcome for the run. Motive always precedes Samsara in every list.
+- `by_company` maps each `company` value to its row count. Null company values appear under the key `"(null)"`.
+- All timestamps are ISO-8601 UTC with the `Z` suffix.
+- `schema_version` is a literal integer for future schema evolution; bumped on a breaking metadata-shape change.
+
+## Utilization Pipeline: Backfill
+
+To bootstrap or re-run the utilization pipeline over a historical range:
+
+1. Set `pipeline.default_start_date` in the config to the desired backfill start date (e.g., `"2024-01-01"` for a two-year backfill).
+2. Delete the existing utilization output directory if any:
+
+   ```bash
+   rm -rf {parquet_path}/utilization/
+   ```
+
+3. Run the pipeline once. It will fetch from `default_start_date` through `today - 1` in a single invocation, write a single Parquet, and create the metadata file.
+4. Subsequent runs use the metadata's `latest_data_date` minus `lookback_days` as the window start, so steady-state daily operation resumes automatically.
+
+A multi-year backfill can take 10-30 minutes depending on fleet size due to the per-vehicle Samsara trips loop, but completes in a single run.
 
 ## Configuration
 
@@ -550,7 +677,7 @@ Please ensure:
 
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+This project is licensed under the Apache License, Version 2.0 - see the LICENSE file for details.
 
 ## Contact
 
