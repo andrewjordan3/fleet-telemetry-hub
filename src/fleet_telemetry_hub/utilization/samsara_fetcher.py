@@ -1,21 +1,38 @@
-"""Samsara utilization fetcher and its typed bundle dataclass."""
+"""Samsara utilization fetcher and its typed bundle dataclass.
+
+This module switches Samsara to an event-grain shape. Per-vehicle
+trips (from ``/v1/fleet/trips``) and per-window idling events (from
+``/idling/events``) are the new source of utilization signal,
+chunked at 28 days to stay well under Samsara's 90-day per-call
+cap on the trips endpoint. Dimension data (``vehicles``,
+``drivers``) flows in the same bundle so the downstream unifier
+can resolve ``vehicleId -> vin`` and ``driverId -> driver_name``
+from a single fetch.
+"""
 
 import logging
 from dataclasses import dataclass
-from datetime import UTC, date, datetime, timedelta
+from datetime import date
 
 from fleet_telemetry_hub.models.samsara_requests import SamsaraEndpoints
 from fleet_telemetry_hub.models.samsara_responses import (
-    DriverFuelEnergyReport,
-    DriverVehicleAssignment,
-    FuelEnergyVehicleReport,
+    DriverActivationStatus,
     IdlingEvent,
+    SamsaraDriver,
+    SamsaraVehicle,
+    Trip,
 )
 from fleet_telemetry_hub.provider import Provider
+from fleet_telemetry_hub.utilization.date_chunking import iter_chunks
 
 __all__: list[str] = ['SamsaraUtilizationBundle', 'SamsaraUtilizationFetcher']
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+# Samsara caps /v1/fleet/trips at 90 days per call; 28 days is a
+# deliberate safety margin that also matches the chunking used by the
+# idling-events fetch for parity.
+_MAX_CHUNK_DAYS: int = 28
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,46 +40,47 @@ class SamsaraUtilizationBundle:
     """
     Typed container for Samsara utilization data fetched over a date range.
 
-    Mirrors MotiveUtilizationBundle in structure: aggregate-grain
-    records grouped into by-date dicts, event-grain records as flat
-    lists, plus the inclusive ``date_range``. Samsara has one
-    additional event-grain field (``idling_events``) that the Motive
-    bundle does not.
+    The bundle pairs the two event-grain streams the unifier consumes
+    (``trips``, ``idling_events``) with the two dimension lists the
+    unifier needs to resolve identifiers to human-readable values
+    (``vehicles``, ``drivers``). Holding the dimensions alongside the
+    events means one fetch yields everything required for a unified
+    utilization view of the requested date range.
 
-    Aggregate-grain endpoints (vehicle_fuel_energy, driver_fuel_energy)
-    return per-window totals without per-record timestamps. The
-    bundle groups them into dicts keyed by the UTC date they were
-    fetched for. Every date in ``date_range`` is present as a key,
-    even if the value is an empty list.
-
-    Event-grain endpoints (driver_vehicle_assignments, idling_events)
-    return records carrying their own start/end timestamps. The
-    bundle stores these flat. Cross-midnight events are preserved
-    unclipped -- the unifier handles clipping.
+    Trip and idling-event ordering is whatever the API returns within
+    each chunk. The trips list is also ordered by vehicle iteration
+    order on the outer dimension (matches the order of ``vehicles``).
+    No client-side sorting is applied.
 
     Attributes:
-        vehicle_fuel_energy_by_date: Per-vehicle aggregates, keyed by
-            UTC date. Every date in date_range is present.
-        driver_fuel_energy_by_date: Per-driver aggregates, keyed by
-            UTC date. Every date in date_range is present.
-        driver_vehicle_assignments: Bipartite (driver, vehicle,
-            time-window) records spanning the full date range,
-            including any that straddle the range boundaries. Order
-            matches the API response order (no client-side sorting).
+        vehicles: All vehicles known to the account, in the order the
+            ``/fleet/vehicles`` endpoint returned them. Includes
+            historical (deactivated) vehicles so backfill joins work.
+        drivers: All drivers known to the account, deduplicated by
+            driver identifier. Active drivers are listed first; any
+            deactivated drivers that share an ID with an active driver
+            are dropped in favor of the active record.
+        trips: Per-vehicle trip records spanning the full date range,
+            collected by looping over ``vehicles`` and over the 28-day
+            chunks the time window was split into.
         idling_events: Idling event records spanning the full date
-            range. Each event has a startTime and durationMilliseconds
-            but no endTime. Order matches the API response order
-            (no client-side sorting).
-        date_range: Inclusive (start_date, end_date) the bundle was
+            range, collected by looping over the same 28-day chunks
+            (no per-vehicle inner loop -- the endpoint accepts the
+            time window directly).
+        date_range: Inclusive ``(start_date, end_date)`` the bundle was
             fetched for. Useful for downstream code to verify coverage
-            without recomputing from dict keys.
+            without recomputing from chunk arithmetic.
+        company: Company identifier configured on the source Provider,
+            propagated into the unified output's ``company`` column.
+            ``None`` when the Provider was constructed without one.
     """
 
-    vehicle_fuel_energy_by_date: dict[date, list[FuelEnergyVehicleReport]]
-    driver_fuel_energy_by_date: dict[date, list[DriverFuelEnergyReport]]
-    driver_vehicle_assignments: list[DriverVehicleAssignment]
+    vehicles: list[SamsaraVehicle]
+    drivers: list[SamsaraDriver]
+    trips: list[Trip]
     idling_events: list[IdlingEvent]
     date_range: tuple[date, date]
+    company: str | None
 
 
 class SamsaraUtilizationFetcher:
@@ -70,19 +88,20 @@ class SamsaraUtilizationFetcher:
     Fetcher for Samsara utilization data across a UTC date range.
 
     Wraps a configured Samsara Provider and orchestrates the four
-    endpoint calls needed for utilization attribution:
+    endpoint calls needed for the event-grain unifier path:
 
-        - vehicle_fuel_energy:        per-day call
-        - driver_fuel_energy:         per-day call
-        - driver_vehicle_assignments: single call across the full range
-        - idling_events:              single call across the full range
+        - vehicles:       single call, no time window
+        - drivers:        two calls (active + deactivated), deduplicated
+        - trips:          per-vehicle, per-chunk loop
+        - idling_events:  per-chunk loop (no per-vehicle dimension)
 
     The fetcher does no transformation of returned records -- it
-    fetches and assembles them into a typed bundle. Unit conversions,
-    timezone interpretation, attribution math, and cross-midnight
-    clipping all happen downstream in the unifier.
+    fetches and assembles them into a typed bundle. Unit
+    conversions, timezone interpretation, attribution math, and
+    cross-midnight clipping all happen downstream in the unifier.
 
-    Satisfies the UtilizationFetcher[SamsaraUtilizationBundle] Protocol.
+    Satisfies the ``UtilizationFetcher[SamsaraUtilizationBundle]``
+    Protocol.
 
     Attributes:
         provider: The configured Samsara Provider instance (read-only).
@@ -115,12 +134,12 @@ class SamsaraUtilizationFetcher:
             end_date: Last UTC day to fetch (inclusive).
 
         Returns:
-            SamsaraUtilizationBundle holding per-day vehicle and driver
-            fuel-energy rollups plus the full-range lists of
-            driver-vehicle assignments and idling events.
+            ``SamsaraUtilizationBundle`` carrying the vehicles and
+            drivers dimension lists plus the chunked event-grain
+            trips and idling events.
 
         Raises:
-            ValueError: If start_date > end_date.
+            ValueError: If ``start_date > end_date``.
         """
         if start_date > end_date:
             raise ValueError(
@@ -133,130 +152,119 @@ class SamsaraUtilizationFetcher:
             end_date,
         )
 
-        target_dates: list[date] = self._enumerate_dates(start_date, end_date)
-        range_start, range_end = self._utc_range_window(start_date, end_date)
-
-        vehicle_fuel_energy_by_date: dict[date, list[FuelEnergyVehicleReport]] = {}
-        driver_fuel_energy_by_date: dict[date, list[DriverFuelEnergyReport]] = {}
+        chunks = list(
+            iter_chunks(
+                start_date,
+                end_date,
+                _MAX_CHUNK_DAYS,
+                chunk_format='datetime',
+            )
+        )
 
         with self._provider.client() as client:
-            for target_date in target_dates:
-                window_start, window_end = self._utc_day_window(target_date)
+            vehicles: list[SamsaraVehicle] = list(
+                client.fetch_all(SamsaraEndpoints.VEHICLES)
+            )
+            logger.debug('vehicles: %d records', len(vehicles))
 
-                vehicle_rows: list[FuelEnergyVehicleReport] = list(
-                    client.fetch_all(
-                        SamsaraEndpoints.VEHICLE_FUEL_ENERGY,
-                        start_date=window_start,
-                        end_date=window_end,
-                    )
-                )
-                vehicle_fuel_energy_by_date[target_date] = vehicle_rows
-                logger.debug(
-                    'Day %s vehicle_fuel_energy: %d records',
-                    target_date,
-                    len(vehicle_rows),
-                )
-
-                driver_rows: list[DriverFuelEnergyReport] = list(
-                    client.fetch_all(
-                        SamsaraEndpoints.DRIVER_FUEL_ENERGY,
-                        start_date=window_start,
-                        end_date=window_end,
-                    )
-                )
-                driver_fuel_energy_by_date[target_date] = driver_rows
-                logger.debug(
-                    'Day %s driver_fuel_energy: %d records',
-                    target_date,
-                    len(driver_rows),
-                )
-
-            driver_vehicle_assignments: list[DriverVehicleAssignment] = list(
+            active_drivers: list[SamsaraDriver] = list(
                 client.fetch_all(
-                    SamsaraEndpoints.DRIVER_VEHICLE_ASSIGNMENTS,
-                    filter_by='drivers',
-                    start_time=range_start,
-                    end_time=range_end,
+                    SamsaraEndpoints.DRIVERS,
+                    driver_activation_status=DriverActivationStatus.ACTIVE.value,
                 )
+            )
+            deactivated_drivers: list[SamsaraDriver] = list(
+                client.fetch_all(
+                    SamsaraEndpoints.DRIVERS,
+                    driver_activation_status=DriverActivationStatus.DEACTIVATED.value,
+                )
+            )
+            drivers: list[SamsaraDriver] = _dedup_drivers(
+                active_drivers,
+                deactivated_drivers,
             )
             logger.debug(
-                'driver_vehicle_assignments: %d records',
-                len(driver_vehicle_assignments),
+                'drivers: %d active + %d deactivated -> %d after dedup',
+                len(active_drivers),
+                len(deactivated_drivers),
+                len(drivers),
             )
 
-            idling_events: list[IdlingEvent] = list(
-                client.fetch_all(
-                    SamsaraEndpoints.IDLING_EVENTS,
-                    start_time=range_start,
-                    end_time=range_end,
+            trips: list[Trip] = []
+            for vehicle in vehicles:
+                for chunk_start_dt, chunk_end_dt in chunks:
+                    logger.debug(
+                        'trips fetch: vehicle=%s chunk=%s..%s',
+                        vehicle.vehicle_id,
+                        chunk_start_dt,
+                        chunk_end_dt,
+                    )
+                    trips.extend(
+                        client.fetch_all(
+                            SamsaraEndpoints.TRIPS,
+                            vehicle_id=vehicle.vehicle_id,
+                            start_time=chunk_start_dt,
+                            end_time=chunk_end_dt,
+                        )
+                    )
+
+            idling_events: list[IdlingEvent] = []
+            for chunk_start_dt, chunk_end_dt in chunks:
+                logger.debug(
+                    'idling_events fetch: chunk=%s..%s',
+                    chunk_start_dt,
+                    chunk_end_dt,
                 )
-            )
-            logger.debug('idling_events: %d records', len(idling_events))
+                idling_events.extend(
+                    client.fetch_all(
+                        SamsaraEndpoints.IDLING_EVENTS,
+                        start_time=chunk_start_dt,
+                        end_time=chunk_end_dt,
+                    )
+                )
 
-        total_vehicle_rows: int = sum(
-            len(rows) for rows in vehicle_fuel_energy_by_date.values()
-        )
-        total_driver_rows: int = sum(
-            len(rows) for rows in driver_fuel_energy_by_date.values()
-        )
         logger.info(
-            'Samsara fetch complete: %d vehicle rows, %d driver rows, '
-            '%d assignments, %d idling events',
-            total_vehicle_rows,
-            total_driver_rows,
-            len(driver_vehicle_assignments),
+            'Samsara fetch complete: %d vehicles, %d drivers, %d trips, %d idling events',
+            len(vehicles),
+            len(drivers),
+            len(trips),
             len(idling_events),
         )
 
         return SamsaraUtilizationBundle(
-            vehicle_fuel_energy_by_date=vehicle_fuel_energy_by_date,
-            driver_fuel_energy_by_date=driver_fuel_energy_by_date,
-            driver_vehicle_assignments=driver_vehicle_assignments,
+            vehicles=vehicles,
+            drivers=drivers,
+            trips=trips,
             idling_events=idling_events,
             date_range=(start_date, end_date),
+            company=self._provider.company,
         )
 
-    @staticmethod
-    def _enumerate_dates(start_date: date, end_date: date) -> list[date]:
-        """Return every UTC date in [start_date, end_date] inclusive."""
-        day_count: int = (end_date - start_date).days + 1
-        return [start_date + timedelta(days=offset) for offset in range(day_count)]
 
-    @staticmethod
-    def _utc_day_window(target_date: date) -> tuple[datetime, datetime]:
-        """Return the [00:00:00Z, next-day 00:00:00Z) UTC window for a date."""
-        window_start: datetime = datetime(
-            target_date.year,
-            target_date.month,
-            target_date.day,
-            tzinfo=UTC,
-        )
-        window_end: datetime = window_start + timedelta(days=1)
-        return window_start, window_end
+def _dedup_drivers(
+    active: list[SamsaraDriver],
+    deactivated: list[SamsaraDriver],
+) -> list[SamsaraDriver]:
+    """
+    Deduplicate ``active`` and ``deactivated`` drivers by primary ID.
 
-    @staticmethod
-    def _utc_range_window(
-        start_date: date,
-        end_date: date,
-    ) -> tuple[datetime, datetime]:
-        """
-        Return the half-open UTC window covering an inclusive date range.
+    Active drivers are inserted first; deactivated drivers that
+    share an ID with an active driver are dropped. Order within
+    each group is preserved.
 
-        For [start_date, end_date] inclusive, returns
-        ``(start_date 00:00:00Z, (end_date + 1 day) 00:00:00Z)`` so the
-        upper bound excludes the day after end_date but includes all of
-        end_date itself.
-        """
-        range_start: datetime = datetime(
-            start_date.year,
-            start_date.month,
-            start_date.day,
-            tzinfo=UTC,
-        )
-        range_end: datetime = datetime(
-            end_date.year,
-            end_date.month,
-            end_date.day,
-            tzinfo=UTC,
-        ) + timedelta(days=1)
-        return range_start, range_end
+    Args:
+        active: Drivers returned by the ``DRIVERS`` endpoint with
+            ``driver_activation_status='active'``.
+        deactivated: Drivers returned with
+            ``driver_activation_status='deactivated'``.
+
+    Returns:
+        Combined, deduplicated list with active records winning on
+        ID collisions.
+    """
+    seen: dict[str, SamsaraDriver] = {}
+    for driver in active:
+        seen[driver.driver_id] = driver
+    for driver in deactivated:
+        seen.setdefault(driver.driver_id, driver)
+    return list(seen.values())

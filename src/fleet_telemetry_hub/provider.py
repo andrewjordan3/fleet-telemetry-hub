@@ -132,6 +132,8 @@ class Provider:
         credentials: ProviderCredentials,
         config: TelemetryConfig | None = None,
         registry: EndpointRegistry | None = None,
+        *,
+        company: str | None = None,
     ) -> None:
         """
         Initialize provider facade.
@@ -141,6 +143,10 @@ class Provider:
             credentials: Provider credentials and connection settings.
             config: Optional full config, used for rate limit calculations.
             registry: Optional custom endpoint registry. Uses singleton if not provided.
+            company: Optional company identifier for this provider's fleet. Flows
+                through the utilization bundles into the unified output's
+                ``company`` column. ``None`` (the default) yields null company
+                values in the output.
 
         Raises:
             ProviderNotFoundError: If provider doesn't exist in the registry.
@@ -149,6 +155,7 @@ class Provider:
         self._credentials: ProviderCredentials = credentials
         self._config: TelemetryConfig | None = config
         self._registry: EndpointRegistry = registry or EndpointRegistry.instance()
+        self._company: str | None = company
 
         # Validate provider exists in registry (raises ProviderNotFoundError if not)
         # We call list_endpoints to trigger validation without fetching a specific endpoint
@@ -174,6 +181,11 @@ class Provider:
     def config(self) -> TelemetryConfig | None:
         """Full telemetry config, if provided."""
         return self._config
+
+    @property
+    def company(self) -> str | None:
+        """Company identifier for this provider's fleet, or ``None`` if unconfigured."""
+        return self._company
 
     @classmethod
     def from_config(
@@ -237,7 +249,13 @@ class Provider:
             use_truststore=config.pipeline.use_truststore,
         )
 
-        return cls(provider_name, credentials, config, registry)
+        return cls(
+            provider_name,
+            credentials,
+            config,
+            registry,
+            company=provider_config.company,
+        )
 
     # -------------------------------------------------------------------------
     # Endpoint Access

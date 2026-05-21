@@ -81,6 +81,9 @@ providers:
     enabled: true
     base_url: "https://api.gomotive.com"
     api_key: "your-motive-api-key"
+    # Identifier emitted as the `company` column value in the unified
+    # utilization output. Leave null to emit null company values.
+    company: null
     request_timeout: [10, 30]
     max_retries: 5
     retry_backoff_factor: 2.0
@@ -90,6 +93,9 @@ providers:
     enabled: true
     base_url: "https://api.samsara.com"
     api_key: "your-samsara-api-key"
+    # Identifier emitted as the `company` column value in the unified
+    # utilization output. Leave null to emit null company values.
+    company: null
     request_timeout: [10, 30]
     max_retries: 5
     retry_backoff_factor: 2.0

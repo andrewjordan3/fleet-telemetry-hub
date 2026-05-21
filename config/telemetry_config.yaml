@@ -16,6 +16,12 @@ providers:
     base_url: "https://api.gomotive.com"
     api_key: ""
 
+    # Identifier emitted as the `company` column value in the unified
+    # utilization output. Free-form string; the unifier applies
+    # NFKC + whitespace + lowercase normalization. Leave null to emit
+    # null company values.
+    company: null
+
     # Timeout Tuple: (Connect Timeout, Read Timeout)
     # 1. Connect (10s): Time to establish handshake. Fails fast if Zscaler hangs.
     # 2. Read (30s): Time to wait for the server to send bytes.
@@ -45,6 +51,12 @@ providers:
     enabled: true
     base_url: "https://api.samsara.com"
     api_key: ""
+
+    # Identifier emitted as the `company` column value in the unified
+    # utilization output. Free-form string; the unifier applies
+    # NFKC + whitespace + lowercase normalization. Leave null to emit
+    # null company values.
+    company: null
 
     # Samsara endpoints are generally faster than Motive, but we keep
     # the same robust timeout settings for consistency.

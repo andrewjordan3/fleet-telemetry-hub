@@ -136,6 +136,10 @@ class ProviderConfig(BaseModel):
             True uses system CA store, or provide path to custom CA bundle.
         rate_limit_requests_per_second: Maximum API requests per second.
             Enforced client-side to respect provider rate limits.
+        company: Company identifier for this provider's fleet, used as the
+            ``company`` column value in the unified utilization output. Free-form
+            string; the unifier owns any normalization (NFKC + whitespace +
+            lowercase). Leave null to emit null company values.
     """
 
     model_config = ConfigDict(
@@ -171,6 +175,16 @@ class ProviderConfig(BaseModel):
         gt=0,
         le=100,
         description='Maximum requests per second (client-side rate limiting)',
+    )
+    company: str | None = Field(
+        default=None,
+        description=(
+            "Company identifier for this provider's fleet, emitted as the "
+            '`company` column value in the unified utilization output. '
+            'Free-form string; the unifier applies NFKC + whitespace + '
+            'lowercase normalization before writing it to the column. Leave '
+            'null to emit null company values.'
+        ),
     )
 
     @field_validator('base_url')

@@ -1,14 +1,12 @@
-"""Tests for SamsaraUtilizationFetcher.
+"""Tests for the event-grain SamsaraUtilizationFetcher.
 
-Mirrors the structure of test_motive_fetcher.py. Uses ``unittest.mock``
-for the Provider/TelemetryClient context-manager pair but constructs
-real Pydantic record instances (FuelEnergyVehicleReport,
-DriverFuelEnergyReport, DriverVehicleAssignment, IdlingEvent) for the
-data the fake client yields. Tests assert the fetcher orchestrates
-the four Samsara endpoints correctly without performing any
-transformation: identity equality is used for records flowing through
-the bundle, and ``is`` identity is used for endpoint constants on the
-call list.
+Uses ``unittest.mock`` for the Provider/TelemetryClient context
+pair but constructs real Pydantic record instances for the data
+the fake client yields. Tests assert the fetcher orchestrates the
+four endpoints (VEHICLES, DRIVERS x2, TRIPS, IDLING_EVENTS)
+correctly without performing any transformation: identity equality
+is used for records flowing through the bundle, and ``is`` identity
+is used for endpoint constants on the call list.
 
 All identifiers in test data are synthetic.
 """
@@ -23,10 +21,10 @@ import pytest
 from fleet_telemetry_hub.client import TelemetryClient
 from fleet_telemetry_hub.models.samsara_requests import SamsaraEndpoints
 from fleet_telemetry_hub.models.samsara_responses import (
-    DriverFuelEnergyReport,
-    DriverVehicleAssignment,
-    FuelEnergyVehicleReport,
     IdlingEvent,
+    SamsaraDriver,
+    SamsaraVehicle,
+    Trip,
 )
 from fleet_telemetry_hub.provider import Provider
 from fleet_telemetry_hub.utilization import (
@@ -35,165 +33,121 @@ from fleet_telemetry_hub.utilization import (
     UtilizationFetcher,
 )
 
-# Single-day and multi-day date constants used across tests.
+# Date constants. _MAY_14..16 is a single 28-day chunk; the 30-day
+# range below exercises the multi-chunk path.
 _MAY_14 = date(2026, 5, 14)
-_MAY_15 = date(2026, 5, 15)
-_MAY_16 = date(2026, 5, 16)
-
-_MAY_14_START = datetime(2026, 5, 14, 0, 0, 0, tzinfo=UTC)
-_MAY_15_START = datetime(2026, 5, 15, 0, 0, 0, tzinfo=UTC)
-_MAY_16_START = datetime(2026, 5, 16, 0, 0, 0, tzinfo=UTC)
-_MAY_17_START = datetime(2026, 5, 17, 0, 0, 0, tzinfo=UTC)
+_MAY_20 = date(2026, 5, 20)
+_JUN_12 = date(2026, 6, 12)  # 30 days after MAY_14 inclusive -> 2 chunks
 
 
-def _make_vehicle_fuel_energy_report(
-    vehicle_id: str = '999999900000001',
-) -> FuelEnergyVehicleReport:
-    return FuelEnergyVehicleReport.model_validate(
+def _make_samsara_vehicle(vehicle_id: str, vin: str, name: str) -> SamsaraVehicle:
+    return SamsaraVehicle.model_validate({'id': vehicle_id, 'name': name, 'vin': vin})
+
+
+def _make_samsara_driver(
+    driver_id: str,
+    name: str,
+    activation_status: str,
+) -> SamsaraDriver:
+    return SamsaraDriver.model_validate(
         {
-            'vehicle': {
-                'energyType': 'fuel',
-                'id': vehicle_id,
-                'name': f'TEST-{vehicle_id} (Tractor)',
-                'externalIds': {
-                    'samsara.serial': f'TESTSERIAL{vehicle_id[-2:]}',
-                    'samsara.vin': f'TESTVIN{vehicle_id[-11:]}',
-                },
-            },
-            'efficiencyMpge': 5.5,
-            'energyUsedKwh': 0,
-            'fuelConsumedMl': 200000,
-            'distanceTraveledMeters': 500000,
-            'estCarbonEmissionsKg': 540.0,
-            'estFuelEnergyCost': {'amount': 300.0, 'currencyCode': 'USD'},
-            'engineRunTimeDurationMs': 72000000,
-            'engineIdleTimeDurationMs': 40000000,
+            'id': driver_id,
+            'name': name,
+            'driverActivationStatus': activation_status,
         }
     )
 
 
-def _make_driver_fuel_energy_report(
-    driver_id: str = '1000001',
-) -> DriverFuelEnergyReport:
-    return DriverFuelEnergyReport.model_validate(
+def _make_trip(  # noqa: PLR0913 -- test factory bundling six small payload fields
+    trip_id: str,
+    vehicle_id: str,
+    driver_id: str | None,
+    start_dt: datetime,
+    end_dt: datetime,
+    distance_meters: int,
+) -> Trip:
+    return Trip.model_validate(
         {
-            'driver': {'id': driver_id, 'name': f'Test Driver {driver_id}'},
-            'efficiencyMpge': 6.5,
-            'energyUsedKwh': 0,
-            'fuelConsumedMl': 35000,
-            'distanceTraveledMeters': 100000,
-            'estCarbonEmissionsKg': 93.0,
-            'estFuelEnergyCost': {'amount': 51.0, 'currencyCode': 'USD'},
-            'engineRunTimeDurationMs': 11000000,
-            'engineIdleTimeDurationMs': 700000,
+            'id': trip_id,
+            'vehicleId': vehicle_id,
+            'driverId': driver_id,
+            'startMs': int(start_dt.timestamp() * 1000),
+            'endMs': int(end_dt.timestamp() * 1000),
+            'distanceMeters': distance_meters,
         }
     )
 
 
-def _make_driver_vehicle_assignment(
-    driver_id: str = '1000001',
-    vehicle_id: str = '999999900000001',
-) -> DriverVehicleAssignment:
-    return DriverVehicleAssignment.model_validate(
-        {
-            'startTime': '2026-05-14T07:00:00Z',
-            'endTime': '2026-05-14T19:00:00Z',
-            'isPassenger': False,
-            'assignedAtTime': '',
-            'assignmentType': 'HOS',
-            'driver': {'id': driver_id, 'name': f'Test Driver {driver_id}'},
-            'vehicle': {
-                'id': vehicle_id,
-                'name': f'TEST-{vehicle_id}',
-                'externalIds': {
-                    'samsara.vin': f'TESTVIN{vehicle_id[-11:]}',
-                    'samsara.serial': f'TESTSERIAL{vehicle_id[-2:]}',
-                },
-            },
-        }
-    )
+@dataclasses.dataclass(frozen=True, slots=True)
+class _FakeBackend:
+    """Routes fake_client.fetch_all calls to the right preconfigured iterator."""
 
+    vehicles: list[SamsaraVehicle]
+    active_drivers: list[SamsaraDriver]
+    deactivated_drivers: list[SamsaraDriver]
+    trips_by_vehicle_chunk: dict[tuple[str, datetime, datetime], list[Trip]]
+    idling_by_chunk: dict[tuple[datetime, datetime], list[IdlingEvent]]
 
-def _make_idling_event(
-    event_uuid: str = '00000000-0000-0000-0000-000000000001',
-) -> IdlingEvent:
-    return IdlingEvent.model_validate(
-        {
-            'airTemperatureMillicelsius': 12938,
-            'asset': {'id': 999999900000005},
-            'durationMilliseconds': 331886,
-            'eventUuid': event_uuid,
-            'fuelConsumedMilliliters': 451.07,
-            'fuelCost': {'amount': '0.66', 'currency': 'usd'},
-            'gaseousFuelConsumedGrams': 0,
-            'gaseousFuelCost': {'amount': '0.00', 'currency': 'usd'},
-            'operator': {'id': 1000006},
-            'ptoState': 'inactive',
-            'startTime': '2026-05-14T13:13:01.078Z',
-            'latitude': 30.0,
-            'longitude': -90.0,
-        }
-    )
+    def dispatch(self, endpoint: Any, **params: Any) -> Any:
+        records: list[Any] = []
+        if endpoint is SamsaraEndpoints.VEHICLES:
+            records = list(self.vehicles)
+        elif endpoint is SamsaraEndpoints.DRIVERS:
+            status = params['driver_activation_status']
+            if status == 'active':
+                records = list(self.active_drivers)
+            elif status == 'deactivated':
+                records = list(self.deactivated_drivers)
+        elif endpoint is SamsaraEndpoints.TRIPS:
+            trips_key = (
+                params['vehicle_id'],
+                params['start_time'],
+                params['end_time'],
+            )
+            records = list(self.trips_by_vehicle_chunk.get(trips_key, []))
+        elif endpoint is SamsaraEndpoints.IDLING_EVENTS:
+            idling_key = (params['start_time'], params['end_time'])
+            records = list(self.idling_by_chunk.get(idling_key, []))
+        return iter(records)
 
 
 def _build_fake_provider_and_client(
     *,
-    vehicle_records_by_window: dict[
-        tuple[datetime, datetime], list[FuelEnergyVehicleReport]
-    ]
+    vehicles: list[SamsaraVehicle] | None = None,
+    active_drivers: list[SamsaraDriver] | None = None,
+    deactivated_drivers: list[SamsaraDriver] | None = None,
+    trips_by_vehicle_chunk: dict[tuple[str, datetime, datetime], list[Trip]]
     | None = None,
-    driver_records_by_window: dict[
-        tuple[datetime, datetime], list[DriverFuelEnergyReport]
-    ]
-    | None = None,
-    assignment_records: list[DriverVehicleAssignment] | None = None,
-    idling_event_records: list[IdlingEvent] | None = None,
+    idling_by_chunk: dict[tuple[datetime, datetime], list[IdlingEvent]] | None = None,
 ) -> tuple[MagicMock, MagicMock]:
-    """
-    Construct a fake (Provider, TelemetryClient) pair wired together.
+    """Construct a fake (Provider, TelemetryClient) pair wired to a ``_FakeBackend``."""
 
-    The fake client's ``fetch_all`` dispatches on the endpoint constant:
-    VEHICLE_FUEL_ENERGY / DRIVER_FUEL_ENERGY lookups use the
-    (start_date, end_date) window as the key into the per-window
-    record maps; DRIVER_VEHICLE_ASSIGNMENTS and IDLING_EVENTS each
-    return their configured flat list regardless of window.
-
-    Returns (fake_provider, fake_client) so tests can also assert on
-    the client side (e.g. context-manager invocation counts).
-    """
-
-    vehicle_by_window: dict[
-        tuple[datetime, datetime], list[FuelEnergyVehicleReport]
-    ] = vehicle_records_by_window or {}
-    driver_by_window: dict[tuple[datetime, datetime], list[DriverFuelEnergyReport]] = (
-        driver_records_by_window or {}
+    backend = _FakeBackend(
+        vehicles=vehicles or [],
+        active_drivers=active_drivers or [],
+        deactivated_drivers=deactivated_drivers or [],
+        trips_by_vehicle_chunk=trips_by_vehicle_chunk or {},
+        idling_by_chunk=idling_by_chunk or {},
     )
-    assignments: list[DriverVehicleAssignment] = assignment_records or []
-    idling_events: list[IdlingEvent] = idling_event_records or []
 
     fake_client = MagicMock(spec=TelemetryClient)
     fake_client.__enter__.return_value = fake_client
     fake_client.__exit__.return_value = None
-
-    def fake_fetch_all(endpoint: Any, **params: Any) -> Any:
-        if endpoint is SamsaraEndpoints.VEHICLE_FUEL_ENERGY:
-            window = (params['start_date'], params['end_date'])
-            return iter(vehicle_by_window.get(window, []))
-        if endpoint is SamsaraEndpoints.DRIVER_FUEL_ENERGY:
-            window = (params['start_date'], params['end_date'])
-            return iter(driver_by_window.get(window, []))
-        if endpoint is SamsaraEndpoints.DRIVER_VEHICLE_ASSIGNMENTS:
-            return iter(assignments)
-        if endpoint is SamsaraEndpoints.IDLING_EVENTS:
-            return iter(idling_events)
-        return iter([])
-
-    fake_client.fetch_all.side_effect = fake_fetch_all
+    fake_client.fetch_all.side_effect = backend.dispatch
 
     fake_provider = MagicMock(spec=Provider)
     fake_provider.client.return_value = fake_client
 
     return fake_provider, fake_client
+
+
+def _single_chunk(start_date: date, end_date: date) -> tuple[datetime, datetime]:
+    """Return the half-open UTC datetime chunk for a sub-28-day range."""
+    start_dt = datetime(start_date.year, start_date.month, start_date.day, tzinfo=UTC)
+    one_past = end_date.toordinal() + 1
+    end_dt_date = date.fromordinal(one_past)
+    end_dt = datetime(end_dt_date.year, end_dt_date.month, end_dt_date.day, tzinfo=UTC)
+    return start_dt, end_dt
 
 
 class TestSamsaraUtilizationFetcherProtocolConformance:
@@ -208,301 +162,312 @@ class TestSamsaraUtilizationFetcherProtocolConformance:
         assert isinstance(fetcher, UtilizationFetcher)
 
 
-class TestSamsaraUtilizationFetcherValidation:
-    """Date-range validation."""
+class TestSamsaraUtilizationBundleShape:
+    """Bundle field set and frozen-dataclass behavior."""
 
-    def test_reversed_range_raises_value_error(self) -> None:
-        """Should reject start_date > end_date with both dates in the message."""
+    def test_field_set_is_exact(self) -> None:
+        """Bundle declares exactly the documented field set."""
 
-        fake_provider, _ = _build_fake_provider_and_client()
-        fetcher = SamsaraUtilizationFetcher(fake_provider)
+        fields = {f.name for f in dataclasses.fields(SamsaraUtilizationBundle)}
 
-        with pytest.raises(ValueError, match='must be <=') as exc_info:
-            fetcher.fetch(_MAY_16, _MAY_14)
-
-        assert str(_MAY_16) in str(exc_info.value)
-        assert str(_MAY_14) in str(exc_info.value)
-
-
-class TestSamsaraUtilizationFetcherSingleDay:
-    """Single-day range fetches all four endpoints exactly once."""
-
-    def test_one_key_per_by_date_dict_and_four_calls(self) -> None:
-        """Should produce one by-date key per dict and 4 total fetch_all calls."""
-
-        fake_provider, fake_client = _build_fake_provider_and_client()
-        fetcher = SamsaraUtilizationFetcher(fake_provider)
-
-        bundle = fetcher.fetch(_MAY_14, _MAY_14)
-
-        assert list(bundle.vehicle_fuel_energy_by_date) == [_MAY_14]
-        assert list(bundle.driver_fuel_energy_by_date) == [_MAY_14]
-        expected_call_count = 4
-        assert fake_client.fetch_all.call_count == expected_call_count
-
-
-class TestSamsaraUtilizationFetcherMultiDay:
-    """Multi-day range loops per-day endpoints; full-range event endpoints once each."""
-
-    def test_three_day_range_keys_and_call_count(self) -> None:
-        """Should fan out 3 days x 2 per-day + 2 full-range endpoints = 8."""
-
-        fake_provider, fake_client = _build_fake_provider_and_client()
-        fetcher = SamsaraUtilizationFetcher(fake_provider)
-
-        bundle = fetcher.fetch(_MAY_14, _MAY_16)
-
-        assert list(bundle.vehicle_fuel_energy_by_date) == [
-            _MAY_14,
-            _MAY_15,
-            _MAY_16,
-        ]
-        assert list(bundle.driver_fuel_energy_by_date) == [
-            _MAY_14,
-            _MAY_15,
-            _MAY_16,
-        ]
-        expected_call_count = 8
-        assert fake_client.fetch_all.call_count == expected_call_count
-
-
-class TestSamsaraUtilizationFetcherEmptyDaysPreserved:
-    """Days with zero records still appear in the by-date dicts."""
-
-    def test_empty_vehicle_day_still_has_key(self) -> None:
-        """Should preserve a key with value [] when an aggregate day is empty."""
-
-        vehicle_records_by_window = {
-            (_MAY_14_START, _MAY_15_START): [
-                _make_vehicle_fuel_energy_report('999999900000001'),
-            ],
-            # No entry for May 15 -> fake_fetch_all returns iter([]).
-            (_MAY_16_START, _MAY_17_START): [
-                _make_vehicle_fuel_energy_report('999999900000002'),
-            ],
+        assert fields == {
+            'vehicles',
+            'drivers',
+            'trips',
+            'idling_events',
+            'date_range',
+            'company',
         }
-        fake_provider, _ = _build_fake_provider_and_client(
-            vehicle_records_by_window=vehicle_records_by_window,
-        )
-        fetcher = SamsaraUtilizationFetcher(fake_provider)
-
-        bundle = fetcher.fetch(_MAY_14, _MAY_16)
-
-        assert _MAY_15 in bundle.vehicle_fuel_energy_by_date
-        assert bundle.vehicle_fuel_energy_by_date[_MAY_15] == []
-        assert len(bundle.vehicle_fuel_energy_by_date[_MAY_14]) == 1
-        assert len(bundle.vehicle_fuel_energy_by_date[_MAY_16]) == 1
-
-
-class TestSamsaraUtilizationFetcherEndpointAndParameterShapes:
-    """Endpoint identity and parameter types per call."""
-
-    def _fetch_and_partition_calls(
-        self,
-    ) -> tuple[list[Any], list[Any], list[Any], list[Any]]:
-        """Run a 2-day fetch and partition calls by endpoint constant."""
-
-        fake_provider, fake_client = _build_fake_provider_and_client()
-        fetcher = SamsaraUtilizationFetcher(fake_provider)
-
-        fetcher.fetch(_MAY_14, _MAY_15)
-
-        vehicle_calls: list[Any] = []
-        driver_calls: list[Any] = []
-        assignment_calls: list[Any] = []
-        idling_calls: list[Any] = []
-        for call in fake_client.fetch_all.call_args_list:
-            endpoint = call.args[0]
-            if endpoint is SamsaraEndpoints.VEHICLE_FUEL_ENERGY:
-                vehicle_calls.append(call)
-            elif endpoint is SamsaraEndpoints.DRIVER_FUEL_ENERGY:
-                driver_calls.append(call)
-            elif endpoint is SamsaraEndpoints.DRIVER_VEHICLE_ASSIGNMENTS:
-                assignment_calls.append(call)
-            elif endpoint is SamsaraEndpoints.IDLING_EVENTS:
-                idling_calls.append(call)
-
-        return vehicle_calls, driver_calls, assignment_calls, idling_calls
-
-    def test_endpoint_identity_per_call_class(self) -> None:
-        """Each call's positional endpoint argument matches the expected constant."""
-
-        vehicle_calls, driver_calls, assignment_calls, idling_calls = (
-            self._fetch_and_partition_calls()
-        )
-
-        expected_per_day_calls = 2
-        assert len(vehicle_calls) == expected_per_day_calls
-        assert len(driver_calls) == expected_per_day_calls
-        assert len(assignment_calls) == 1
-        assert len(idling_calls) == 1
-
-        for call in vehicle_calls:
-            assert call.args[0] is SamsaraEndpoints.VEHICLE_FUEL_ENERGY
-        for call in driver_calls:
-            assert call.args[0] is SamsaraEndpoints.DRIVER_FUEL_ENERGY
-        assert (
-            assignment_calls[0].args[0] is SamsaraEndpoints.DRIVER_VEHICLE_ASSIGNMENTS
-        )
-        assert idling_calls[0].args[0] is SamsaraEndpoints.IDLING_EVENTS
-
-    def test_vehicle_fuel_energy_params_are_utc_datetimes(self) -> None:
-        """VEHICLE_FUEL_ENERGY receives start_date / end_date as UTC datetimes."""
-
-        vehicle_calls, _, _, _ = self._fetch_and_partition_calls()
-
-        for call in vehicle_calls:
-            assert isinstance(call.kwargs['start_date'], datetime)
-            assert isinstance(call.kwargs['end_date'], datetime)
-            assert call.kwargs['start_date'].tzinfo is UTC
-            assert call.kwargs['end_date'].tzinfo is UTC
-
-    def test_driver_fuel_energy_params_are_utc_datetimes(self) -> None:
-        """DRIVER_FUEL_ENERGY receives start_date / end_date as UTC datetimes."""
-
-        _, driver_calls, _, _ = self._fetch_and_partition_calls()
-
-        for call in driver_calls:
-            assert isinstance(call.kwargs['start_date'], datetime)
-            assert isinstance(call.kwargs['end_date'], datetime)
-            assert call.kwargs['start_date'].tzinfo is UTC
-            assert call.kwargs['end_date'].tzinfo is UTC
-
-    def test_assignments_params_are_utc_datetimes_with_filter_by(self) -> None:
-        """DRIVER_VEHICLE_ASSIGNMENTS receives start_time/end_time + filter_by='drivers'."""
-
-        _, _, assignment_calls, _ = self._fetch_and_partition_calls()
-
-        assignment_call = assignment_calls[0]
-        assert isinstance(assignment_call.kwargs['start_time'], datetime)
-        assert isinstance(assignment_call.kwargs['end_time'], datetime)
-        assert assignment_call.kwargs['start_time'].tzinfo is UTC
-        assert assignment_call.kwargs['end_time'].tzinfo is UTC
-        assert assignment_call.kwargs['filter_by'] == 'drivers'
-
-    def test_idling_events_params_are_utc_datetimes_without_filter_by(self) -> None:
-        """IDLING_EVENTS receives start_time/end_time only; no filter_by kwarg."""
-
-        _, _, _, idling_calls = self._fetch_and_partition_calls()
-
-        idling_call = idling_calls[0]
-        assert isinstance(idling_call.kwargs['start_time'], datetime)
-        assert isinstance(idling_call.kwargs['end_time'], datetime)
-        assert idling_call.kwargs['start_time'].tzinfo is UTC
-        assert idling_call.kwargs['end_time'].tzinfo is UTC
-        assert 'filter_by' not in idling_call.kwargs
-
-
-class TestSamsaraUtilizationFetcherWindowBoundaries:
-    """Exact window boundaries for both aggregate and full-range endpoints."""
-
-    def test_three_day_windows_are_exact(self) -> None:
-        """May 14 per-day window plus full-range [May 14 00Z, May 17 00Z) bounds."""
-
-        fake_provider, fake_client = _build_fake_provider_and_client()
-        fetcher = SamsaraUtilizationFetcher(fake_provider)
-
-        fetcher.fetch(_MAY_14, _MAY_16)
-
-        # First per-day vehicle and driver calls cover May 14.
-        first_vehicle_call = fake_client.fetch_all.call_args_list[0]
-        first_driver_call = fake_client.fetch_all.call_args_list[1]
-        assert first_vehicle_call.args[0] is SamsaraEndpoints.VEHICLE_FUEL_ENERGY
-        assert first_vehicle_call.kwargs['start_date'] == _MAY_14_START
-        assert first_vehicle_call.kwargs['end_date'] == _MAY_15_START
-        assert first_driver_call.args[0] is SamsaraEndpoints.DRIVER_FUEL_ENERGY
-        assert first_driver_call.kwargs['start_date'] == _MAY_14_START
-        assert first_driver_call.kwargs['end_date'] == _MAY_15_START
-
-        # Full-range calls span the half-open window [May 14 00Z, May 17 00Z).
-        calls_by_endpoint: dict[Any, Any] = {
-            call.args[0]: call for call in fake_client.fetch_all.call_args_list
-        }
-        assignment_call = calls_by_endpoint[SamsaraEndpoints.DRIVER_VEHICLE_ASSIGNMENTS]
-        assert assignment_call.kwargs['start_time'] == _MAY_14_START
-        assert assignment_call.kwargs['end_time'] == _MAY_17_START
-
-        idling_call = calls_by_endpoint[SamsaraEndpoints.IDLING_EVENTS]
-        assert idling_call.kwargs['start_time'] == _MAY_14_START
-        assert idling_call.kwargs['end_time'] == _MAY_17_START
-
-
-class TestSamsaraUtilizationFetcherPassThrough:
-    """Records flow through the bundle unchanged."""
-
-    def test_records_pass_through_by_identity(self) -> None:
-        """Bundle entries are the exact instances the fake client yielded."""
-
-        v_rec_14 = _make_vehicle_fuel_energy_report('999999900000001')
-        v_rec_15 = _make_vehicle_fuel_energy_report('999999900000002')
-        d_rec_14 = _make_driver_fuel_energy_report('1000001')
-        assignment_a = _make_driver_vehicle_assignment('1000001', '999999900000001')
-        assignment_b = _make_driver_vehicle_assignment('1000002', '999999900000002')
-        idling_a = _make_idling_event('00000000-0000-0000-0000-000000000001')
-        idling_b = _make_idling_event('00000000-0000-0000-0000-000000000002')
-
-        fake_provider, _ = _build_fake_provider_and_client(
-            vehicle_records_by_window={
-                (_MAY_14_START, _MAY_15_START): [v_rec_14],
-                (_MAY_15_START, _MAY_16_START): [v_rec_15],
-            },
-            driver_records_by_window={
-                (_MAY_14_START, _MAY_15_START): [d_rec_14],
-            },
-            assignment_records=[assignment_a, assignment_b],
-            idling_event_records=[idling_a, idling_b],
-        )
-        fetcher = SamsaraUtilizationFetcher(fake_provider)
-
-        bundle = fetcher.fetch(_MAY_14, _MAY_15)
-
-        assert bundle.vehicle_fuel_energy_by_date[_MAY_14][0] is v_rec_14
-        assert bundle.vehicle_fuel_energy_by_date[_MAY_15][0] is v_rec_15
-        assert bundle.driver_fuel_energy_by_date[_MAY_14][0] is d_rec_14
-        assert bundle.driver_vehicle_assignments[0] is assignment_a
-        assert bundle.driver_vehicle_assignments[1] is assignment_b
-        assert bundle.idling_events[0] is idling_a
-        assert bundle.idling_events[1] is idling_b
-
-
-class TestSamsaraUtilizationFetcherBundleMetadata:
-    """date_range and bundle immutability."""
-
-    def test_date_range_matches_input(self) -> None:
-        """Bundle.date_range equals the (start, end) tuple originally passed."""
-
-        fake_provider, _ = _build_fake_provider_and_client()
-        fetcher = SamsaraUtilizationFetcher(fake_provider)
-
-        bundle = fetcher.fetch(_MAY_14, _MAY_16)
-
-        assert bundle.date_range == (_MAY_14, _MAY_16)
 
     def test_bundle_is_frozen_dataclass(self) -> None:
         """Assigning to a bundle attribute raises FrozenInstanceError."""
 
         bundle = SamsaraUtilizationBundle(
-            vehicle_fuel_energy_by_date={},
-            driver_fuel_energy_by_date={},
-            driver_vehicle_assignments=[],
+            vehicles=[],
+            drivers=[],
+            trips=[],
             idling_events=[],
             date_range=(_MAY_14, _MAY_14),
+            company=None,
         )
 
         with pytest.raises(dataclasses.FrozenInstanceError):
-            bundle.vehicle_fuel_energy_by_date = {}  # pyright: ignore[reportAttributeAccessIssue]
+            bundle.vehicles = []  # pyright: ignore[reportAttributeAccessIssue]
+
+
+class TestSamsaraUtilizationFetcherValidation:
+    """Date-range validation: reversed range raises before any API call."""
+
+    def test_reversed_range_raises_value_error(self) -> None:
+        """``start_date > end_date`` raises ValueError with both dates in the message."""
+
+        fake_provider, fake_client = _build_fake_provider_and_client()
+        fetcher = SamsaraUtilizationFetcher(fake_provider)
+
+        with pytest.raises(ValueError, match='must be <=') as exc_info:
+            fetcher.fetch(_MAY_20, _MAY_14)
+
+        assert str(_MAY_20) in str(exc_info.value)
+        assert str(_MAY_14) in str(exc_info.value)
+        assert fake_client.fetch_all.call_count == 0
+
+
+class TestSamsaraUtilizationFetcherDateRange:
+    """The bundle's date_range reflects the fetch arguments."""
+
+    def test_date_range_matches_input(self) -> None:
+        """``bundle.date_range`` is the inclusive ``(start, end)`` tuple."""
+
+        fake_provider, _ = _build_fake_provider_and_client()
+        fetcher = SamsaraUtilizationFetcher(fake_provider)
+
+        bundle = fetcher.fetch(_MAY_14, _MAY_20)
+
+        assert bundle.date_range == (_MAY_14, _MAY_20)
+
+
+class TestSamsaraUtilizationFetcherDimensionPassThrough:
+    """Vehicles and active drivers flow into the bundle by identity."""
+
+    def test_vehicles_pass_through_by_identity(self) -> None:
+        """Bundle's ``vehicles`` list is the same instances the API returned."""
+
+        v_a = _make_samsara_vehicle('999999900000001', 'TESTVIN0000000001', 'TEST-001')
+        v_b = _make_samsara_vehicle('999999900000002', 'TESTVIN0000000002', 'TEST-002')
+        fake_provider, _ = _build_fake_provider_and_client(vehicles=[v_a, v_b])
+        fetcher = SamsaraUtilizationFetcher(fake_provider)
+
+        bundle = fetcher.fetch(_MAY_14, _MAY_20)
+
+        assert bundle.vehicles[0] is v_a
+        assert bundle.vehicles[1] is v_b
+
+    def test_active_drivers_pass_through_by_identity(self) -> None:
+        """Active driver instances appear in the bundle unchanged."""
+
+        d_sam = _make_samsara_driver('1000001', 'Sam Snowflake', 'active')
+        d_suzy = _make_samsara_driver('1000002', 'Suzy Snowflake', 'active')
+        fake_provider, _ = _build_fake_provider_and_client(
+            active_drivers=[d_sam, d_suzy],
+        )
+        fetcher = SamsaraUtilizationFetcher(fake_provider)
+
+        bundle = fetcher.fetch(_MAY_14, _MAY_20)
+
+        assert d_sam in bundle.drivers
+        assert d_suzy in bundle.drivers
+        bundle_by_id = {d.driver_id: d for d in bundle.drivers}
+        assert bundle_by_id['1000001'] is d_sam
+        assert bundle_by_id['1000002'] is d_suzy
+
+
+class TestSamsaraUtilizationFetcherDriverDedup:
+    """Active drivers win when the same ID appears in both status calls."""
+
+    def test_dedup_prefers_active_instance(self) -> None:
+        """A driver in both lists appears once with the active-version instance."""
+
+        d_sam_active = _make_samsara_driver('1000001', 'Sam Snowflake', 'active')
+        d_sam_deactivated = _make_samsara_driver(
+            '1000001', 'Sam Snowflake (Deactivated)', 'deactivated'
+        )
+        d_sammy = _make_samsara_driver('1000003', 'Sammy Snowflake', 'deactivated')
+
+        fake_provider, _ = _build_fake_provider_and_client(
+            active_drivers=[d_sam_active],
+            deactivated_drivers=[d_sam_deactivated, d_sammy],
+        )
+        fetcher = SamsaraUtilizationFetcher(fake_provider)
+
+        bundle = fetcher.fetch(_MAY_14, _MAY_20)
+
+        bundle_by_id = {d.driver_id: d for d in bundle.drivers}
+        assert bundle_by_id['1000001'] is d_sam_active
+        assert d_sam_deactivated not in bundle.drivers
+        assert bundle_by_id['1000003'] is d_sammy
+        assert len(bundle.drivers) == 2  # noqa: PLR2004
+
+
+class TestSamsaraUtilizationFetcherTripsAndIdlingChunking:
+    """The fetcher loops per-vehicle x per-chunk over TRIPS; per-chunk over IDLING_EVENTS."""
+
+    def _vehicles(self) -> list[SamsaraVehicle]:
+        return [
+            _make_samsara_vehicle('999999900000001', 'TESTVIN0000000001', 'TEST-001'),
+            _make_samsara_vehicle('999999900000002', 'TESTVIN0000000002', 'TEST-002'),
+        ]
+
+    def test_single_chunk_two_vehicles(self) -> None:
+        """7-day range yields one chunk: trips called n_vehicles times, idling once."""
+
+        vehicles = self._vehicles()
+        fake_provider, fake_client = _build_fake_provider_and_client(vehicles=vehicles)
+        fetcher = SamsaraUtilizationFetcher(fake_provider)
+
+        fetcher.fetch(_MAY_14, _MAY_20)
+
+        trips_calls = [
+            call
+            for call in fake_client.fetch_all.call_args_list
+            if call.args[0] is SamsaraEndpoints.TRIPS
+        ]
+        idling_calls = [
+            call
+            for call in fake_client.fetch_all.call_args_list
+            if call.args[0] is SamsaraEndpoints.IDLING_EVENTS
+        ]
+        assert len(trips_calls) == len(vehicles)
+        assert len(idling_calls) == 1
+
+    def test_thirty_day_range_yields_two_chunks(self) -> None:
+        """30-day range -> 2 chunks: trips n_vehicles x 2 calls; idling 2 calls."""
+
+        vehicles = self._vehicles()
+        fake_provider, fake_client = _build_fake_provider_and_client(vehicles=vehicles)
+        fetcher = SamsaraUtilizationFetcher(fake_provider)
+
+        fetcher.fetch(_MAY_14, _JUN_12)
+
+        trips_calls = [
+            call
+            for call in fake_client.fetch_all.call_args_list
+            if call.args[0] is SamsaraEndpoints.TRIPS
+        ]
+        idling_calls = [
+            call
+            for call in fake_client.fetch_all.call_args_list
+            if call.args[0] is SamsaraEndpoints.IDLING_EVENTS
+        ]
+        expected_trip_calls = len(vehicles) * 2
+        expected_idling_calls = 2
+        assert len(trips_calls) == expected_trip_calls
+        assert len(idling_calls) == expected_idling_calls
+
+    def test_trips_call_params_match_vehicle_and_chunk(self) -> None:
+        """Each trips call carries one vehicle's ID and one chunk's datetime bounds."""
+
+        vehicles = self._vehicles()
+        chunk_start, chunk_end = _single_chunk(_MAY_14, _MAY_20)
+        fake_provider, fake_client = _build_fake_provider_and_client(vehicles=vehicles)
+        fetcher = SamsaraUtilizationFetcher(fake_provider)
+
+        fetcher.fetch(_MAY_14, _MAY_20)
+
+        trips_calls = [
+            call
+            for call in fake_client.fetch_all.call_args_list
+            if call.args[0] is SamsaraEndpoints.TRIPS
+        ]
+        observed = [
+            (
+                call.kwargs['vehicle_id'],
+                call.kwargs['start_time'],
+                call.kwargs['end_time'],
+            )
+            for call in trips_calls
+        ]
+        assert observed == [
+            (vehicles[0].vehicle_id, chunk_start, chunk_end),
+            (vehicles[1].vehicle_id, chunk_start, chunk_end),
+        ]
+
+
+class TestSamsaraUtilizationFetcherTripOrdering:
+    """Bundle's trip list orders by vehicle iteration, then by chunk chronology."""
+
+    def test_trip_ordering_outer_by_vehicle_inner_by_chunk(self) -> None:
+        """Trips appear in (vehicle_index, chunk_index) order."""
+
+        v_a = _make_samsara_vehicle('999999900000001', 'TESTVIN0000000001', 'TEST-001')
+        v_b = _make_samsara_vehicle('999999900000002', 'TESTVIN0000000002', 'TEST-002')
+
+        # 30-day range -> two chunks.
+        chunks = [
+            (datetime(2026, 5, 14, tzinfo=UTC), datetime(2026, 6, 11, tzinfo=UTC)),
+            (datetime(2026, 6, 11, tzinfo=UTC), datetime(2026, 6, 13, tzinfo=UTC)),
+        ]
+        trip_a1 = _make_trip(
+            '00000000-0000-0000-0000-000000001001',
+            v_a.vehicle_id,
+            '1000001',
+            chunks[0][0],
+            chunks[0][0],
+            100,
+        )
+        trip_a2 = _make_trip(
+            '00000000-0000-0000-0000-000000001002',
+            v_a.vehicle_id,
+            '1000001',
+            chunks[1][0],
+            chunks[1][0],
+            200,
+        )
+        trip_b1 = _make_trip(
+            '00000000-0000-0000-0000-000000001003',
+            v_b.vehicle_id,
+            '1000002',
+            chunks[0][0],
+            chunks[0][0],
+            300,
+        )
+        trip_b2 = _make_trip(
+            '00000000-0000-0000-0000-000000001004',
+            v_b.vehicle_id,
+            '1000002',
+            chunks[1][0],
+            chunks[1][0],
+            400,
+        )
+
+        trips_map: dict[tuple[str, datetime, datetime], list[Trip]] = {
+            (v_a.vehicle_id, chunks[0][0], chunks[0][1]): [trip_a1],
+            (v_a.vehicle_id, chunks[1][0], chunks[1][1]): [trip_a2],
+            (v_b.vehicle_id, chunks[0][0], chunks[0][1]): [trip_b1],
+            (v_b.vehicle_id, chunks[1][0], chunks[1][1]): [trip_b2],
+        }
+        fake_provider, _ = _build_fake_provider_and_client(
+            vehicles=[v_a, v_b],
+            trips_by_vehicle_chunk=trips_map,
+        )
+        fetcher = SamsaraUtilizationFetcher(fake_provider)
+
+        bundle = fetcher.fetch(_MAY_14, _JUN_12)
+
+        # Vehicle A's trips precede vehicle B's; within each vehicle,
+        # chunk 0 precedes chunk 1.
+        assert bundle.trips[0] is trip_a1
+        assert bundle.trips[1] is trip_a2
+        assert bundle.trips[2] is trip_b1
+        assert bundle.trips[3] is trip_b2
+
+
+class TestSamsaraUtilizationFetcherEmptyResults:
+    """When every endpoint returns no records, the bundle has empty lists."""
+
+    def test_empty_everywhere_produces_empty_bundle_lists(self) -> None:
+        """No vehicles, no drivers, no trips, no idling events -> empty lists, no crash."""
+
+        fake_provider, _ = _build_fake_provider_and_client()
+        fetcher = SamsaraUtilizationFetcher(fake_provider)
+
+        bundle = fetcher.fetch(_MAY_14, _MAY_20)
+
+        assert bundle.vehicles == []
+        assert bundle.drivers == []
+        assert bundle.trips == []
+        assert bundle.idling_events == []
 
 
 class TestSamsaraUtilizationFetcherClientLifecycle:
     """The fetcher opens and closes the client context exactly once."""
 
     def test_client_enter_and_exit_called_once(self) -> None:
-        """__enter__ and __exit__ are each invoked exactly once during fetch."""
+        """``__enter__`` and ``__exit__`` are each invoked exactly once per fetch."""
 
         fake_provider, fake_client = _build_fake_provider_and_client()
         fetcher = SamsaraUtilizationFetcher(fake_provider)
 
-        fetcher.fetch(_MAY_14, _MAY_15)
+        fetcher.fetch(_MAY_14, _MAY_20)
 
         assert fake_client.__enter__.call_count == 1
         assert fake_client.__exit__.call_count == 1

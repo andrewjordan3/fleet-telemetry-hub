@@ -36,6 +36,14 @@ class MotiveUtilizationBundle:
     unclipped -- the unifier handles clipping when it computes
     per-day attribution.
 
+    Note on bundle field consumption: ``vehicle_utilizations_by_date``
+    and ``driver_idle_rollups_by_date`` are populated by the fetcher
+    but are not currently consumed by the downstream unifier path,
+    which sources its event-grain output from ``driving_periods`` and
+    ``idle_events``. The aggregate-grain fields are retained for now
+    so downstream callers that previously depended on them keep
+    working; they will be revisited when the unifier work consolidates.
+
     Attributes:
         vehicle_utilizations_by_date: Per-vehicle aggregates, keyed by
             UTC date. Every date in date_range is present as a key.
@@ -54,6 +62,9 @@ class MotiveUtilizationBundle:
         date_range: Inclusive (start_date, end_date) the bundle was
             fetched for. Useful for downstream code to verify coverage
             without recomputing from dict keys.
+        company: Company identifier configured on the source Provider,
+            propagated into the unified output's ``company`` column.
+            ``None`` when the Provider was constructed without one.
     """
 
     vehicle_utilizations_by_date: dict[date, list[VehicleUtilization]]
@@ -61,6 +72,7 @@ class MotiveUtilizationBundle:
     driving_periods: list[DrivingPeriod]
     idle_events: list[IdleEvent]
     date_range: tuple[date, date]
+    company: str | None
 
 
 class MotiveUtilizationFetcher:
@@ -206,6 +218,7 @@ class MotiveUtilizationFetcher:
             driving_periods=driving_periods,
             idle_events=idle_events,
             date_range=(start_date, end_date),
+            company=self._provider.company,
         )
 
     @staticmethod
