@@ -765,7 +765,10 @@ class DrivingPeriod(FrozenResponseModelBase):
     The ``distance`` field is a formatted string emitted by Motive (e.g.
     ``"22.3 mi"``) and is not useful for arithmetic. Callers wanting real
     distance should compute it from ``end_kilometers - start_kilometers``
-    (also exposed as ``kilometers_traveled``).
+    (also exposed as ``kilometers_traveled``). Both readings can be
+    ``null`` when the ELD did not report odometer data; in that case
+    ``kilometers_traveled`` propagates ``None`` and the unifier emits
+    the row with null ``distance_miles``.
 
     The HVB (high-voltage battery) fields are EV-only; they are always null
     for fuel vehicles in the current fleet.
@@ -787,7 +790,11 @@ class DrivingPeriod(FrozenResponseModelBase):
             ``start_time`` and ``end_time`` directly. Modeled
             permissively (may be null).
         start_kilometers: Vehicle odometer reading at period start (km).
+            Null when the ELD did not report a reading; the unifier
+            emits the row with null distance in that case.
         end_kilometers: Vehicle odometer reading at period end (km).
+            Null when the ELD did not report a reading; the unifier
+            emits the row with null distance in that case.
         source: Numeric source code identifying how the period was
             recorded. May be null.
         driver: Embedded driver summary, or None when no driver was logged in.
@@ -813,8 +820,8 @@ class DrivingPeriod(FrozenResponseModelBase):
     annotation_status: int | None = None
     notes: str | None = None
     duration: int | None = None
-    start_kilometers: float
-    end_kilometers: float
+    start_kilometers: float | None = None
+    end_kilometers: float | None = None
     source: int | None = None
     driver: DriverSummary | None = None
     vehicle: VehicleSummary
@@ -831,8 +838,19 @@ class DrivingPeriod(FrozenResponseModelBase):
     end_hvb_lifetime_energy_output: float | None = None
 
     @property
-    def kilometers_traveled(self) -> float:
-        """Odometer-delta distance for this period, in kilometers."""
+    def kilometers_traveled(self) -> float | None:
+        """
+        Odometer-delta distance for this period, in kilometers.
+
+        Returns ``None`` when either ``start_kilometers`` or
+        ``end_kilometers`` is null -- the ELD did not report the
+        reading and no odometer delta is computable. The unifier
+        emits the row with null distance in that case rather than
+        dropping it: time, driver, and vehicle are still meaningful
+        even when distance is not.
+        """
+        if self.start_kilometers is None or self.end_kilometers is None:
+            return None
         return self.end_kilometers - self.start_kilometers
 
 

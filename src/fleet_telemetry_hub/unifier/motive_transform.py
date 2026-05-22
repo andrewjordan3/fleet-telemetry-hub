@@ -49,6 +49,12 @@ logger: logging.Logger = logging.getLogger(__name__)
 
 _DROP_REASONS: tuple[str, ...] = ('null_vin', 'non_positive_duration')
 
+# Soft-warning categories track events that produced a row but with
+# one or more degraded enrichment fields (e.g. null odometer ->
+# null distance). Distinct from ``drops``, which counts events that
+# could not be represented in the unified schema at all.
+_SOFT_WARNING_REASONS: tuple[str, ...] = ('null_odometer',)
+
 
 def transform_motive_bundle(bundle: MotiveUtilizationBundle) -> list[UnifiedEventRow]:
     """
@@ -80,10 +86,11 @@ def transform_motive_bundle(bundle: MotiveUtilizationBundle) -> list[UnifiedEven
 
     rows: list[UnifiedEventRow] = []
     drops: dict[str, int] = dict.fromkeys(_DROP_REASONS, 0)
+    soft_warnings: dict[str, int] = dict.fromkeys(_SOFT_WARNING_REASONS, 0)
 
     for period in bundle.driving_periods:
         driving_row = _driving_period_to_row(
-            period, idle_by_vehicle, bundle.company, drops
+            period, idle_by_vehicle, bundle.company, drops, soft_warnings
         )
         if driving_row is not None:
             rows.append(driving_row)
@@ -96,9 +103,10 @@ def transform_motive_bundle(bundle: MotiveUtilizationBundle) -> list[UnifiedEven
             rows.append(idle_row)
 
     logger.info(
-        'Motive transform complete: %d rows emitted, drops=%s',
+        'Motive transform complete: %d rows emitted, drops=%s, soft_warnings=%s',
         len(rows),
         drops,
+        soft_warnings,
     )
     return rows
 
@@ -146,8 +154,18 @@ def _driving_period_to_row(
     idle_by_vehicle: dict[int, list[IdleEvent]],
     company: str | None,
     drops: dict[str, int],
+    soft_warnings: dict[str, int],
 ) -> UnifiedEventRow | None:
-    """Convert a single ``DrivingPeriod`` into a unified row, or drop with a WARNING."""
+    """
+    Convert a single ``DrivingPeriod`` into a unified row.
+
+    Returns ``None`` (and increments ``drops``) for events that
+    cannot be represented in the unified schema -- null VIN or
+    non-positive computed duration. Returns a row (and increments
+    ``soft_warnings``) for events that can be emitted but with a
+    degraded enrichment field, currently only null odometer ->
+    null distance.
+    """
     vin = nfkc_strip(period.vehicle.vin)
     if not vin:
         logger.warning(
@@ -180,7 +198,26 @@ def _driving_period_to_row(
         return None
 
     driver_id, driver_name = _extract_driver_identity(period.driver)
-    distance_miles = km_to_miles(period.kilometers_traveled)
+
+    kilometers_traveled = period.kilometers_traveled
+    distance_miles: float | None
+    if kilometers_traveled is None:
+        logger.warning(
+            'Motive driving period has null odometer reading(s); '
+            'emitting row with null distance. '
+            'vehicle_id=%d, vin=%s, start=%s, end=%s, '
+            'start_kilometers=%s, end_kilometers=%s',
+            period.vehicle.vehicle_id,
+            vin,
+            period.start_time,
+            period.end_time,
+            period.start_kilometers,
+            period.end_kilometers,
+        )
+        soft_warnings['null_odometer'] += 1
+        distance_miles = None
+    else:
+        distance_miles = km_to_miles(kilometers_traveled)
 
     return UnifiedEventRow(
         company=company,

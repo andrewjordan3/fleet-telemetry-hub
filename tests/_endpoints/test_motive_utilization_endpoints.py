@@ -1205,7 +1205,11 @@ class TestMotiveModelDriftConsumedFieldsStrictness:
 
     @pytest.mark.parametrize(
         'field_name',
-        ['period_id', 'start_time', 'end_time', 'start_kilometers', 'end_kilometers'],
+        # ``start_kilometers`` and ``end_kilometers`` were previously
+        # in this list; they are now nullable since the unifier
+        # emits a row with null distance rather than dropping the
+        # event when the ELD did not report odometer data.
+        ['period_id', 'start_time', 'end_time'],
     )
     def test_driving_period_rejects_null_in_consumed_fields(
         self, field_name: str
@@ -1233,3 +1237,91 @@ class TestMotiveModelDriftConsumedFieldsStrictness:
 
         with pytest.raises(ValidationError):
             IdleEvent.model_validate(payload)
+
+
+class TestDrivingPeriodNullOdometer:
+    """``start_kilometers`` / ``end_kilometers`` widened to ``float | None``.
+
+    The ELD does not always report an odometer reading; the unifier
+    handles this as a soft-warning (emit row with null distance)
+    rather than a drop. These tests pin the model-layer behavior the
+    unifier relies on.
+    """
+
+    def test_driving_period_accepts_null_start_kilometers(self) -> None:
+        """``start_kilometers: null`` parses without raising."""
+
+        payload = dict(_THIRD_PERIOD_RAW)
+        payload['start_kilometers'] = None
+
+        parsed = DrivingPeriod.model_validate(payload)
+
+        assert parsed.start_kilometers is None
+
+    def test_driving_period_accepts_null_end_kilometers(self) -> None:
+        """``end_kilometers: null`` parses without raising."""
+
+        payload = dict(_THIRD_PERIOD_RAW)
+        payload['end_kilometers'] = None
+
+        parsed = DrivingPeriod.model_validate(payload)
+
+        assert parsed.end_kilometers is None
+
+    def test_driving_period_accepts_null_both_kilometers(self) -> None:
+        """Both odometer fields null in the same record -- the live failure shape."""
+
+        payload = dict(_THIRD_PERIOD_RAW)
+        payload['start_kilometers'] = None
+        payload['end_kilometers'] = None
+
+        parsed = DrivingPeriod.model_validate(payload)
+
+        assert parsed.start_kilometers is None
+        assert parsed.end_kilometers is None
+
+    def test_kilometers_traveled_returns_none_when_start_is_null(self) -> None:
+        """Property propagates null when only the start reading is missing."""
+
+        payload = dict(_THIRD_PERIOD_RAW)
+        payload['start_kilometers'] = None
+        payload['end_kilometers'] = 150.0
+
+        parsed = DrivingPeriod.model_validate(payload)
+
+        assert parsed.kilometers_traveled is None
+
+    def test_kilometers_traveled_returns_none_when_end_is_null(self) -> None:
+        """Property propagates null when only the end reading is missing."""
+
+        payload = dict(_THIRD_PERIOD_RAW)
+        payload['start_kilometers'] = 100.0
+        payload['end_kilometers'] = None
+
+        parsed = DrivingPeriod.model_validate(payload)
+
+        assert parsed.kilometers_traveled is None
+
+    def test_kilometers_traveled_returns_none_when_both_are_null(self) -> None:
+        """Property returns ``None`` (not a crash) when both readings are null."""
+
+        payload = dict(_THIRD_PERIOD_RAW)
+        payload['start_kilometers'] = None
+        payload['end_kilometers'] = None
+
+        parsed = DrivingPeriod.model_validate(payload)
+
+        assert parsed.kilometers_traveled is None
+
+    def test_kilometers_traveled_returns_delta_when_both_present(self) -> None:
+        """Property still computes the delta correctly when neither is null."""
+
+        payload = dict(_THIRD_PERIOD_RAW)
+        payload['start_kilometers'] = 100.0
+        payload['end_kilometers'] = 150.25
+
+        parsed = DrivingPeriod.model_validate(payload)
+
+        assert parsed.kilometers_traveled is not None
+        expected_delta = 50.25
+        assert abs(parsed.kilometers_traveled - expected_delta) < _FUEL_DELTA_TOLERANCE

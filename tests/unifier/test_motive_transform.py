@@ -110,12 +110,19 @@ def _make_driving_period(  # noqa: PLR0913 -- test factory; one knob per field
     distance_km: float = _DEFAULT_DISTANCE_KM,
     type_value: str = 'driving',
     period_id: int = 4550000001,
+    null_start_kilometers: bool = False,
+    null_end_kilometers: bool = False,
 ) -> DrivingPeriod:
     """
     Build a ``DrivingPeriod`` with sensible defaults.
 
     ``driver=None`` produces an unattributed period; pass a
-    ``DriverSummary`` (or accept the default) to attribute the period.
+    ``DriverSummary`` (or accept the default) to attribute the
+    period. ``null_start_kilometers`` / ``null_end_kilometers``
+    swap the respective odometer reading for ``None`` so tests can
+    exercise the unifier's null-odometer soft-warning path. The
+    boolean-knob shape avoids overloading ``None`` as a sentinel
+    here, since ``None`` is a legitimate field value.
     """
     if vehicle is None:
         vehicle = _make_vehicle()
@@ -123,6 +130,10 @@ def _make_driving_period(  # noqa: PLR0913 -- test factory; one knob per field
         start = _dt(hour=8)
     if end is None:
         end = _dt(hour=9)
+    start_kilometers: float | None = None if null_start_kilometers else 100.0
+    end_kilometers: float | None = (
+        None if null_end_kilometers else 100.0 + distance_km
+    )
     return DrivingPeriod.model_validate(
         {
             'id': period_id,
@@ -133,8 +144,8 @@ def _make_driving_period(  # noqa: PLR0913 -- test factory; one knob per field
             'annotation_status': None,
             'notes': None,
             'duration': int((end - start).total_seconds()),
-            'start_kilometers': 100.0,
-            'end_kilometers': 100.0 + distance_km,
+            'start_kilometers': start_kilometers,
+            'end_kilometers': end_kilometers,
             'source': 1,
             'driver': (
                 driver.model_dump(by_alias=True) if driver is not None else None
@@ -565,3 +576,96 @@ class TestBundleLevelBehavior:
         assert rows[1].start_time_utc == _dt(hour=13)
         assert rows[2].start_time_utc == _dt(hour=10)
         assert rows[3].start_time_utc == _dt(hour=12)
+
+
+class TestDrivingPeriodNullOdometerSoftWarning:
+    """Null-odometer rows emit with ``distance_miles=None`` rather than dropping."""
+
+    def test_driving_period_with_null_odometer_emits_row_with_null_distance(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Null both readings -> row still emitted; ``distance_miles`` is null."""
+
+        period = _make_driving_period(
+            null_start_kilometers=True, null_end_kilometers=True
+        )
+        with caplog.at_level(logging.WARNING):
+            rows = transform_motive_bundle(_make_bundle(driving_periods=[period]))
+
+        assert len(rows) == 1
+        row = rows[0]
+        assert row.event_type is EventType.DRIVING
+        assert row.distance_miles is None
+        # Other fields still reflect the input -- only distance degraded.
+        assert row.vin == _DEFAULT_VIN
+        assert row.driver_id == str(_DEFAULT_DRIVER_ID)
+        assert row.driver_name == _DEFAULT_DRIVER_FULL_NAME
+        assert row.start_time_utc == _dt(hour=8)
+        assert row.end_time_utc == _dt(hour=9)
+        assert row.duration_seconds == _ONE_HOUR_SECONDS
+        # WARNING fires with the documented substring.
+        assert any(
+            'null odometer reading' in record.message for record in caplog.records
+        )
+
+    def test_null_start_only_still_emits_row_with_null_distance(self) -> None:
+        """Only ``start_kilometers`` null -> still soft-degrade, not a drop."""
+
+        period = _make_driving_period(null_start_kilometers=True)
+        rows = transform_motive_bundle(_make_bundle(driving_periods=[period]))
+
+        assert len(rows) == 1
+        assert rows[0].distance_miles is None
+
+    def test_null_end_only_still_emits_row_with_null_distance(self) -> None:
+        """Only ``end_kilometers`` null -> still soft-degrade, not a drop."""
+
+        period = _make_driving_period(null_end_kilometers=True)
+        rows = transform_motive_bundle(_make_bundle(driving_periods=[period]))
+
+        assert len(rows) == 1
+        assert rows[0].distance_miles is None
+
+    def test_null_odometer_increments_soft_warnings_counter(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Final INFO log reports ``soft_warnings={'null_odometer': 1}``."""
+
+        period = _make_driving_period(
+            null_start_kilometers=True, null_end_kilometers=True
+        )
+        # Scope to the transform's logger so a prior test that pinned
+        # the package logger to WARNING does not filter the final
+        # INFO line before caplog sees it.
+        with caplog.at_level(
+            logging.INFO, logger='fleet_telemetry_hub.unifier.motive_transform'
+        ):
+            transform_motive_bundle(_make_bundle(driving_periods=[period]))
+
+        complete_records = [
+            record
+            for record in caplog.records
+            if 'Motive transform complete' in record.message
+        ]
+        assert len(complete_records) == 1
+        message = complete_records[0].message
+        assert "soft_warnings={'null_odometer': 1}" in message
+
+    def test_present_odometer_does_not_increment_soft_warnings(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Normal records keep ``null_odometer`` at zero in the final summary."""
+
+        period = _make_driving_period()  # defaults: both readings present
+        with caplog.at_level(
+            logging.INFO, logger='fleet_telemetry_hub.unifier.motive_transform'
+        ):
+            transform_motive_bundle(_make_bundle(driving_periods=[period]))
+
+        complete_records = [
+            record
+            for record in caplog.records
+            if 'Motive transform complete' in record.message
+        ]
+        assert len(complete_records) == 1
+        assert "soft_warnings={'null_odometer': 0}" in complete_records[0].message
