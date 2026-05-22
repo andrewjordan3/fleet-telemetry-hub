@@ -14,6 +14,7 @@ vehicle IDs, or trip UUIDs from any production fleet appear in this
 file.
 """
 
+import logging
 from datetime import UTC, datetime
 from typing import Any
 
@@ -47,7 +48,11 @@ _TRIP_A_ID = '00000000-0000-0000-0000-000000001001'
 _TRIP_B_ID = '00000000-0000-0000-0000-000000001002'
 
 _VEHICLE_ID = '999999900000001'
-_DRIVER_ID = '1000001'
+# Samsara returns ``driverId`` as an integer; the Trip model coerces
+# to string. Both forms are kept here so assertions can read against
+# the post-coercion value while the fixture uses the on-wire shape.
+_DRIVER_ID_INT = 7046697
+_DRIVER_ID_STR = str(_DRIVER_ID_INT)
 
 _EXPECTED_TRIP_COUNT = 2
 _TRIP_A_DISTANCE_METERS = 12500
@@ -56,28 +61,39 @@ _TRIP_B_DISTANCE_METERS = 800
 TRIPS_FIXTURE: dict[str, Any] = {
     'data': [
         {
+            # The real API does not echo ``vehicleId`` back per-trip;
+            # the fetcher boundary stamps it on via ``VehicleTrip``.
             'id': _TRIP_A_ID,
-            'vehicleId': _VEHICLE_ID,
-            'driverId': _DRIVER_ID,
+            'driverId': _DRIVER_ID_INT,
             'startMs': _TRIP_A_START_MS,
             'endMs': _TRIP_A_END_MS,
             'distanceMeters': _TRIP_A_DISTANCE_METERS,
-            # Extras Samsara returns that V1 intentionally does not model.
-            'startOdometer': 100000,
-            'endOdometer': 100012,
-            'startCoordinates': {'latitude': 30.0, 'longitude': -90.0},
-            'endCoordinates': {'latitude': 30.1, 'longitude': -90.1},
+            # Extras Samsara returns that V1 intentionally does not model
+            # but that exercise the ``extra='ignore'`` config. Kept here
+            # so a future field-shape regression in pydantic or the base
+            # model would surface as a parse failure.
+            'startLocation': 'Roselawn Street, Pomona, CA',
+            'endLocation': 'Lowell Avenue, Claremont, CA',
+            'startCoordinates': {'latitude': 34.056405, 'longitude': -117.791372},
+            'endCoordinates': {'latitude': 34.114833, 'longitude': -117.711276},
+            'fuelConsumedMl': 6000,
+            'tollMeters': 0,
+            'codriverIds': [],
+            'startOdometer': 123933425,
+            'endOdometer': 123947925,
+            'assetIds': [],
         },
         {
             'id': _TRIP_B_ID,
-            'vehicleId': _VEHICLE_ID,
             'driverId': None,
             'startMs': _TRIP_B_START_MS,
             'endMs': _TRIP_B_END_MS,
             'distanceMeters': _TRIP_B_DISTANCE_METERS,
         },
     ],
-    'pagination': {'endCursor': '', 'hasNextPage': False},
+    # No ``pagination`` key: the legacy /v1/fleet/trips endpoint does
+    # not return pagination metadata; everything for the queried
+    # vehicle/window comes back in one response.
 }
 
 
@@ -90,8 +106,7 @@ class TestTripModelParsing:
         trip = Trip.model_validate(TRIPS_FIXTURE['data'][0])
 
         assert trip.trip_id == _TRIP_A_ID
-        assert trip.driver_id == _DRIVER_ID
-        assert trip.vehicle_id == _VEHICLE_ID
+        assert trip.driver_id == _DRIVER_ID_STR
         assert trip.distance_meters == _TRIP_A_DISTANCE_METERS
 
     def test_start_time_parses_to_tz_aware_utc(self) -> None:
@@ -126,17 +141,27 @@ class TestTripModelParsing:
 
         trip = Trip.model_validate(TRIPS_FIXTURE['data'][0])
 
-        assert not hasattr(trip, 'startOdometer')
-        assert not hasattr(trip, 'start_odometer')
-        assert not hasattr(trip, 'startCoordinates')
+        for unmodeled in (
+            'startLocation',
+            'endLocation',
+            'startCoordinates',
+            'endCoordinates',
+            'fuelConsumedMl',
+            'tollMeters',
+            'codriverIds',
+            'startOdometer',
+            'endOdometer',
+            'assetIds',
+            'start_odometer',
+        ):
+            assert not hasattr(trip, unmodeled)
 
     def test_datetime_input_passes_through(self) -> None:
         """Direct datetime input (vs. epoch-ms int) is accepted unchanged."""
 
         payload = {
             'id': _TRIP_A_ID,
-            'vehicleId': _VEHICLE_ID,
-            'driverId': _DRIVER_ID,
+            'driverId': _DRIVER_ID_INT,
             'startMs': _TRIP_A_START_UTC,
             'endMs': _TRIP_A_END_UTC,
             'distanceMeters': _TRIP_A_DISTANCE_METERS,
@@ -149,7 +174,7 @@ class TestTripModelParsing:
 
     @pytest.mark.parametrize(
         'missing_key',
-        ['vehicleId', 'startMs', 'endMs', 'distanceMeters'],
+        ['startMs', 'endMs', 'distanceMeters'],
     )
     def test_missing_required_field_raises_validation_error(
         self, missing_key: str
@@ -161,6 +186,49 @@ class TestTripModelParsing:
 
         with pytest.raises(ValidationError):
             Trip.model_validate(payload)
+
+
+class TestTripDriverIdCoercion:
+    """``Trip._coerce_driver_id`` normalizes the on-wire shape to ``str | None``."""
+
+    @staticmethod
+    def _payload(driver_id_value: int | str | None) -> dict[str, Any]:
+        """Build a minimal-but-valid Trip payload with the given ``driverId`` value."""
+        return {
+            'id': _TRIP_A_ID,
+            'driverId': driver_id_value,
+            'startMs': _TRIP_A_START_MS,
+            'endMs': _TRIP_A_END_MS,
+            'distanceMeters': _TRIP_A_DISTANCE_METERS,
+        }
+
+    def test_realistic_int_driver_id_is_coerced_to_string(self) -> None:
+        """A large int (the real Samsara shape) round-trips as its decimal string."""
+
+        trip = Trip.model_validate(self._payload(_DRIVER_ID_INT))
+
+        assert trip.driver_id == _DRIVER_ID_STR
+
+    def test_zero_int_driver_id_is_coerced_to_zero_string(self) -> None:
+        """``driverId=0`` is a plain coercion, not a sentinel for null."""
+
+        trip = Trip.model_validate(self._payload(0))
+
+        assert trip.driver_id == '0'
+
+    def test_none_driver_id_passes_through_as_none(self) -> None:
+        """``driverId=None`` is preserved (unattributed trip)."""
+
+        trip = Trip.model_validate(self._payload(None))
+
+        assert trip.driver_id is None
+
+    def test_string_driver_id_passes_through_unchanged(self) -> None:
+        """Defensive symmetry: an already-string id is not re-stringified."""
+
+        trip = Trip.model_validate(self._payload('1000001'))
+
+        assert trip.driver_id == '1000001'
 
 
 class TestTripsResponseShape:
@@ -190,10 +258,10 @@ class TestSamsaraTripsEndpointDefinition:
 
         assert SamsaraEndpoints.TRIPS.http_method == HTTPMethod.GET
 
-    def test_endpoint_is_paginated(self) -> None:
-        """Should be marked paginated."""
+    def test_endpoint_is_not_paginated(self) -> None:
+        """The legacy /v1/fleet/trips endpoint does not paginate."""
 
-        assert SamsaraEndpoints.TRIPS.is_paginated is True
+        assert SamsaraEndpoints.TRIPS.is_paginated is False
 
     def test_response_model_and_item_extractor(self) -> None:
         """Should wire TripsResponse and the uniform get_items extractor."""
@@ -242,7 +310,7 @@ class TestSamsaraTripsEndpointDefinition:
 
         assert len(parsed.items) == _EXPECTED_TRIP_COUNT
         assert all(isinstance(item, Trip) for item in parsed.items)
-        assert parsed.items[0].driver_id == _DRIVER_ID
+        assert parsed.items[0].driver_id == _DRIVER_ID_STR
         assert parsed.items[1].driver_id is None
 
 
@@ -260,3 +328,61 @@ class TestSamsaraTripsRegistryResolution:
         assert isinstance(endpoint, SamsaraEndpointDefinition)
         assert endpoint is SamsaraEndpoints.TRIPS
         assert endpoint.endpoint_path == '/v1/fleet/trips'
+
+
+class TestPaginationMetadataWarning:
+    """The missing-pagination WARNING fires only for endpoints that declare paginated."""
+
+    _REQUESTS_LOGGER = 'fleet_telemetry_hub.models.samsara_requests'
+    _WARNING_NEEDLE = 'Expected pagination metadata'
+
+    def test_non_paginated_endpoint_without_metadata_is_silent(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """``TRIPS`` (non-paginated) + payload with no ``pagination`` key -> no WARNING."""
+
+        with caplog.at_level(logging.WARNING, logger=self._REQUESTS_LOGGER):
+            SamsaraEndpoints.TRIPS.parse_response(TRIPS_FIXTURE)
+
+        assert not any(
+            self._WARNING_NEEDLE in record.message for record in caplog.records
+        )
+
+    def test_paginated_endpoint_without_metadata_emits_warning(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A paginated endpoint receiving a response without metadata still warns."""
+
+        # VEHICLES is paginated and its response model carries an
+        # optional ``pagination`` field, so omitting the key produces
+        # the exact scenario the WARNING was designed to surface.
+        vehicles_payload: dict[str, Any] = {'data': []}
+
+        with caplog.at_level(logging.WARNING, logger=self._REQUESTS_LOGGER):
+            SamsaraEndpoints.VEHICLES.parse_response(vehicles_payload)
+
+        warn_records = [
+            record
+            for record in caplog.records
+            if self._WARNING_NEEDLE in record.message
+        ]
+        assert len(warn_records) == 1
+        # The WARNING includes the offending endpoint's path.
+        assert SamsaraEndpoints.VEHICLES.endpoint_path in warn_records[0].message
+
+    def test_paginated_endpoint_with_metadata_is_silent(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Pagination present on a paginated endpoint -> no WARNING (regression guard)."""
+
+        vehicles_payload: dict[str, Any] = {
+            'data': [],
+            'pagination': {'endCursor': '', 'hasNextPage': False},
+        }
+
+        with caplog.at_level(logging.WARNING, logger=self._REQUESTS_LOGGER):
+            SamsaraEndpoints.VEHICLES.parse_response(vehicles_payload)
+
+        assert not any(
+            self._WARNING_NEEDLE in record.message for record in caplog.records
+        )

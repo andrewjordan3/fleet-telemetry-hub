@@ -32,6 +32,7 @@ from fleet_telemetry_hub.models.samsara_responses import (
 from fleet_telemetry_hub.unifier.schema import COLUMNS, DTYPES
 from fleet_telemetry_hub.utilization.motive_fetcher import MotiveUtilizationBundle
 from fleet_telemetry_hub.utilization.samsara_fetcher import SamsaraUtilizationBundle
+from fleet_telemetry_hub.utilization.vehicle_trip import VehicleTrip
 from fleet_telemetry_hub.utilization_pipeline import UtilizationPipeline
 
 # ---------------------------------------------------------------------------
@@ -219,17 +220,18 @@ def _samsara_driver() -> SamsaraDriver:
     )
 
 
-def _samsara_trip() -> Trip:
-    return Trip.model_validate(
+def _samsara_trip() -> VehicleTrip:
+    """Build a ``VehicleTrip`` -- the wrapper the Samsara bundle's trips list now holds."""
+    trip = Trip.model_validate(
         {
             'id': '00000000-0000-0000-0000-000000001001',
-            'vehicleId': '999999900000001',
             'driverId': '1000001',
             'startMs': int(_at(hour=12).timestamp() * 1000),
             'endMs': int(_at(hour=13).timestamp() * 1000),
             'distanceMeters': 1609,
         }
     )
+    return VehicleTrip.from_trip(trip, '999999900000001')
 
 
 def _empty_samsara_bundle(

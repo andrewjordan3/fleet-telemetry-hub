@@ -1353,13 +1353,19 @@ class Trip(SamsaraModelBase):
     """
     Single trip record from GET /v1/fleet/trips.
 
-    Each record covers one contiguous driving interval for a vehicle.
-    The endpoint reports its time bounds as integer Unix
-    epoch-milliseconds; the validator below coerces those ints to
-    timezone-aware UTC ``datetime`` instances so downstream code can
-    treat them uniformly with the other Samsara time fields. Direct
-    construction with ``datetime`` values is supported and
-    pass-through.
+    Each record covers one contiguous driving interval. The endpoint
+    reports its time bounds as integer Unix epoch-milliseconds; the
+    validator below coerces those ints to timezone-aware UTC
+    ``datetime`` instances so downstream code can treat them
+    uniformly with the other Samsara time fields. Direct construction
+    with ``datetime`` values is supported and pass-through.
+
+    The API does **not** return ``vehicleId`` per trip in the
+    response body -- the vehicle association is implicit from the
+    queried ``vehicleId`` parameter. The fetcher boundary wraps each
+    parsed ``Trip`` in a ``VehicleTrip`` to restore that association
+    for downstream consumers; this model itself stays a faithful
+    reflection of the on-wire shape.
 
     Other fields the Samsara API returns on this endpoint
     (``startOdometer`` / ``endOdometer``, ``startCoordinates`` /
@@ -1370,9 +1376,10 @@ class Trip(SamsaraModelBase):
 
     Attributes:
         trip_id: Samsara's internal trip identifier, if reported.
-        driver_id: Samsara driver identifier, or None when the trip
-            was driven without an attributed driver.
-        vehicle_id: Samsara vehicle identifier (required).
+        driver_id: Samsara driver identifier as a string. The API
+            returns this as an integer (e.g. ``7046697``); a field
+            validator coerces to ``str``. ``None`` when the trip was
+            driven without an attributed driver.
         start_time: Trip start as a tz-aware UTC datetime, parsed
             from ``startMs``.
         end_time: Trip end as a tz-aware UTC datetime, parsed from
@@ -1383,10 +1390,27 @@ class Trip(SamsaraModelBase):
 
     trip_id: str | None = Field(default=None, alias='id')
     driver_id: str | None = Field(default=None, alias='driverId')
-    vehicle_id: str = Field(alias='vehicleId')
     start_time: datetime = Field(alias='startMs')
     end_time: datetime = Field(alias='endMs')
     distance_meters: int = Field(alias='distanceMeters')
+
+    @field_validator('driver_id', mode='before')
+    @classmethod
+    def _coerce_driver_id(cls, value: int | str | None) -> str | None:
+        """
+        Coerce raw ``driverId`` values to ``str | None``.
+
+        Samsara's ``/v1/fleet/trips`` endpoint returns ``driverId`` as
+        an integer (e.g. ``7046697``). We coerce to string form to
+        match the rest of the codebase's driver-id convention. ``None``
+        passes through as ``None``; string input passes through
+        unchanged. Any null-equivalent semantics (empty, ``'unknown'``,
+        etc.) are handled by the unifier's text-normalization layer,
+        not here.
+        """
+        if value is None:
+            return None
+        return str(value)
 
     @field_validator('start_time', 'end_time', mode='before')
     @classmethod

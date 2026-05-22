@@ -21,6 +21,7 @@ from fleet_telemetry_hub.models.samsara_responses import (
 from fleet_telemetry_hub.unifier.samsara_transform import transform_samsara_bundle
 from fleet_telemetry_hub.unifier.schema import EventType
 from fleet_telemetry_hub.utilization.samsara_fetcher import SamsaraUtilizationBundle
+from fleet_telemetry_hub.utilization.vehicle_trip import VehicleTrip
 
 # Date constants shared across tests (keep cross-test consistency).
 _MAY_14 = date(2026, 5, 14)
@@ -86,21 +87,27 @@ def _make_trip(  # noqa: PLR0913 -- test factory; one knob per field
     start_dt: datetime | None = None,
     end_dt: datetime | None = None,
     distance_meters: int = _ONE_MILE_IN_METERS,
-) -> Trip:
+) -> VehicleTrip:
+    """
+    Build a ``VehicleTrip`` -- the wrapper the bundle's ``trips`` list
+    actually holds. The inner ``Trip`` has no ``vehicleId`` in the API
+    response shape; the queried ``vehicle_id`` is stamped on the
+    wrapper instead.
+    """
     if start_dt is None:
         start_dt = _at(hour=8)
     if end_dt is None:
         end_dt = _at(hour=9)
-    return Trip.model_validate(
+    trip = Trip.model_validate(
         {
             'id': trip_id,
-            'vehicleId': vehicle_id,
             'driverId': driver_id,
             'startMs': int(start_dt.timestamp() * 1000),
             'endMs': int(end_dt.timestamp() * 1000),
             'distanceMeters': distance_meters,
         }
     )
+    return VehicleTrip.from_trip(trip, vehicle_id)
 
 
 def _make_idling_event(  # noqa: PLR0913 -- test factory; one knob per field
@@ -204,8 +211,8 @@ class TestVinResolution:
         message = warn_records[0].message
         assert 'in_dim_table=False' in message
         assert 'vehicle_id=ghost_vehicle_id' in message
-        assert trip.trip_id is not None
-        assert trip.trip_id in message
+        assert trip.trip.trip_id is not None
+        assert trip.trip.trip_id in message
 
     def test_trip_vehicle_vin_is_none_falls_back(
         self, caplog: pytest.LogCaptureFixture

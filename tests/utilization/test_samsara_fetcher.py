@@ -31,6 +31,7 @@ from fleet_telemetry_hub.utilization import (
     SamsaraUtilizationBundle,
     SamsaraUtilizationFetcher,
     UtilizationFetcher,
+    VehicleTrip,
 )
 
 # Date constants. _MAY_14..16 is a single 28-day chunk; the 30-day
@@ -58,18 +59,17 @@ def _make_samsara_driver(
     )
 
 
-def _make_trip(  # noqa: PLR0913 -- test factory bundling six small payload fields
+def _make_trip(
     trip_id: str,
-    vehicle_id: str,
     driver_id: str | None,
     start_dt: datetime,
     end_dt: datetime,
     distance_meters: int,
 ) -> Trip:
+    """Build a ``Trip`` with the on-wire shape -- no ``vehicleId`` in the payload."""
     return Trip.model_validate(
         {
             'id': trip_id,
-            'vehicleId': vehicle_id,
             'driverId': driver_id,
             'startMs': int(start_dt.timestamp() * 1000),
             'endMs': int(end_dt.timestamp() * 1000),
@@ -388,7 +388,6 @@ class TestSamsaraUtilizationFetcherTripOrdering:
         ]
         trip_a1 = _make_trip(
             '00000000-0000-0000-0000-000000001001',
-            v_a.vehicle_id,
             '1000001',
             chunks[0][0],
             chunks[0][0],
@@ -396,7 +395,6 @@ class TestSamsaraUtilizationFetcherTripOrdering:
         )
         trip_a2 = _make_trip(
             '00000000-0000-0000-0000-000000001002',
-            v_a.vehicle_id,
             '1000001',
             chunks[1][0],
             chunks[1][0],
@@ -404,7 +402,6 @@ class TestSamsaraUtilizationFetcherTripOrdering:
         )
         trip_b1 = _make_trip(
             '00000000-0000-0000-0000-000000001003',
-            v_b.vehicle_id,
             '1000002',
             chunks[0][0],
             chunks[0][0],
@@ -412,7 +409,6 @@ class TestSamsaraUtilizationFetcherTripOrdering:
         )
         trip_b2 = _make_trip(
             '00000000-0000-0000-0000-000000001004',
-            v_b.vehicle_id,
             '1000002',
             chunks[1][0],
             chunks[1][0],
@@ -433,12 +429,22 @@ class TestSamsaraUtilizationFetcherTripOrdering:
 
         bundle = fetcher.fetch(_MAY_14, _JUN_12)
 
-        # Vehicle A's trips precede vehicle B's; within each vehicle,
-        # chunk 0 precedes chunk 1.
-        assert bundle.trips[0] is trip_a1
-        assert bundle.trips[1] is trip_a2
-        assert bundle.trips[2] is trip_b1
-        assert bundle.trips[3] is trip_b2
+        # Bundle.trips is now list[VehicleTrip]; the inner Trip is
+        # identity-equal to the canned record and the wrapper is
+        # stamped with the queried vehicle_id.
+        assert all(isinstance(item, VehicleTrip) for item in bundle.trips)
+        assert [vt.trip for vt in bundle.trips] == [
+            trip_a1,
+            trip_a2,
+            trip_b1,
+            trip_b2,
+        ]
+        assert [vt.vehicle_id for vt in bundle.trips] == [
+            v_a.vehicle_id,
+            v_a.vehicle_id,
+            v_b.vehicle_id,
+            v_b.vehicle_id,
+        ]
 
 
 class TestSamsaraUtilizationFetcherEmptyResults:
