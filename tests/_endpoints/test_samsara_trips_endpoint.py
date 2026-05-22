@@ -14,6 +14,7 @@ vehicle IDs, or trip UUIDs from any production fleet appear in this
 file.
 """
 
+import logging
 from datetime import UTC, datetime
 from typing import Any
 
@@ -90,7 +91,9 @@ TRIPS_FIXTURE: dict[str, Any] = {
             'distanceMeters': _TRIP_B_DISTANCE_METERS,
         },
     ],
-    'pagination': {'endCursor': '', 'hasNextPage': False},
+    # No ``pagination`` key: the legacy /v1/fleet/trips endpoint does
+    # not return pagination metadata; everything for the queried
+    # vehicle/window comes back in one response.
 }
 
 
@@ -255,10 +258,10 @@ class TestSamsaraTripsEndpointDefinition:
 
         assert SamsaraEndpoints.TRIPS.http_method == HTTPMethod.GET
 
-    def test_endpoint_is_paginated(self) -> None:
-        """Should be marked paginated."""
+    def test_endpoint_is_not_paginated(self) -> None:
+        """The legacy /v1/fleet/trips endpoint does not paginate."""
 
-        assert SamsaraEndpoints.TRIPS.is_paginated is True
+        assert SamsaraEndpoints.TRIPS.is_paginated is False
 
     def test_response_model_and_item_extractor(self) -> None:
         """Should wire TripsResponse and the uniform get_items extractor."""
@@ -325,3 +328,61 @@ class TestSamsaraTripsRegistryResolution:
         assert isinstance(endpoint, SamsaraEndpointDefinition)
         assert endpoint is SamsaraEndpoints.TRIPS
         assert endpoint.endpoint_path == '/v1/fleet/trips'
+
+
+class TestPaginationMetadataWarning:
+    """The missing-pagination WARNING fires only for endpoints that declare paginated."""
+
+    _REQUESTS_LOGGER = 'fleet_telemetry_hub.models.samsara_requests'
+    _WARNING_NEEDLE = 'Expected pagination metadata'
+
+    def test_non_paginated_endpoint_without_metadata_is_silent(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """``TRIPS`` (non-paginated) + payload with no ``pagination`` key -> no WARNING."""
+
+        with caplog.at_level(logging.WARNING, logger=self._REQUESTS_LOGGER):
+            SamsaraEndpoints.TRIPS.parse_response(TRIPS_FIXTURE)
+
+        assert not any(
+            self._WARNING_NEEDLE in record.message for record in caplog.records
+        )
+
+    def test_paginated_endpoint_without_metadata_emits_warning(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A paginated endpoint receiving a response without metadata still warns."""
+
+        # VEHICLES is paginated and its response model carries an
+        # optional ``pagination`` field, so omitting the key produces
+        # the exact scenario the WARNING was designed to surface.
+        vehicles_payload: dict[str, Any] = {'data': []}
+
+        with caplog.at_level(logging.WARNING, logger=self._REQUESTS_LOGGER):
+            SamsaraEndpoints.VEHICLES.parse_response(vehicles_payload)
+
+        warn_records = [
+            record
+            for record in caplog.records
+            if self._WARNING_NEEDLE in record.message
+        ]
+        assert len(warn_records) == 1
+        # The WARNING includes the offending endpoint's path.
+        assert SamsaraEndpoints.VEHICLES.endpoint_path in warn_records[0].message
+
+    def test_paginated_endpoint_with_metadata_is_silent(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Pagination present on a paginated endpoint -> no WARNING (regression guard)."""
+
+        vehicles_payload: dict[str, Any] = {
+            'data': [],
+            'pagination': {'endCursor': '', 'hasNextPage': False},
+        }
+
+        with caplog.at_level(logging.WARNING, logger=self._REQUESTS_LOGGER):
+            SamsaraEndpoints.VEHICLES.parse_response(vehicles_payload)
+
+        assert not any(
+            self._WARNING_NEEDLE in record.message for record in caplog.records
+        )

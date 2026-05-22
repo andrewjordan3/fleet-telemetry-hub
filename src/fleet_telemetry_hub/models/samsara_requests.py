@@ -559,12 +559,14 @@ class SamsaraEndpoints:
         endpoint_path='/v1/fleet/trips',
         http_method=HTTPMethod.GET,
         description=(
-            'Per-vehicle trip records (driver, vehicle, time bounds, distance) '
-            'for a time window. Callers must loop over active vehicles -- the '
+            'Per-vehicle trip records (driver, time bounds, distance) for a '
+            'time window. Callers must loop over active vehicles -- the '
             'endpoint accepts only a single vehicleId per call, not a list. '
-            'Time bounds are integer Unix epoch-milliseconds; the response '
-            'also carries odometer, coordinate, address, and tag fields '
-            'that are intentionally not modeled in V1.'
+            'Time bounds are integer Unix epoch-milliseconds. This legacy '
+            '/v1/ endpoint does not paginate: a single response carries '
+            'every trip for the queried vehicle/window. The response also '
+            'carries odometer, coordinate, address, and tag fields that '
+            'are intentionally not modeled in V1.'
         ),
         query_parameters=(
             QueryParameterSpec(
@@ -593,7 +595,7 @@ class SamsaraEndpoints:
                 description='End of time range (integer Unix epoch-milliseconds)',
             ),
         ),
-        is_paginated=True,
+        is_paginated=False,
         response_model=TripsResponse,
         item_extractor_method='get_items',
     )
