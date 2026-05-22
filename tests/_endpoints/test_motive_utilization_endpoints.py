@@ -27,6 +27,8 @@ fleet appear in this file.
 from datetime import UTC, date, datetime
 from typing import Any
 
+import pytest
+from pydantic import ValidationError
 from pydantic.main import BaseModel
 
 from fleet_telemetry_hub.models import EndpointDefinition
@@ -1085,3 +1087,149 @@ class TestIdleEventConvenienceProperties:
         first = items[0]
         expected = _FIRST_IDLE_RAW['veh_fuel_end'] - _FIRST_IDLE_RAW['veh_fuel_start']
         assert abs(first.fuel_consumed - expected) < _FUEL_DELTA_TOLERANCE
+
+
+# A minimal valid ``DriverSummary`` payload used by the audit tests
+# below. Kept inline rather than promoted to a module-level fixture
+# because only the drift tests need it.
+_BASE_DRIVER_SUMMARY_RAW: dict[str, Any] = {
+    'id': 9000099,
+    'first_name': 'Drift',
+    'last_name': 'Tester',
+    'username': 'drift.tester',
+    'email': 'drift.tester@example.com',
+    'driver_company_id': 'TEST-DRIFT',
+    'status': 'active',
+    'role': 'driver',
+}
+
+
+class TestMotiveModelDriftRegressions:
+    """Confirmed-shape regressions surfaced by the live ``/v1/driving_periods`` run."""
+
+    def test_driving_period_accepts_int_annotation_status(self) -> None:
+        """Live API emits ``annotation_status`` as an int (e.g. 1); model must accept."""
+
+        payload = dict(_THIRD_PERIOD_RAW)
+        payload['annotation_status'] = 1
+
+        parsed = DrivingPeriod.model_validate(payload)
+
+        assert parsed.annotation_status == 1
+
+    def test_driving_period_accepts_null_source(self) -> None:
+        """Live API emits ``source: null`` on some records; model must accept."""
+
+        payload = dict(_THIRD_PERIOD_RAW)
+        payload['source'] = None
+
+        parsed = DrivingPeriod.model_validate(payload)
+
+        assert parsed.source is None
+
+
+class TestMotiveModelDriftAuditCoverage:
+    """Audit-pass coverage: previously-strict unused fields now widen to nullable."""
+
+    @pytest.mark.parametrize('field_name', ['status', 'type', 'duration'])
+    def test_driving_period_accepts_null_in_unused_strict_fields(
+        self, field_name: str
+    ) -> None:
+        """Newly-nullable unused fields on ``DrivingPeriod`` accept ``None``."""
+
+        payload = dict(_THIRD_PERIOD_RAW)
+        payload[field_name] = None
+
+        parsed = DrivingPeriod.model_validate(payload)
+
+        assert getattr(parsed, field_name) is None
+
+    @pytest.mark.parametrize(
+        'field_name',
+        [
+            'veh_fuel_start',
+            'veh_fuel_end',
+            'lat',
+            'lon',
+            'city',
+            'state',
+            'rg_brg',
+            'rg_km',
+            'rg_match',
+            'end_type',
+            'eld_device',
+            'location',
+        ],
+    )
+    def test_idle_event_accepts_null_in_unused_strict_fields(
+        self, field_name: str
+    ) -> None:
+        """Newly-nullable unused fields on ``IdleEvent`` accept ``None``."""
+
+        payload = dict(_THIRD_IDLE_RAW)
+        payload[field_name] = None
+
+        parsed = IdleEvent.model_validate(payload)
+
+        assert getattr(parsed, field_name) is None
+
+    @pytest.mark.parametrize(
+        'status_value', ['supervisor', 'fleet_manager_advanced', 'archived']
+    )
+    def test_driver_summary_accepts_arbitrary_status(self, status_value: str) -> None:
+        """``DriverSummary.status`` accepts strings outside the historical enum set."""
+
+        payload = dict(_BASE_DRIVER_SUMMARY_RAW)
+        payload['status'] = status_value
+
+        parsed = DriverSummary.model_validate(payload)
+
+        assert parsed.status == status_value
+
+    @pytest.mark.parametrize(
+        'role_value', ['supervisor', 'fleet_manager_advanced', 'archived']
+    )
+    def test_driver_summary_accepts_arbitrary_role(self, role_value: str) -> None:
+        """``DriverSummary.role`` accepts strings outside the historical enum set."""
+
+        payload = dict(_BASE_DRIVER_SUMMARY_RAW)
+        payload['role'] = role_value
+
+        parsed = DriverSummary.model_validate(payload)
+
+        assert parsed.role == role_value
+
+
+class TestMotiveModelDriftConsumedFieldsStrictness:
+    """Fields the unifier consumes stay strict -- loud failure on drift is intentional."""
+
+    @pytest.mark.parametrize(
+        'field_name',
+        ['period_id', 'start_time', 'end_time', 'start_kilometers', 'end_kilometers'],
+    )
+    def test_driving_period_rejects_null_in_consumed_fields(
+        self, field_name: str
+    ) -> None:
+        """Setting a unifier-consumed ``DrivingPeriod`` field to None raises."""
+
+        # The alias for ``period_id`` is ``id``; the rest use the same
+        # snake_case key as the attribute name.
+        payload = dict(_THIRD_PERIOD_RAW)
+        payload_key = 'id' if field_name == 'period_id' else field_name
+        payload[payload_key] = None
+
+        with pytest.raises(ValidationError):
+            DrivingPeriod.model_validate(payload)
+
+    @pytest.mark.parametrize('field_name', ['event_id', 'start_time', 'end_time'])
+    def test_idle_event_rejects_null_in_consumed_fields(
+        self, field_name: str
+    ) -> None:
+        """Setting a unifier-consumed ``IdleEvent`` field to None raises."""
+
+        payload = dict(_THIRD_IDLE_RAW)
+        payload_key = 'id' if field_name == 'event_id' else field_name
+        payload[payload_key] = None
+
+        with pytest.raises(ValidationError):
+            IdleEvent.model_validate(payload)
