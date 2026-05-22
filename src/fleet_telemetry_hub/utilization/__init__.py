@@ -9,6 +9,7 @@ from fleet_telemetry_hub.utilization.samsara_fetcher import (
     SamsaraUtilizationBundle,
     SamsaraUtilizationFetcher,
 )
+from fleet_telemetry_hub.utilization.vehicle_trip import VehicleTrip
 
 __all__: list[str] = [
     'MotiveUtilizationBundle',
@@ -16,4 +17,5 @@ __all__: list[str] = [
     'SamsaraUtilizationBundle',
     'SamsaraUtilizationFetcher',
     'UtilizationFetcher',
+    'VehicleTrip',
 ]

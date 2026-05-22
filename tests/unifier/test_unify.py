@@ -33,6 +33,7 @@ from fleet_telemetry_hub.unifier.schema import COLUMNS, DTYPES
 from fleet_telemetry_hub.unifier.unify import unify
 from fleet_telemetry_hub.utilization.motive_fetcher import MotiveUtilizationBundle
 from fleet_telemetry_hub.utilization.samsara_fetcher import SamsaraUtilizationBundle
+from fleet_telemetry_hub.utilization.vehicle_trip import VehicleTrip
 
 _MAY_14 = date(2026, 5, 14)
 _MAY_20 = date(2026, 5, 20)
@@ -227,21 +228,22 @@ def _make_trip(  # noqa: PLR0913 -- test factory; one knob per field
     start: datetime | None = None,
     end: datetime | None = None,
     distance_meters: int = 1609,
-) -> Trip:
+) -> VehicleTrip:
+    """Build a ``VehicleTrip`` -- the wrapper the Samsara bundle's trips list now holds."""
     if start is None:
         start = _at(hour=8)
     if end is None:
         end = _at(hour=9)
-    return Trip.model_validate(
+    trip = Trip.model_validate(
         {
             'id': trip_id,
-            'vehicleId': vehicle_id,
             'driverId': driver_id,
             'startMs': int(start.timestamp() * 1000),
             'endMs': int(end.timestamp() * 1000),
             'distanceMeters': distance_meters,
         }
     )
+    return VehicleTrip.from_trip(trip, vehicle_id)
 
 
 def _make_idling_event(
