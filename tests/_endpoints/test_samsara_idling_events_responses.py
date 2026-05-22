@@ -17,6 +17,9 @@ file.
 from datetime import datetime
 from typing import Any
 
+import pytest
+from pydantic import ValidationError
+
 from fleet_telemetry_hub.models.samsara_responses import (
     IdlingAsset,
     IdlingEvent,
@@ -238,3 +241,77 @@ class TestIdlingFuelCostDirectInstantiation:
 
         assert isinstance(cost.amount, float)
         assert cost.amount == float_amount
+
+
+class TestIdlingEventMissingOperator:
+    """Samsara omits the ``operator`` key for unattributed idle events."""
+
+    def test_idling_event_accepts_missing_operator_key(self) -> None:
+        """The actual production failure shape: ``operator`` key absent entirely."""
+
+        payload = dict(_FIRST_EVENT)
+        # Confirm the fixture has the key today (regression guard if
+        # someone changes the base fixture later), then drop it.
+        assert 'operator' in payload
+        del payload['operator']
+
+        parsed = IdlingEvent.model_validate(payload)
+
+        assert parsed.operator is None
+
+    def test_idling_event_accepts_explicit_null_operator(self) -> None:
+        """Explicit ``operator: null`` (key present, value null) also parses."""
+
+        payload = dict(_FIRST_EVENT)
+        payload['operator'] = None
+
+        parsed = IdlingEvent.model_validate(payload)
+
+        assert parsed.operator is None
+
+
+class TestIdlingEventDriftAuditCoverage:
+    """Strict-but-unused ``IdlingEvent`` fields accept null after the audit pass."""
+
+    @pytest.mark.parametrize(
+        ('field_name', 'expected_attr'),
+        [
+            ('fuelConsumedMilliliters', 'fuel_consumed_milliliters'),
+            ('fuelCost', 'fuel_cost'),
+            ('gaseousFuelConsumedGrams', 'gaseous_fuel_consumed_grams'),
+            ('gaseousFuelCost', 'gaseous_fuel_cost'),
+            ('ptoState', 'pto_state'),
+            ('latitude', 'latitude'),
+            ('longitude', 'longitude'),
+        ],
+    )
+    def test_idling_event_accepts_null_in_unused_strict_fields(
+        self, field_name: str, expected_attr: str
+    ) -> None:
+        """Each newly-nullable unused field accepts ``None``."""
+
+        payload = dict(_FIRST_EVENT)
+        payload[field_name] = None
+
+        parsed = IdlingEvent.model_validate(payload)
+
+        assert getattr(parsed, expected_attr) is None
+
+
+class TestIdlingEventConsumedFieldsStrictness:
+    """Fields the unifier consumes stay strict -- loud failure on drift is intentional."""
+
+    @pytest.mark.parametrize(
+        'field_name',
+        ['startTime', 'durationMilliseconds', 'eventUuid', 'asset'],
+    )
+    def test_idling_event_rejects_null_in_consumed_fields(
+        self, field_name: str
+    ) -> None:
+        """Setting a unifier-consumed ``IdlingEvent`` field to ``None`` raises."""
+
+        payload = dict(_FIRST_EVENT)
+        payload[field_name] = None
+
+        with pytest.raises(ValidationError):
+            IdlingEvent.model_validate(payload)

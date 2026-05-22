@@ -9,6 +9,7 @@ keyword overrides for the fields each test cares about.
 
 import logging
 from datetime import UTC, date, datetime, timedelta
+from typing import Any
 
 import pytest
 
@@ -86,13 +87,14 @@ def _make_trip(  # noqa: PLR0913 -- test factory; one knob per field
     driver_id: str | None = _DRIVER_SAM_ID,
     start_dt: datetime | None = None,
     end_dt: datetime | None = None,
-    distance_meters: int = _ONE_MILE_IN_METERS,
+    distance_meters: int | None = _ONE_MILE_IN_METERS,
 ) -> VehicleTrip:
     """
     Build a ``VehicleTrip`` -- the wrapper the bundle's ``trips`` list
     actually holds. The inner ``Trip`` has no ``vehicleId`` in the API
     response shape; the queried ``vehicle_id`` is stamped on the
-    wrapper instead.
+    wrapper instead. Pass ``distance_meters=None`` to exercise the
+    unifier's null-distance soft-fallback path.
     """
     if start_dt is None:
         start_dt = _at(hour=8)
@@ -118,34 +120,39 @@ def _make_idling_event(  # noqa: PLR0913 -- test factory; one knob per field
     start_dt: datetime | None = None,
     duration_ms: int = 30 * 60 * 1000,  # 30 minutes
     pto_state: str = 'inactive',
+    null_operator: bool = False,
 ) -> IdlingEvent:
     """
     Construct a valid ``IdlingEvent`` with sensible defaults.
 
-    Idling events have several required nested objects (asset, operator,
-    fuel_cost, gaseous_fuel_cost) and several required scalar fields
-    (latitude, longitude, fuel/gaseous fuel consumption, pto_state).
-    Defaults pin those to harmless test values so each behavioral test
-    only has to override the field it cares about.
+    Defaults pin every nested object and required scalar so each
+    behavioral test only has to override the field it cares about.
+
+    ``null_operator=True`` omits the ``operator`` key entirely from
+    the payload (mirroring the actual production shape for
+    unattributed idle events) so the unifier's missing-operator
+    handling path can be exercised. Use this rather than passing
+    ``operator: None`` -- the unifier path is identical, but the
+    key-absent shape is what the live API actually sends.
     """
     if start_dt is None:
         start_dt = _at(hour=10)
-    return IdlingEvent.model_validate(
-        {
-            'asset': {'id': vehicle_id},
-            'durationMilliseconds': duration_ms,
-            'eventUuid': event_uuid,
-            'fuelConsumedMilliliters': 0.5,
-            'fuelCost': {'amount': '0.66', 'currency': 'usd'},
-            'gaseousFuelConsumedGrams': 0,
-            'gaseousFuelCost': {'amount': '0', 'currency': 'usd'},
-            'operator': {'id': operator_id},
-            'ptoState': pto_state,
-            'startTime': start_dt.isoformat().replace('+00:00', 'Z'),
-            'latitude': 30.0,
-            'longitude': -90.0,
-        }
-    )
+    payload: dict[str, Any] = {
+        'asset': {'id': vehicle_id},
+        'durationMilliseconds': duration_ms,
+        'eventUuid': event_uuid,
+        'fuelConsumedMilliliters': 0.5,
+        'fuelCost': {'amount': '0.66', 'currency': 'usd'},
+        'gaseousFuelConsumedGrams': 0,
+        'gaseousFuelCost': {'amount': '0', 'currency': 'usd'},
+        'ptoState': pto_state,
+        'startTime': start_dt.isoformat().replace('+00:00', 'Z'),
+        'latitude': 30.0,
+        'longitude': -90.0,
+    }
+    if not null_operator:
+        payload['operator'] = {'id': operator_id}
+    return IdlingEvent.model_validate(payload)
 
 
 def _make_bundle(  # noqa: PLR0913 -- bundles mirror the six SamsaraUtilizationBundle fields
@@ -811,3 +818,148 @@ class TestFinalInfoLog:
         assert 'unknown_vin_fallbacks' in message
         assert 'unresolvable_drivers' in message
         assert 'non_positive_durations_dropped' in message
+        assert 'null_distance_meters_fallback' in message
+
+
+class TestIdlingEventMissingOperator:
+    """Samsara omits the ``operator`` block for unattributed idle events."""
+
+    def test_idling_event_with_missing_operator_emits_row(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """No operator + no overlapping trip -> row emitted with null driver fields."""
+
+        vehicles = [_make_vehicle()]
+        drivers = [_make_driver()]
+        idling = _make_idling_event(null_operator=True)
+
+        with caplog.at_level(logging.WARNING):
+            rows = transform_samsara_bundle(
+                _make_bundle(
+                    vehicles=vehicles, drivers=drivers, idling_events=[idling]
+                )
+            )
+
+        assert len(rows) == 1
+        row = rows[0]
+        assert row.event_type is EventType.IDLE
+        assert row.driver_id is None
+        assert row.driver_name is None
+        # No "missing operator" warning fired -- matches Motive's
+        # ``IdleEvent.driver is None`` quiet path.
+        assert not any(
+            'missing operator' in record.message.lower()
+            or 'null operator' in record.message.lower()
+            for record in caplog.records
+        )
+
+    def test_idling_event_with_missing_operator_gap_fills_from_overlapping_trip(
+        self,
+    ) -> None:
+        """Missing operator + covering trip -> idle row picks up the trip's driver."""
+
+        vehicles = [_make_vehicle()]
+        drivers = [_make_driver()]
+        idling = _make_idling_event(
+            null_operator=True,
+            start_dt=_at(hour=10),
+            duration_ms=30 * 60 * 1000,
+        )
+        # Sam's trip overlaps the idling window entirely.
+        covering_trip = _make_trip(start_dt=_at(hour=10), end_dt=_at(hour=11))
+
+        rows = transform_samsara_bundle(
+            _make_bundle(
+                vehicles=vehicles,
+                drivers=drivers,
+                trips=[covering_trip],
+                idling_events=[idling],
+            )
+        )
+        idle_row = next(row for row in rows if row.event_type is EventType.IDLE)
+
+        assert idle_row.driver_id == _DRIVER_SAM_ID
+        assert idle_row.driver_name == _DRIVER_SAM_NAME
+
+
+class TestTripNullDistanceMetersSoftFallback:
+    """Null ``distance_meters`` triggers the soft-fallback path, not a drop."""
+
+    def test_trip_with_null_distance_meters_emits_row_with_null_distance(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Null distance -> row emitted with ``distance_miles=None`` + WARNING fires."""
+
+        vehicles = [_make_vehicle()]
+        drivers = [_make_driver()]
+        trip = _make_trip(distance_meters=None)
+
+        with caplog.at_level(logging.WARNING):
+            rows = transform_samsara_bundle(
+                _make_bundle(vehicles=vehicles, drivers=drivers, trips=[trip])
+            )
+
+        assert len(rows) == 1
+        row = rows[0]
+        assert row.event_type is EventType.DRIVING
+        assert row.distance_miles is None
+        # Other fields are still populated from the trip.
+        assert row.vin == _VIN_A
+        assert row.driver_id == _DRIVER_SAM_ID
+        warn_records = [
+            record
+            for record in caplog.records
+            if 'null distance_meters' in record.message
+        ]
+        assert len(warn_records) == 1
+
+    def test_null_distance_meters_increments_counter_in_final_log(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Final INFO log reports ``null_distance_meters_fallback`` was incremented."""
+
+        vehicles = [_make_vehicle()]
+        drivers = [_make_driver()]
+        trip = _make_trip(distance_meters=None)
+
+        with caplog.at_level(
+            logging.INFO, logger='fleet_telemetry_hub.unifier.samsara_transform'
+        ):
+            transform_samsara_bundle(
+                _make_bundle(vehicles=vehicles, drivers=drivers, trips=[trip])
+            )
+
+        complete_records = [
+            record
+            for record in caplog.records
+            if 'Samsara transform complete' in record.message
+        ]
+        assert len(complete_records) == 1
+        assert "'null_distance_meters_fallback': 1" in complete_records[0].message
+
+    def test_trip_with_present_distance_meters_does_not_increment_counter(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A normal trip leaves the counter at ``0`` and emits no fallback WARNING."""
+
+        vehicles = [_make_vehicle()]
+        drivers = [_make_driver()]
+        trip = _make_trip()  # default distance_meters is _ONE_MILE_IN_METERS
+
+        with caplog.at_level(
+            logging.INFO, logger='fleet_telemetry_hub.unifier.samsara_transform'
+        ):
+            transform_samsara_bundle(
+                _make_bundle(vehicles=vehicles, drivers=drivers, trips=[trip])
+            )
+
+        complete_records = [
+            record
+            for record in caplog.records
+            if 'Samsara transform complete' in record.message
+        ]
+        assert len(complete_records) == 1
+        assert "'null_distance_meters_fallback': 0" in complete_records[0].message
+        assert not any(
+            'null distance_meters' in record.message for record in caplog.records
+        )

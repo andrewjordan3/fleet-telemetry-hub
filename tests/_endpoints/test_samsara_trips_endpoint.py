@@ -174,7 +174,11 @@ class TestTripModelParsing:
 
     @pytest.mark.parametrize(
         'missing_key',
-        ['startMs', 'endMs', 'distanceMeters'],
+        # ``distanceMeters`` was previously in this list; it is now
+        # nullable since the unifier emits a row with null distance
+        # rather than dropping the event when Samsara does not
+        # report a trip distance.
+        ['startMs', 'endMs'],
     )
     def test_missing_required_field_raises_validation_error(
         self, missing_key: str
@@ -386,3 +390,50 @@ class TestPaginationMetadataWarning:
         assert not any(
             self._WARNING_NEEDLE in record.message for record in caplog.records
         )
+
+
+class TestTripNullDistanceMeters:
+    """``Trip.distance_meters`` widened to ``int | None`` for soft-fallback handling."""
+
+    @staticmethod
+    def _base_payload() -> dict[str, Any]:
+        """Build a minimal-but-valid Trip payload (distanceMeters present, normal)."""
+        return {
+            'id': _TRIP_A_ID,
+            'driverId': _DRIVER_ID_INT,
+            'startMs': _TRIP_A_START_MS,
+            'endMs': _TRIP_A_END_MS,
+            'distanceMeters': _TRIP_A_DISTANCE_METERS,
+        }
+
+    def test_trip_accepts_null_distance_meters(self) -> None:
+        """``distanceMeters: null`` parses; ``distance_meters`` is ``None``."""
+
+        payload = self._base_payload()
+        payload['distanceMeters'] = None
+
+        parsed = Trip.model_validate(payload)
+
+        assert parsed.distance_meters is None
+
+    def test_trip_accepts_missing_distance_meters_key(self) -> None:
+        """``distanceMeters`` key entirely absent -> ``distance_meters`` is ``None``."""
+
+        payload = self._base_payload()
+        del payload['distanceMeters']
+
+        parsed = Trip.model_validate(payload)
+
+        assert parsed.distance_meters is None
+
+    @pytest.mark.parametrize('field_name', ['startMs', 'endMs'])
+    def test_trip_preserves_consumed_time_fields_strictness(
+        self, field_name: str
+    ) -> None:
+        """``startMs`` / ``endMs`` stay required even after the audit pass."""
+
+        payload = self._base_payload()
+        payload[field_name] = None
+
+        with pytest.raises(ValidationError):
+            Trip.model_validate(payload)

@@ -1293,20 +1293,44 @@ class IdlingEvent(SamsaraModelBase):
     ``airTemperatureMillicelsius`` is optional and may be omitted on
     individual events.
 
+    Samsara omits the ``operator`` block entirely for unattributed
+    idle events (truck idling with no driver logged in). The unifier
+    handles that case via gap-fill from overlapping trips on the
+    same vehicle, mirroring the Motive side's
+    ``IdleEvent.driver is None`` path. The strict-but-unused fields
+    below (fuel, geocode, PTO state, coordinates) are modeled
+    permissively so a single drift on a cosmetic field cannot kill
+    the whole page during validation.
+
     Attributes:
         air_temperature_millicelsius: Ambient temperature in millicelsius if reported.
         asset: Asset/vehicle reference.
         duration_milliseconds: Event duration in milliseconds.
         event_uuid: Stable UUID for the event.
-        fuel_consumed_milliliters: Liquid fuel consumed during idling.
-        fuel_cost: Estimated liquid fuel cost.
-        gaseous_fuel_consumed_grams: Gaseous fuel consumed during idling.
-        gaseous_fuel_cost: Estimated gaseous fuel cost.
-        operator: Driver assigned at the time of the event.
-        pto_state: Power take-off state (e.g. "inactive").
+        fuel_consumed_milliliters: Liquid fuel consumed during
+            idling. May be null. Not consumed by the unifier;
+            modeled permissively. Fuel data is handled by a
+            separate authoritative pipeline.
+        fuel_cost: Estimated liquid fuel cost. May be null. Not
+            consumed by the unifier; modeled permissively.
+        gaseous_fuel_consumed_grams: Gaseous fuel consumed during
+            idling. May be null. Not consumed by the unifier;
+            modeled permissively.
+        gaseous_fuel_cost: Estimated gaseous fuel cost. May be null.
+            Not consumed by the unifier; modeled permissively.
+        operator: Driver assigned at the time of the event. Samsara
+            omits the operator block entirely for unattributed idle
+            events (truck idling with no driver logged in); the
+            unifier handles this case via gap-fill from overlapping
+            trips, same as the Motive side.
+        pto_state: Power take-off state (e.g. ``"inactive"``). May
+            be null. Not consumed by the unifier; modeled
+            permissively.
         start_time: Event start timestamp.
-        latitude: Event location latitude.
-        longitude: Event location longitude.
+        latitude: Event location latitude. May be null. Not
+            consumed by the unifier; modeled permissively.
+        longitude: Event location longitude. May be null. Not
+            consumed by the unifier; modeled permissively.
     """
 
     air_temperature_millicelsius: int | None = Field(
@@ -1316,15 +1340,21 @@ class IdlingEvent(SamsaraModelBase):
     asset: IdlingAsset
     duration_milliseconds: int = Field(alias='durationMilliseconds')
     event_uuid: str = Field(alias='eventUuid')
-    fuel_consumed_milliliters: float = Field(alias='fuelConsumedMilliliters')
-    fuel_cost: IdlingFuelCost = Field(alias='fuelCost')
-    gaseous_fuel_consumed_grams: int = Field(alias='gaseousFuelConsumedGrams')
-    gaseous_fuel_cost: IdlingFuelCost = Field(alias='gaseousFuelCost')
-    operator: IdlingOperator
-    pto_state: str = Field(alias='ptoState')
+    fuel_consumed_milliliters: float | None = Field(
+        default=None, alias='fuelConsumedMilliliters'
+    )
+    fuel_cost: IdlingFuelCost | None = Field(default=None, alias='fuelCost')
+    gaseous_fuel_consumed_grams: int | None = Field(
+        default=None, alias='gaseousFuelConsumedGrams'
+    )
+    gaseous_fuel_cost: IdlingFuelCost | None = Field(
+        default=None, alias='gaseousFuelCost'
+    )
+    operator: IdlingOperator | None = Field(default=None, alias='operator')
+    pto_state: str | None = Field(default=None, alias='ptoState')
     start_time: datetime = Field(alias='startTime')
-    latitude: float
-    longitude: float
+    latitude: float | None = None
+    longitude: float | None = None
 
 
 class IdlingEventsResponse(SamsaraModelBase):
@@ -1367,6 +1397,10 @@ class Trip(SamsaraModelBase):
     for downstream consumers; this model itself stays a faithful
     reflection of the on-wire shape.
 
+    ``distance_meters`` can be null when Samsara did not report a
+    distance for the trip; the unifier emits the row with null
+    ``distance_miles`` in that case rather than dropping the event.
+
     Other fields the Samsara API returns on this endpoint
     (``startOdometer`` / ``endOdometer``, ``startCoordinates`` /
     ``endCoordinates``, addresses, tags) are intentionally not
@@ -1385,14 +1419,16 @@ class Trip(SamsaraModelBase):
         end_time: Trip end as a tz-aware UTC datetime, parsed from
             ``endMs``.
         distance_meters: Trip distance in meters, pass-through with
-            no unit conversion at the model layer.
+            no unit conversion at the model layer. Null when Samsara
+            did not report a distance for the trip; the unifier
+            emits the row with null distance in that case.
     """
 
     trip_id: str | None = Field(default=None, alias='id')
     driver_id: str | None = Field(default=None, alias='driverId')
     start_time: datetime = Field(alias='startMs')
     end_time: datetime = Field(alias='endMs')
-    distance_meters: int = Field(alias='distanceMeters')
+    distance_meters: int | None = Field(default=None, alias='distanceMeters')
 
     @field_validator('driver_id', mode='before')
     @classmethod
