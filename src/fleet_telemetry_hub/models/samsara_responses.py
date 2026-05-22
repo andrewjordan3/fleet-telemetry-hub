@@ -444,7 +444,7 @@ class SamsaraVehicle(SamsaraModelBase):
         default=None,
         alias='vehicleRegulationMode',
     )
-    harsh_acceleration_setting_type: HarshAccelerationSettingType | None = Field(
+    harsh_acceleration_setting_type: str | None = Field(
         default=None,
         alias='harshAccelerationSettingType',
     )
@@ -1402,14 +1402,14 @@ class TripsResponse(SamsaraModelBase):
     Complete response from GET /v1/fleet/trips.
 
     Attributes:
-        data: List of trip records for the queried vehicle and
+        trips: List of trip records for the queried vehicle and
             time window.
         pagination: Cursor-based pagination metadata.
     """
 
-    data: list[Trip]
+    trips: list[Trip]
     pagination: SamsaraPaginationInfo | None = None
 
     def get_items(self) -> list[Trip]:
         """Extract trip list (uniform interface method)."""
-        return self.data
+        return self.trips
