@@ -1388,6 +1388,24 @@ class Trip(SamsaraModelBase):
     end_time: datetime = Field(alias='endMs')
     distance_meters: int = Field(alias='distanceMeters')
 
+    @field_validator('driver_id', mode='before')
+    @classmethod
+    def _coerce_driver_id(cls, value: int | str | None) -> str | None:
+        """
+        Coerce raw ``driverId`` values to ``str | None``.
+
+        Samsara's ``/v1/fleet/trips`` endpoint returns ``driverId`` as
+        an integer (e.g. ``7046697``). We coerce to string form to
+        match the rest of the codebase's driver-id convention. ``None``
+        passes through as ``None``; string input passes through
+        unchanged. Any null-equivalent semantics (empty, ``'unknown'``,
+        etc.) are handled by the unifier's text-normalization layer,
+        not here.
+        """
+        if value is None:
+            return None
+        return str(value)
+
     @field_validator('start_time', 'end_time', mode='before')
     @classmethod
     def _coerce_epoch_ms_to_datetime(cls, value: int | datetime) -> datetime:

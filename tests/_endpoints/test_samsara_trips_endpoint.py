@@ -47,7 +47,11 @@ _TRIP_A_ID = '00000000-0000-0000-0000-000000001001'
 _TRIP_B_ID = '00000000-0000-0000-0000-000000001002'
 
 _VEHICLE_ID = '999999900000001'
-_DRIVER_ID = '1000001'
+# Samsara returns ``driverId`` as an integer; the Trip model coerces
+# to string. Both forms are kept here so assertions can read against
+# the post-coercion value while the fixture uses the on-wire shape.
+_DRIVER_ID_INT = 7046697
+_DRIVER_ID_STR = str(_DRIVER_ID_INT)
 
 _EXPECTED_TRIP_COUNT = 2
 _TRIP_A_DISTANCE_METERS = 12500
@@ -58,15 +62,24 @@ TRIPS_FIXTURE: dict[str, Any] = {
         {
             'id': _TRIP_A_ID,
             'vehicleId': _VEHICLE_ID,
-            'driverId': _DRIVER_ID,
+            'driverId': _DRIVER_ID_INT,
             'startMs': _TRIP_A_START_MS,
             'endMs': _TRIP_A_END_MS,
             'distanceMeters': _TRIP_A_DISTANCE_METERS,
-            # Extras Samsara returns that V1 intentionally does not model.
-            'startOdometer': 100000,
-            'endOdometer': 100012,
-            'startCoordinates': {'latitude': 30.0, 'longitude': -90.0},
-            'endCoordinates': {'latitude': 30.1, 'longitude': -90.1},
+            # Extras Samsara returns that V1 intentionally does not model
+            # but that exercise the ``extra='ignore'`` config. Kept here
+            # so a future field-shape regression in pydantic or the base
+            # model would surface as a parse failure.
+            'startLocation': 'Roselawn Street, Pomona, CA',
+            'endLocation': 'Lowell Avenue, Claremont, CA',
+            'startCoordinates': {'latitude': 34.056405, 'longitude': -117.791372},
+            'endCoordinates': {'latitude': 34.114833, 'longitude': -117.711276},
+            'fuelConsumedMl': 6000,
+            'tollMeters': 0,
+            'codriverIds': [],
+            'startOdometer': 123933425,
+            'endOdometer': 123947925,
+            'assetIds': [],
         },
         {
             'id': _TRIP_B_ID,
@@ -90,7 +103,7 @@ class TestTripModelParsing:
         trip = Trip.model_validate(TRIPS_FIXTURE['data'][0])
 
         assert trip.trip_id == _TRIP_A_ID
-        assert trip.driver_id == _DRIVER_ID
+        assert trip.driver_id == _DRIVER_ID_STR
         assert trip.vehicle_id == _VEHICLE_ID
         assert trip.distance_meters == _TRIP_A_DISTANCE_METERS
 
@@ -126,9 +139,20 @@ class TestTripModelParsing:
 
         trip = Trip.model_validate(TRIPS_FIXTURE['data'][0])
 
-        assert not hasattr(trip, 'startOdometer')
-        assert not hasattr(trip, 'start_odometer')
-        assert not hasattr(trip, 'startCoordinates')
+        for unmodeled in (
+            'startLocation',
+            'endLocation',
+            'startCoordinates',
+            'endCoordinates',
+            'fuelConsumedMl',
+            'tollMeters',
+            'codriverIds',
+            'startOdometer',
+            'endOdometer',
+            'assetIds',
+            'start_odometer',
+        ):
+            assert not hasattr(trip, unmodeled)
 
     def test_datetime_input_passes_through(self) -> None:
         """Direct datetime input (vs. epoch-ms int) is accepted unchanged."""
@@ -136,7 +160,7 @@ class TestTripModelParsing:
         payload = {
             'id': _TRIP_A_ID,
             'vehicleId': _VEHICLE_ID,
-            'driverId': _DRIVER_ID,
+            'driverId': _DRIVER_ID_INT,
             'startMs': _TRIP_A_START_UTC,
             'endMs': _TRIP_A_END_UTC,
             'distanceMeters': _TRIP_A_DISTANCE_METERS,
@@ -161,6 +185,50 @@ class TestTripModelParsing:
 
         with pytest.raises(ValidationError):
             Trip.model_validate(payload)
+
+
+class TestTripDriverIdCoercion:
+    """``Trip._coerce_driver_id`` normalizes the on-wire shape to ``str | None``."""
+
+    @staticmethod
+    def _payload(driver_id_value: int | str | None) -> dict[str, Any]:
+        """Build a minimal-but-valid Trip payload with the given ``driverId`` value."""
+        return {
+            'id': _TRIP_A_ID,
+            'vehicleId': _VEHICLE_ID,
+            'driverId': driver_id_value,
+            'startMs': _TRIP_A_START_MS,
+            'endMs': _TRIP_A_END_MS,
+            'distanceMeters': _TRIP_A_DISTANCE_METERS,
+        }
+
+    def test_realistic_int_driver_id_is_coerced_to_string(self) -> None:
+        """A large int (the real Samsara shape) round-trips as its decimal string."""
+
+        trip = Trip.model_validate(self._payload(_DRIVER_ID_INT))
+
+        assert trip.driver_id == _DRIVER_ID_STR
+
+    def test_zero_int_driver_id_is_coerced_to_zero_string(self) -> None:
+        """``driverId=0`` is a plain coercion, not a sentinel for null."""
+
+        trip = Trip.model_validate(self._payload(0))
+
+        assert trip.driver_id == '0'
+
+    def test_none_driver_id_passes_through_as_none(self) -> None:
+        """``driverId=None`` is preserved (unattributed trip)."""
+
+        trip = Trip.model_validate(self._payload(None))
+
+        assert trip.driver_id is None
+
+    def test_string_driver_id_passes_through_unchanged(self) -> None:
+        """Defensive symmetry: an already-string id is not re-stringified."""
+
+        trip = Trip.model_validate(self._payload('1000001'))
+
+        assert trip.driver_id == '1000001'
 
 
 class TestTripsResponseShape:
@@ -242,7 +310,7 @@ class TestSamsaraTripsEndpointDefinition:
 
         assert len(parsed.items) == _EXPECTED_TRIP_COUNT
         assert all(isinstance(item, Trip) for item in parsed.items)
-        assert parsed.items[0].driver_id == _DRIVER_ID
+        assert parsed.items[0].driver_id == _DRIVER_ID_STR
         assert parsed.items[1].driver_id is None
 
 
