@@ -84,7 +84,7 @@ def _make_trip(  # noqa: PLR0913 -- test factory; one knob per field
     *,
     trip_id: str = '00000000-0000-0000-0000-000000001001',
     vehicle_id: str = _VEHICLE_A_ID,
-    driver_id: str | None = _DRIVER_SAM_ID,
+    driver_id: int | str | None = _DRIVER_SAM_ID,
     start_dt: datetime | None = None,
     end_dt: datetime | None = None,
     distance_meters: int | None = _ONE_MILE_IN_METERS,
@@ -963,3 +963,48 @@ class TestTripNullDistanceMetersSoftFallback:
         assert not any(
             'null distance_meters' in record.message for record in caplog.records
         )
+
+
+class TestTripDriverIdZeroSentinel:
+    """Samsara fills ``driverId=0`` for unattributed trips; the cascade is silent."""
+
+    def test_trip_with_driver_id_zero_emits_silent_row(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """``driverId=0`` -> row emitted with null driver fields, no WARNING, counter stays at 0.
+
+        Before the model-validator sentinel fix, a single ``driverId=0`` trip
+        would fire the ``driver name unresolvable`` WARNING directly via
+        ``_trip_to_row`` and again per-candidate from ``_gap_fill_idle_driver``.
+        With the validator normalizing ``0`` to ``None``, ``_resolve_driver``
+        short-circuits silently and the counter no longer increments.
+        """
+
+        vehicles = [_make_vehicle()]
+        drivers = [_make_driver()]
+        trip = _make_trip(driver_id=0)
+
+        with caplog.at_level(
+            logging.INFO, logger='fleet_telemetry_hub.unifier.samsara_transform'
+        ):
+            rows = transform_samsara_bundle(
+                _make_bundle(vehicles=vehicles, drivers=drivers, trips=[trip])
+            )
+
+        assert len(rows) == 1
+        row = rows[0]
+        assert row.driver_id is None
+        assert row.driver_name is None
+        # No "driver name unresolvable" WARNING fired.
+        assert not any(
+            'driver name unresolvable' in record.message for record in caplog.records
+        )
+        # The counter line in the final INFO log shows the soft channel
+        # untouched by this sentinel.
+        complete_records = [
+            record
+            for record in caplog.records
+            if 'Samsara transform complete' in record.message
+        ]
+        assert len(complete_records) == 1
+        assert "'unresolvable_drivers': 0" in complete_records[0].message

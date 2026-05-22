@@ -1434,17 +1434,24 @@ class Trip(SamsaraModelBase):
     @classmethod
     def _coerce_driver_id(cls, value: int | str | None) -> str | None:
         """
-        Coerce raw ``driverId`` values to ``str | None``.
+        Coerce raw ``driverId`` values to ``str | None``, applying the
+        documented null-driver sentinel.
 
-        Samsara's ``/v1/fleet/trips`` endpoint returns ``driverId`` as
-        an integer (e.g. ``7046697``). We coerce to string form to
-        match the rest of the codebase's driver-id convention. ``None``
-        passes through as ``None``; string input passes through
-        unchanged. Any null-equivalent semantics (empty, ``'unknown'``,
-        etc.) are handled by the unifier's text-normalization layer,
-        not here.
+        Samsara's ``/v1/fleet/trips`` documentation types ``driverId``
+        as a plain ``integer`` (not nullable). When a trip has no
+        attributed driver, the API fills the field with ``0`` rather
+        than omitting it or sending null. We treat ``0`` (and the
+        string form ``'0'``, for defensive symmetry) as the
+        null-driver sentinel and coerce to ``None``. Source: Samsara
+        API documentation for ``/v1/fleet/trips``.
+
+        Real driver IDs (e.g. ``7046697``) coerce to their decimal
+        string form to match the rest of the codebase's string-typed
+        driver-id convention. ``None`` passes through as ``None``.
+        Empty-string or other null-equivalent semantics are handled
+        by the unifier's text-normalization layer, not here.
         """
-        if value is None:
+        if value is None or value in {0, '0'}:
             return None
         return str(value)
 

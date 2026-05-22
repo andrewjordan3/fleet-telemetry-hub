@@ -213,12 +213,39 @@ class TestTripDriverIdCoercion:
 
         assert trip.driver_id == _DRIVER_ID_STR
 
-    def test_zero_int_driver_id_is_coerced_to_zero_string(self) -> None:
-        """``driverId=0`` is a plain coercion, not a sentinel for null."""
+    def test_zero_int_driver_id_coerces_to_none(self) -> None:
+        """Samsara fills ``driverId=0`` for trips with no attributed driver; the
+        validator normalizes this to ``None`` per the documented sentinel."""
 
         trip = Trip.model_validate(self._payload(0))
 
-        assert trip.driver_id == '0'
+        assert trip.driver_id is None
+
+    def test_zero_string_driver_id_coerces_to_none(self) -> None:
+        """Defensive symmetry: the string form ``'0'`` also maps to ``None``.
+
+        Not observed in production -- Samsara has only been seen sending the
+        integer ``0`` -- but the validator handles both forms consistently so a
+        future API serialization change doesn't reopen the
+        ``unresolvable_drivers`` noise channel.
+        """
+
+        trip = Trip.model_validate(self._payload('0'))
+
+        assert trip.driver_id is None
+
+    def test_other_falsy_string_does_not_coerce_to_none(self) -> None:
+        """Sanity check: only the literal ``'0'`` matches, not arbitrary
+        falsy-when-int strings.
+
+        Guards against a future refactor that swaps the literal comparison
+        for ``int(value) == 0`` or similar, which would over-eagerly nullify
+        ``'00'`` (a string distinct from ``'0'``).
+        """
+
+        trip = Trip.model_validate(self._payload('00'))
+
+        assert trip.driver_id == '00'
 
     def test_none_driver_id_passes_through_as_none(self) -> None:
         """``driverId=None`` is preserved (unattributed trip)."""
