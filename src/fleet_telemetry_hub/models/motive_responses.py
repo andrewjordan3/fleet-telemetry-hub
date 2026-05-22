@@ -192,8 +192,14 @@ class DriverSummary(ResponseModelBase):
         username: Login username (may be null if not set).
         email: Driver's email address.
         driver_company_id: Company-assigned driver ID (e.g., "12345-WXYZ").
-        status: Account status (active, inactive, deactivated).
-        role: User role (typically "driver" in this context).
+        status: Free-form account status string from the Motive API
+            (e.g. ``"active"``, ``"inactive"``, ``"deactivated"``).
+            Modeled as ``str`` rather than a constrained enum since
+            the API documents this as a plain String type, and the
+            unifier does not consume the field.
+        role: Free-form user role string (typically ``"driver"`` in
+            this context). Modeled as ``str`` rather than a
+            constrained enum for the same reason as ``status``.
     """
 
     driver_id: int = Field(alias='id')
@@ -202,8 +208,8 @@ class DriverSummary(ResponseModelBase):
     username: str | None = None
     email: str | None = None
     driver_company_id: str | None = None
-    status: UserStatus
-    role: UserRole
+    status: str | None = None
+    role: str | None = None
 
     @property
     def full_name(self) -> str:
@@ -768,14 +774,22 @@ class DrivingPeriod(FrozenResponseModelBase):
         period_id: Motive's internal identifier for this driving period.
         start_time: Period start timestamp (timezone-aware UTC).
         end_time: Period end timestamp (timezone-aware UTC).
-        status: Lifecycle status (e.g., ``"complete"``).
-        type: Period classification (e.g., ``"driving"``).
-        annotation_status: Optional review/annotation status flag.
+        status: Lifecycle status (e.g., ``"complete"``). Not consumed
+            by the unifier; modeled permissively (may be null).
+        type: Period classification (e.g., ``"driving"``). Not
+            consumed by the unifier; modeled permissively (may be null).
+        annotation_status: Integer annotation status code from Motive
+            (e.g., ``1``). Not consumed by the unifier; modeled
+            permissively (may be null).
         notes: Free-form driver notes attached to the period.
-        duration: Period length in seconds.
+        duration: Period length in seconds as reported by Motive.
+            Not consumed by the unifier -- duration is computed from
+            ``start_time`` and ``end_time`` directly. Modeled
+            permissively (may be null).
         start_kilometers: Vehicle odometer reading at period start (km).
         end_kilometers: Vehicle odometer reading at period end (km).
-        source: Numeric source code identifying how the period was recorded.
+        source: Numeric source code identifying how the period was
+            recorded. May be null.
         driver: Embedded driver summary, or None when no driver was logged in.
         vehicle: Embedded summary of the vehicle that operated the period.
         origin: Reverse-geocoded origin description.
@@ -794,14 +808,14 @@ class DrivingPeriod(FrozenResponseModelBase):
     period_id: int = Field(alias='id')
     start_time: datetime
     end_time: datetime
-    status: str
-    type: str
-    annotation_status: str | None = None
+    status: str | None = None
+    type: str | None = None
+    annotation_status: int | None = None
     notes: str | None = None
-    duration: int
+    duration: int | None = None
     start_kilometers: float
     end_kilometers: float
-    source: int
+    source: int | None = None
     driver: DriverSummary | None = None
     vehicle: VehicleSummary
     origin: str | None = None
@@ -831,55 +845,79 @@ class IdleEvent(FrozenResponseModelBase):
     must clip to target-day boundaries themselves -- this model does
     not clip.
 
-    ``veh_fuel_start`` and ``veh_fuel_end`` are cumulative fuel readings
-    (like a fuel odometer); the consumption during the idle is the
-    delta, exposed as ``fuel_consumed``. The ``rg_*`` fields are
+    ``veh_fuel_start`` and ``veh_fuel_end`` are ELD-derived cumulative
+    fuel readings (like a fuel odometer) -- estimates, not
+    authoritative consumption data. The authoritative fuel-data
+    pipeline lives outside this repo and reconciles against
+    fuel-card transactions separately. ``fuel_consumed`` exposes the
+    delta when both endpoints are present. The ``rg_*`` fields are
     Motive-internal reverse-geocode metadata and are preserved
-    verbatim without interpretation. ``end_type`` is a free-form string
-    code (e.g. ``"vehicle_moving"``) and is modeled as ``str`` rather
-    than an enum because the full universe of values is not
-    documented.
+    verbatim without interpretation. ``end_type`` is a free-form
+    string code (e.g. ``"vehicle_moving"``) and is modeled as
+    ``str`` rather than an enum because the full universe of values
+    is not documented.
+
+    Apart from ``event_id``, ``start_time``, ``end_time``,
+    ``driver``, and ``vehicle``, the fields below are not consumed
+    by the unifier; they are modeled permissively (nullable) so a
+    single drifted field cannot kill the whole page during
+    validation.
 
     Attributes:
         event_id: Motive's internal identifier for this idle event.
         start_time: Event start timestamp (timezone-aware UTC).
         end_time: Event end timestamp (timezone-aware UTC).
-        veh_fuel_start: Cumulative vehicle fuel reading at event start.
-        veh_fuel_end: Cumulative vehicle fuel reading at event end.
-        lat: Event latitude in decimal degrees.
-        lon: Event longitude in decimal degrees.
-        city: Reverse-geocoded city name.
-        state: Reverse-geocoded state/province code.
+        veh_fuel_start: Cumulative ELD-derived fuel reading at event
+            start. ELD readings are estimates, not authoritative
+            fuel data; the authoritative fuel-data pipeline lives
+            outside this repo. Retained for possible future use but
+            not consumed by the unifier (may be null).
+        veh_fuel_end: Cumulative ELD-derived fuel reading at event
+            end. See ``veh_fuel_start`` for caveat (may be null).
+        lat: Event latitude in decimal degrees. Not consumed by the
+            unifier; may be null.
+        lon: Event longitude in decimal degrees. Not consumed by the
+            unifier; may be null.
+        city: Reverse-geocoded city name. May be null in unmapped
+            regions; not consumed by the unifier.
+        state: Reverse-geocoded state/province code. May be null in
+            unmapped regions; not consumed by the unifier.
         rg_brg: Motive-internal reverse-geocode bearing metric.
+            Not consumed by the unifier; may be null.
         rg_km: Motive-internal reverse-geocode distance metric.
+            Not consumed by the unifier; may be null.
         rg_match: Motive-internal reverse-geocode match flag.
+            Not consumed by the unifier; may be null.
         end_type: Code describing how the idle ended
-            (e.g. ``"vehicle_moving"``).
+            (e.g. ``"vehicle_moving"``). Not consumed by the
+            unifier; may be null.
         driver: Embedded driver summary, or None when no driver was
             logged in.
         vehicle: Embedded summary of the vehicle that was idling.
         eld_device: Embedded ELD device hardware information.
+            Not consumed by the unifier; may be null.
         location: Human-readable location string (typically
-            ``"<city>, <state>"``).
+            ``"<city>, <state>"``). Not consumed by the unifier;
+            may be null.
     """
 
     event_id: int = Field(alias='id')
     start_time: datetime
     end_time: datetime
-    veh_fuel_start: float
-    veh_fuel_end: float
-    lat: float
-    lon: float
-    city: str
-    state: str
-    rg_brg: float
-    rg_km: float
-    rg_match: bool
-    end_type: str
+    veh_fuel_start: float | None = None
+    veh_fuel_end: float | None = None
+    lat: float | None = None
+    lon: float | None = None
+    city: str | None = None
+    state: str | None = None
+    rg_brg: float | None = None
+    rg_km: float | None = None
+    rg_match: bool | None = None
+    end_type: str | None = None
     driver: DriverSummary | None = None
     vehicle: VehicleSummary
-    eld_device: EldDeviceInfo
-    location: str
+    eld_device: EldDeviceInfo | None = None
+    location: str | None = None
 
     @property
     def is_unattributed(self) -> bool:
@@ -893,8 +931,25 @@ class IdleEvent(FrozenResponseModelBase):
 
     @property
     def fuel_consumed(self) -> float:
-        """Cumulative-fuel delta over the event (veh_fuel_end - veh_fuel_start)."""
-        return self.veh_fuel_end - self.veh_fuel_start
+        """
+        Cumulative-fuel delta over the event (``veh_fuel_end - veh_fuel_start``).
+
+        The result is an ELD-derived estimate, not an authoritative
+        consumption figure. The authoritative fuel-data pipeline
+        lives outside this repo and reconciles against fuel-card
+        transactions separately.
+
+        Raises:
+            TypeError: If either ``veh_fuel_start`` or ``veh_fuel_end``
+                is ``None``. Callers that need to handle absent
+                readings should guard on those attributes directly.
+        """
+        # Both operands are nullable after the model-strictness audit
+        # (see class docstring). The property intentionally surfaces
+        # absent readings as a runtime ``TypeError`` rather than
+        # silently returning a misleading value; the type-checker
+        # cannot model that contract.
+        return self.veh_fuel_end - self.veh_fuel_start  # type: ignore[operator]
 
 
 # =============================================================================
