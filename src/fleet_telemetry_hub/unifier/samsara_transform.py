@@ -53,6 +53,7 @@ _COUNTER_KEYS: tuple[str, ...] = (
     'unknown_vin_fallbacks',
     'unresolvable_drivers',
     'non_positive_durations_dropped',
+    'null_distance_meters_fallback',
 )
 
 
@@ -282,6 +283,23 @@ def _trip_to_row(
         )
         return None
 
+    distance_meters = trip.distance_meters
+    distance_miles: float | None
+    if distance_meters is None:
+        logger.warning(
+            'Samsara trip has null distance_meters; emitting row with null '
+            'distance. trip_id=%s, vehicle_id=%s, vin=%s, start=%s, end=%s',
+            event_identifier,
+            vehicle_id,
+            vin,
+            trip.start_time,
+            trip.end_time,
+        )
+        ctx.counters['null_distance_meters_fallback'] += 1
+        distance_miles = None
+    else:
+        distance_miles = meters_to_miles(distance_meters)
+
     return UnifiedEventRow(
         company=ctx.company,
         event_type=EventType.DRIVING,
@@ -291,7 +309,7 @@ def _trip_to_row(
         start_time_utc=trip.start_time,
         end_time_utc=trip.end_time,
         duration_seconds=duration_seconds,
-        distance_miles=meters_to_miles(trip.distance_meters),
+        distance_miles=distance_miles,
     )
 
 
@@ -310,8 +328,13 @@ def _idling_event_to_row(
         event_identifier=event.event_uuid,
         event_window=(event.start_time, end_time_utc),
     )
+    # Samsara omits the ``operator`` block entirely for unattributed
+    # idle events; ``_resolve_driver`` already maps ``None`` to
+    # ``(None, None)`` with no warning, mirroring the Motive
+    # ``IdleEvent.driver is None`` path.
+    operator_id = event.operator.operator_id if event.operator is not None else None
     driver_id, driver_name = _resolve_driver(
-        event.operator.operator_id,
+        operator_id,
         ctx,
         event_kind='idling_event',
         event_identifier=event.event_uuid,
