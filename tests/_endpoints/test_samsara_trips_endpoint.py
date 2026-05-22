@@ -60,8 +60,9 @@ _TRIP_B_DISTANCE_METERS = 800
 TRIPS_FIXTURE: dict[str, Any] = {
     'data': [
         {
+            # The real API does not echo ``vehicleId`` back per-trip;
+            # the fetcher boundary stamps it on via ``VehicleTrip``.
             'id': _TRIP_A_ID,
-            'vehicleId': _VEHICLE_ID,
             'driverId': _DRIVER_ID_INT,
             'startMs': _TRIP_A_START_MS,
             'endMs': _TRIP_A_END_MS,
@@ -83,7 +84,6 @@ TRIPS_FIXTURE: dict[str, Any] = {
         },
         {
             'id': _TRIP_B_ID,
-            'vehicleId': _VEHICLE_ID,
             'driverId': None,
             'startMs': _TRIP_B_START_MS,
             'endMs': _TRIP_B_END_MS,
@@ -104,7 +104,6 @@ class TestTripModelParsing:
 
         assert trip.trip_id == _TRIP_A_ID
         assert trip.driver_id == _DRIVER_ID_STR
-        assert trip.vehicle_id == _VEHICLE_ID
         assert trip.distance_meters == _TRIP_A_DISTANCE_METERS
 
     def test_start_time_parses_to_tz_aware_utc(self) -> None:
@@ -159,7 +158,6 @@ class TestTripModelParsing:
 
         payload = {
             'id': _TRIP_A_ID,
-            'vehicleId': _VEHICLE_ID,
             'driverId': _DRIVER_ID_INT,
             'startMs': _TRIP_A_START_UTC,
             'endMs': _TRIP_A_END_UTC,
@@ -173,7 +171,7 @@ class TestTripModelParsing:
 
     @pytest.mark.parametrize(
         'missing_key',
-        ['vehicleId', 'startMs', 'endMs', 'distanceMeters'],
+        ['startMs', 'endMs', 'distanceMeters'],
     )
     def test_missing_required_field_raises_validation_error(
         self, missing_key: str
@@ -195,7 +193,6 @@ class TestTripDriverIdCoercion:
         """Build a minimal-but-valid Trip payload with the given ``driverId`` value."""
         return {
             'id': _TRIP_A_ID,
-            'vehicleId': _VEHICLE_ID,
             'driverId': driver_id_value,
             'startMs': _TRIP_A_START_MS,
             'endMs': _TRIP_A_END_MS,

@@ -20,10 +20,10 @@ from fleet_telemetry_hub.models.samsara_responses import (
     IdlingEvent,
     SamsaraDriver,
     SamsaraVehicle,
-    Trip,
 )
 from fleet_telemetry_hub.provider import Provider
 from fleet_telemetry_hub.utilization.date_chunking import iter_chunks
+from fleet_telemetry_hub.utilization.vehicle_trip import VehicleTrip
 
 __all__: list[str] = ['SamsaraUtilizationBundle', 'SamsaraUtilizationFetcher']
 
@@ -60,9 +60,12 @@ class SamsaraUtilizationBundle:
             driver identifier. Active drivers are listed first; any
             deactivated drivers that share an ID with an active driver
             are dropped in favor of the active record.
-        trips: Per-vehicle trip records spanning the full date range,
-            collected by looping over ``vehicles`` and over the 28-day
-            chunks the time window was split into.
+        trips: Per-vehicle ``VehicleTrip`` records spanning the full
+            date range, collected by looping over ``vehicles`` and
+            over the 28-day chunks the time window was split into.
+            Each ``VehicleTrip`` wraps a parsed ``Trip`` with the
+            ``vehicle_id`` the query used, since the API does not
+            echo ``vehicleId`` back in the response body.
         idling_events: Idling event records spanning the full date
             range, collected by looping over the same 28-day chunks
             (no per-vehicle inner loop -- the endpoint accepts the
@@ -77,7 +80,7 @@ class SamsaraUtilizationBundle:
 
     vehicles: list[SamsaraVehicle]
     drivers: list[SamsaraDriver]
-    trips: list[Trip]
+    trips: list[VehicleTrip]
     idling_events: list[IdlingEvent]
     date_range: tuple[date, date]
     company: str | None
@@ -190,7 +193,7 @@ class SamsaraUtilizationFetcher:
                 len(drivers),
             )
 
-            trips: list[Trip] = []
+            trips: list[VehicleTrip] = []
             for vehicle in vehicles:
                 for chunk_start_dt, chunk_end_dt in chunks:
                     logger.debug(
@@ -200,7 +203,8 @@ class SamsaraUtilizationFetcher:
                         chunk_end_dt,
                     )
                     trips.extend(
-                        client.fetch_all(
+                        VehicleTrip.from_trip(trip, vehicle.vehicle_id)
+                        for trip in client.fetch_all(
                             SamsaraEndpoints.TRIPS,
                             vehicle_id=vehicle.vehicle_id,
                             start_time=chunk_start_dt,

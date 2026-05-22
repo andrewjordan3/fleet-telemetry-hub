@@ -21,7 +21,6 @@ from fleet_telemetry_hub.models.samsara_responses import (
     IdlingEvent,
     SamsaraDriver,
     SamsaraVehicle,
-    Trip,
 )
 from fleet_telemetry_hub.unifier.distance import meters_to_miles
 from fleet_telemetry_hub.unifier.overlap import (
@@ -36,6 +35,7 @@ from fleet_telemetry_hub.unifier.text_normalization import (
     normalize_driver_name,
 )
 from fleet_telemetry_hub.utilization.samsara_fetcher import SamsaraUtilizationBundle
+from fleet_telemetry_hub.utilization.vehicle_trip import VehicleTrip
 
 __all__: list[str] = ['transform_samsara_bundle']
 
@@ -63,7 +63,7 @@ class _SamsaraContext:
     vin_by_vehicle_id: dict[str, str | None]
     name_by_driver_id: dict[str, str]
     idling_by_vehicle_id: dict[str, list[IdlingEvent]]
-    trips_by_vehicle_id: dict[str, list[Trip]]
+    trips_by_vehicle_id: dict[str, list[VehicleTrip]]
     company: str | None
     counters: dict[str, int]
 
@@ -110,8 +110,8 @@ def transform_samsara_bundle(
 
     rows: list[UnifiedEventRow] = []
 
-    for trip in bundle.trips:
-        trip_row = _trip_to_row(trip, ctx)
+    for vehicle_trip in bundle.trips:
+        trip_row = _trip_to_row(vehicle_trip, ctx)
         if trip_row is not None:
             rows.append(trip_row)
 
@@ -148,11 +148,13 @@ def _index_idling_by_vehicle(
     return index
 
 
-def _index_trips_by_vehicle(trips: list[Trip]) -> dict[str, list[Trip]]:
+def _index_trips_by_vehicle(
+    trips: list[VehicleTrip],
+) -> dict[str, list[VehicleTrip]]:
     """Index trips by ``vehicle_id`` for O(1) lookup during idle gap-fill."""
-    index: dict[str, list[Trip]] = {}
-    for trip in trips:
-        index.setdefault(trip.vehicle_id, []).append(trip)
+    index: dict[str, list[VehicleTrip]] = {}
+    for vehicle_trip in trips:
+        index.setdefault(vehicle_trip.vehicle_id, []).append(vehicle_trip)
     return index
 
 
@@ -233,11 +235,15 @@ def _resolve_driver(
     return (normalized_id, driver_name)
 
 
-def _trip_to_row(trip: Trip, ctx: _SamsaraContext) -> UnifiedEventRow | None:
-    """Convert a single ``Trip`` into a unified driving row, or drop with a WARNING."""
+def _trip_to_row(
+    vehicle_trip: VehicleTrip, ctx: _SamsaraContext
+) -> UnifiedEventRow | None:
+    """Convert a single ``VehicleTrip`` into a unified driving row, or drop with WARNING."""
+    trip = vehicle_trip.trip
+    vehicle_id = vehicle_trip.vehicle_id
     event_identifier = trip.trip_id if trip.trip_id is not None else '<no_trip_id>'
     vin = _resolve_vin(
-        trip.vehicle_id,
+        vehicle_id,
         ctx,
         event_kind='trip',
         event_identifier=event_identifier,
@@ -250,7 +256,7 @@ def _trip_to_row(trip: Trip, ctx: _SamsaraContext) -> UnifiedEventRow | None:
         event_identifier=event_identifier,
     )
 
-    idling_candidates = ctx.idling_by_vehicle_id.get(trip.vehicle_id, [])
+    idling_candidates = ctx.idling_by_vehicle_id.get(vehicle_id, [])
     idle_windows = [
         (
             event.start_time,
@@ -268,7 +274,7 @@ def _trip_to_row(trip: Trip, ctx: _SamsaraContext) -> UnifiedEventRow | None:
             'trip_id=%s, vehicle_id=%s, vin=%s, start=%s, end=%s, '
             'computed_seconds=%d',
             event_identifier,
-            trip.vehicle_id,
+            vehicle_id,
             vin,
             trip.start_time,
             trip.end_time,
@@ -343,18 +349,20 @@ def _gap_fill_idle_driver(
     candidate_trips = ctx.trips_by_vehicle_id.get(vehicle_id, [])
     driving_windows = [
         DrivingWindow(
-            start=trip.start_time,
-            end=trip.end_time,
+            start=vt.trip.start_time,
+            end=vt.trip.end_time,
             driver=_resolve_driver(
-                trip.driver_id,
+                vt.trip.driver_id,
                 ctx,
                 event_kind='trip',
                 event_identifier=(
-                    trip.trip_id if trip.trip_id is not None else '<no_trip_id>'
+                    vt.trip.trip_id
+                    if vt.trip.trip_id is not None
+                    else '<no_trip_id>'
                 ),
             ),
         )
-        for trip in candidate_trips
+        for vt in candidate_trips
     ]
     winner, distribution, warn_flag = attribute_idle_driver(
         event.start_time, end_time_utc, driving_windows
