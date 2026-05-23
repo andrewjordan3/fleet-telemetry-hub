@@ -13,7 +13,8 @@ All identifiers in test data are synthetic.
 """
 
 import dataclasses
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
+from itertools import pairwise
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -36,6 +37,7 @@ from fleet_telemetry_hub.utilization import (
     MotiveUtilizationFetcher,
     UtilizationFetcher,
 )
+from fleet_telemetry_hub.utilization.motive_fetcher import _MAX_CHUNK_DAYS
 
 # Single-day and multi-day date constants used across tests.
 _MAY_14 = date(2026, 5, 14)
@@ -172,52 +174,98 @@ def _make_idle_event(event_id: int = 4860000001) -> IdleEvent:
     )
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class _FakeBackendRecords:
+    """
+    Frozen fixture bundling the records the fake backend dispatches.
+
+    ``*_by_window`` maps key on the request kwargs the fetcher passes
+    to the corresponding endpoint; missing keys yield an empty
+    iterator (so the fake silently models "no records for that
+    window" without raising). ``driving_period_records`` /
+    ``idle_event_records`` are flat lists returned regardless of
+    window, preserving the pre-chunking helper contract; tests that
+    want chunk-window dispatch populate the ``*_by_window`` maps for
+    those endpoints instead.
+
+    Frozen+slots is structural only -- the held collections remain
+    mutable Python dicts/lists, which is fine for a test fixture.
+    """
+
+    vehicle_records_by_window: dict[
+        tuple[datetime, datetime], list[VehicleUtilization]
+    ] = dataclasses.field(default_factory=dict)
+    driver_records_by_window: dict[
+        tuple[datetime, datetime], list[DriverIdleRollup]
+    ] = dataclasses.field(default_factory=dict)
+    driving_period_records: list[DrivingPeriod] = dataclasses.field(
+        default_factory=list
+    )
+    idle_event_records: list[IdleEvent] = dataclasses.field(default_factory=list)
+    driving_period_records_by_window: dict[
+        tuple[date, date], list[DrivingPeriod]
+    ] = dataclasses.field(default_factory=dict)
+    idle_event_records_by_window: dict[
+        tuple[date, date], list[IdleEvent]
+    ] = dataclasses.field(default_factory=dict)
+
+
 def _build_fake_provider_and_client(
     *,
-    vehicle_records_by_window: dict[tuple[datetime, datetime], list[VehicleUtilization]]
-    | None = None,
-    driver_records_by_window: dict[tuple[datetime, datetime], list[DriverIdleRollup]]
-    | None = None,
-    driving_period_records: list[DrivingPeriod] | None = None,
-    idle_event_records: list[IdleEvent] | None = None,
+    records: _FakeBackendRecords | None = None,
 ) -> tuple[MagicMock, MagicMock]:
     """
     Construct a fake (Provider, TelemetryClient) pair wired together.
 
-    The fake client's ``fetch_all`` dispatches on the endpoint constant:
-    VEHICLE_UTILIZATION / DRIVER_UTILIZATION lookups use the
-    (start_at, end_at) or (start_date, end_date) window as the key into
-    the per-window record maps; DRIVING_PERIODS and IDLE_EVENTS each
-    return their configured flat list regardless of window.
+    The fake client's ``fetch_all`` dispatches on the endpoint
+    constant:
 
-    Returns (fake_provider, fake_client) so tests can also assert on
-    the client side (e.g. context-manager invocation counts).
+    - VEHICLE_UTILIZATION / DRIVER_UTILIZATION lookups use the
+      ``(start_at, end_at)`` or ``(start_date, end_date)`` datetime
+      window as the key into the per-window record maps.
+    - DRIVING_PERIODS / IDLE_EVENTS first check the ``*_by_window``
+      maps keyed on the chunk's ``(start_date, end_date)``; an empty
+      map falls back to the flat ``*_records`` list so existing
+      callers see unchanged behavior.
+
+    Returns ``(fake_provider, fake_client)`` so tests can also
+    assert on the client side (e.g. context-manager invocation
+    counts, call-list dispatch).
     """
 
-    vehicle_by_window: dict[tuple[datetime, datetime], list[VehicleUtilization]] = (
-        vehicle_records_by_window or {}
-    )
-    driver_by_window: dict[tuple[datetime, datetime], list[DriverIdleRollup]] = (
-        driver_records_by_window or {}
-    )
-    periods: list[DrivingPeriod] = driving_period_records or []
-    idle_events: list[IdleEvent] = idle_event_records or []
+    backend_records = records or _FakeBackendRecords()
 
     fake_client = MagicMock(spec=TelemetryClient)
     fake_client.__enter__.return_value = fake_client
     fake_client.__exit__.return_value = None
 
+    def dispatch_driving_periods(**params: Any) -> Any:
+        date_window = (params['start_date'], params['end_date'])
+        if backend_records.driving_period_records_by_window:
+            return iter(
+                backend_records.driving_period_records_by_window.get(date_window, [])
+            )
+        return iter(backend_records.driving_period_records)
+
+    def dispatch_idle_events(**params: Any) -> Any:
+        date_window = (params['start_date'], params['end_date'])
+        if backend_records.idle_event_records_by_window:
+            return iter(
+                backend_records.idle_event_records_by_window.get(date_window, [])
+            )
+        return iter(backend_records.idle_event_records)
+
     def fake_fetch_all(endpoint: Any, **params: Any) -> Any:
         if endpoint is MotiveEndpoints.VEHICLE_UTILIZATION:
             window = (params['start_at'], params['end_at'])
-            return iter(vehicle_by_window.get(window, []))
+            return iter(backend_records.vehicle_records_by_window.get(window, []))
         if endpoint is MotiveEndpoints.DRIVER_UTILIZATION:
             window = (params['start_date'], params['end_date'])
-            return iter(driver_by_window.get(window, []))
+            return iter(backend_records.driver_records_by_window.get(window, []))
         if endpoint is MotiveEndpoints.DRIVING_PERIODS:
-            return iter(periods)
+            return dispatch_driving_periods(**params)
         if endpoint is MotiveEndpoints.IDLE_EVENTS:
-            return iter(idle_events)
+            return dispatch_idle_events(**params)
         return iter([])
 
     fake_client.fetch_all.side_effect = fake_fetch_all
@@ -310,7 +358,9 @@ class TestMotiveUtilizationFetcherEmptyDaysPreserved:
             (_MAY_16_START, _MAY_17_START): [_make_vehicle_utilization(8000002)],
         }
         fake_provider, _ = _build_fake_provider_and_client(
-            vehicle_records_by_window=vehicle_records_by_window,
+            records=_FakeBackendRecords(
+                vehicle_records_by_window=vehicle_records_by_window,
+            ),
         )
         fetcher = MotiveUtilizationFetcher(fake_provider)
 
@@ -464,15 +514,17 @@ class TestMotiveUtilizationFetcherPassThrough:
         idle_b = _make_idle_event(4860000002)
 
         fake_provider, _ = _build_fake_provider_and_client(
-            vehicle_records_by_window={
-                (_MAY_14_START, _MAY_15_START): [v_rec_14],
-                (_MAY_15_START, _MAY_16_START): [v_rec_15],
-            },
-            driver_records_by_window={
-                (_MAY_14_START, _MAY_15_START): [d_rec_14],
-            },
-            driving_period_records=[period_a, period_b],
-            idle_event_records=[idle_a, idle_b],
+            records=_FakeBackendRecords(
+                vehicle_records_by_window={
+                    (_MAY_14_START, _MAY_15_START): [v_rec_14],
+                    (_MAY_15_START, _MAY_16_START): [v_rec_15],
+                },
+                driver_records_by_window={
+                    (_MAY_14_START, _MAY_15_START): [d_rec_14],
+                },
+                driving_period_records=[period_a, period_b],
+                idle_event_records=[idle_a, idle_b],
+            ),
         )
         fetcher = MotiveUtilizationFetcher(fake_provider)
 
@@ -529,3 +581,157 @@ class TestMotiveUtilizationFetcherClientLifecycle:
 
         assert fake_client.__enter__.call_count == 1
         assert fake_client.__exit__.call_count == 1
+
+
+# ============================================================
+# Chunking tests
+# ============================================================
+#
+# Motive caps /v1/driving_periods and /v1/idle_events at 30 days per
+# request. The fetcher chunks longer ranges via ``iter_chunks`` with
+# ``_MAX_CHUNK_DAYS``; these tests exercise that path and pin the
+# expected call shape.
+
+# Multi-chunk landmarks: a 30-day inclusive range from May 14 should
+# produce two chunks (days 1..28 + days 29..30), and a 142-day
+# range from Jan 1 should produce six chunks. Both bracket the
+# production failure mode.
+_JAN_1 = date(2026, 1, 1)
+_MAY_22 = date(2026, 5, 22)  # 142 days inclusive from Jan 1
+_JUN_12 = date(2026, 6, 12)  # 30 days inclusive from May 14
+_TWO_CHUNKS = 2
+_SIX_CHUNKS = 6
+
+
+class TestMotiveUtilizationFetcherChunking:
+    """``DRIVING_PERIODS`` and ``IDLE_EVENTS`` are chunked into <=28-day windows."""
+
+    @staticmethod
+    def _driving_periods_calls(fake_client: MagicMock) -> list[Any]:
+        """Filter the fake client's recorded calls down to DRIVING_PERIODS."""
+        return [
+            call
+            for call in fake_client.fetch_all.call_args_list
+            if call.args[0] is MotiveEndpoints.DRIVING_PERIODS
+        ]
+
+    @staticmethod
+    def _idle_events_calls(fake_client: MagicMock) -> list[Any]:
+        """Filter the fake client's recorded calls down to IDLE_EVENTS."""
+        return [
+            call
+            for call in fake_client.fetch_all.call_args_list
+            if call.args[0] is MotiveEndpoints.IDLE_EVENTS
+        ]
+
+    def test_thirty_day_range_yields_two_chunks_per_event_endpoint(self) -> None:
+        """A 30-day inclusive range chunks into two calls each for both endpoints."""
+
+        fake_provider, fake_client = _build_fake_provider_and_client()
+        fetcher = MotiveUtilizationFetcher(fake_provider)
+
+        fetcher.fetch(_MAY_14, _JUN_12)
+
+        assert len(self._driving_periods_calls(fake_client)) == _TWO_CHUNKS
+        assert len(self._idle_events_calls(fake_client)) == _TWO_CHUNKS
+
+    def test_long_range_chunks_match_iter_chunks_output(self) -> None:
+        """A 142-day backfill produces six chunks, matching ``iter_chunks``."""
+
+        fake_provider, fake_client = _build_fake_provider_and_client()
+        fetcher = MotiveUtilizationFetcher(fake_provider)
+
+        fetcher.fetch(_JAN_1, _MAY_22)
+
+        assert len(self._driving_periods_calls(fake_client)) == _SIX_CHUNKS
+        assert len(self._idle_events_calls(fake_client)) == _SIX_CHUNKS
+
+    def test_no_single_chunk_exceeds_max_chunk_days(self) -> None:
+        """Every chunk's inclusive span is <= ``_MAX_CHUNK_DAYS`` days.
+
+        This is the assertion that pins the production-failure
+        invariant: no single call against ``DRIVING_PERIODS`` or
+        ``IDLE_EVENTS`` may span a window wider than
+        ``_MAX_CHUNK_DAYS`` inclusive days, regardless of the
+        requested range.
+        """
+
+        fake_provider, fake_client = _build_fake_provider_and_client()
+        fetcher = MotiveUtilizationFetcher(fake_provider)
+
+        fetcher.fetch(_JAN_1, _MAY_22)
+
+        for call in (
+            *self._driving_periods_calls(fake_client),
+            *self._idle_events_calls(fake_client),
+        ):
+            chunk_start: date = call.kwargs['start_date']
+            chunk_end: date = call.kwargs['end_date']
+            inclusive_days = (chunk_end - chunk_start).days + 1
+            assert inclusive_days <= _MAX_CHUNK_DAYS, (
+                f'Chunk {chunk_start}..{chunk_end} spans {inclusive_days} '
+                f'days, exceeding _MAX_CHUNK_DAYS={_MAX_CHUNK_DAYS}'
+            )
+
+    def test_chunks_are_contiguous_and_non_overlapping(self) -> None:
+        """Adjacent chunks meet at day-grain (``chunk[N].end + 1 == chunk[N+1].start``)."""
+
+        fake_provider, fake_client = _build_fake_provider_and_client()
+        fetcher = MotiveUtilizationFetcher(fake_provider)
+
+        fetcher.fetch(_JAN_1, _MAY_22)
+
+        windows: list[tuple[date, date]] = [
+            (call.kwargs['start_date'], call.kwargs['end_date'])
+            for call in self._driving_periods_calls(fake_client)
+        ]
+        # First chunk starts at the requested start; last chunk ends
+        # at the requested end; every interior boundary is contiguous.
+        assert windows[0][0] == _JAN_1
+        assert windows[-1][1] == _MAY_22
+        one_day = timedelta(days=1)
+        for previous_window, next_window in pairwise(windows):
+            assert next_window[0] == previous_window[1] + one_day
+
+    def test_records_concatenate_in_chunk_chronological_order(self) -> None:
+        """Each chunk's records appear in the bundle in chunk-chronological order."""
+
+        # Two-chunk run with distinct period records per chunk window.
+        chunk_one = (_MAY_14, date(2026, 6, 10))  # inclusive 28-day chunk
+        chunk_two = (date(2026, 6, 11), _JUN_12)  # remaining 2 days
+        period_chunk_one = _make_driving_period(4550000001)
+        period_chunk_two = _make_driving_period(4550000002)
+        idle_chunk_one = _make_idle_event(4860000001)
+        idle_chunk_two = _make_idle_event(4860000002)
+
+        fake_provider, _ = _build_fake_provider_and_client(
+            records=_FakeBackendRecords(
+                driving_period_records_by_window={
+                    chunk_one: [period_chunk_one],
+                    chunk_two: [period_chunk_two],
+                },
+                idle_event_records_by_window={
+                    chunk_one: [idle_chunk_one],
+                    chunk_two: [idle_chunk_two],
+                },
+            ),
+        )
+        fetcher = MotiveUtilizationFetcher(fake_provider)
+
+        bundle = fetcher.fetch(_MAY_14, _JUN_12)
+
+        assert bundle.driving_periods[0] is period_chunk_one
+        assert bundle.driving_periods[1] is period_chunk_two
+        assert bundle.idle_events[0] is idle_chunk_one
+        assert bundle.idle_events[1] is idle_chunk_two
+
+    def test_short_range_still_makes_exactly_one_chunk(self) -> None:
+        """A range that fits in a single chunk produces exactly one call per endpoint."""
+
+        fake_provider, fake_client = _build_fake_provider_and_client()
+        fetcher = MotiveUtilizationFetcher(fake_provider)
+
+        fetcher.fetch(_MAY_14, _MAY_16)  # 3 inclusive days, well under 28
+
+        assert len(self._driving_periods_calls(fake_client)) == 1
+        assert len(self._idle_events_calls(fake_client)) == 1
