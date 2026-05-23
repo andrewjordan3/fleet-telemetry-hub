@@ -12,10 +12,17 @@ from fleet_telemetry_hub.models.motive_responses import (
     VehicleUtilization,
 )
 from fleet_telemetry_hub.provider import Provider
+from fleet_telemetry_hub.utilization.date_chunking import iter_chunks
 
 __all__: list[str] = ['MotiveUtilizationBundle', 'MotiveUtilizationFetcher']
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+# Motive caps both /v1/driving_periods and /v1/idle_events at 30
+# days per request. 28 days is a deliberate safety margin and also
+# matches the chunking constant used by ``samsara_fetcher`` for
+# cross-provider parity.
+_MAX_CHUNK_DAYS: int = 28
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,8 +91,10 @@ class MotiveUtilizationFetcher:
 
         - vehicle_utilization: per-day call
         - driver_utilization:  per-day call
-        - driving_periods:     single call across the full range
-        - idle_events:         single call across the full range
+        - driving_periods:     chunked into <=28-day windows
+                               (Motive caps the endpoint at 30 days)
+        - idle_events:         chunked into <=28-day windows
+                               (Motive caps the endpoint at 30 days)
 
     The fetcher does no transformation of returned records -- it
     fetches and assembles them into a typed bundle. Unit conversions,
@@ -179,22 +188,26 @@ class MotiveUtilizationFetcher:
                     len(driver_rows),
                 )
 
-            driving_periods: list[DrivingPeriod] = list(
-                client.fetch_all(
-                    MotiveEndpoints.DRIVING_PERIODS,
-                    start_date=start_date,
-                    end_date=end_date,
+            driving_periods: list[DrivingPeriod] = []
+            idle_events: list[IdleEvent] = []
+            for chunk_start_date, chunk_end_date in iter_chunks(
+                start_date, end_date, _MAX_CHUNK_DAYS, chunk_format='date'
+            ):
+                driving_periods.extend(
+                    client.fetch_all(
+                        MotiveEndpoints.DRIVING_PERIODS,
+                        start_date=chunk_start_date,
+                        end_date=chunk_end_date,
+                    )
                 )
-            )
+                idle_events.extend(
+                    client.fetch_all(
+                        MotiveEndpoints.IDLE_EVENTS,
+                        start_date=chunk_start_date,
+                        end_date=chunk_end_date,
+                    )
+                )
             logger.debug('driving_periods: %d records', len(driving_periods))
-
-            idle_events: list[IdleEvent] = list(
-                client.fetch_all(
-                    MotiveEndpoints.IDLE_EVENTS,
-                    start_date=start_date,
-                    end_date=end_date,
-                )
-            )
             logger.debug('idle_events: %d records', len(idle_events))
 
         total_vehicle_rows: int = sum(
