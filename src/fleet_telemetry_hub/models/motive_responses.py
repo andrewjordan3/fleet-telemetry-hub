@@ -16,8 +16,9 @@ Design Notes:
 
 # pyright: reportUnknownVariableType=false
 import logging
-from datetime import datetime
-from enum import Enum
+from collections import Counter
+from datetime import datetime, timedelta
+from enum import Enum, StrEnum
 from typing import Any
 
 from pydantic import (
@@ -773,10 +774,25 @@ class DrivingPeriod(FrozenResponseModelBase):
     The HVB (high-voltage battery) fields are EV-only; they are always null
     for fuel vehicles in the current fleet.
 
+    Both ``start_time`` and ``end_time`` are nullable at the model
+    layer: Motive emits null on at least one timestamp for ongoing
+    or unterminated periods. The unifier-side guarantee that records
+    arrive with valid timestamps has not been weakened -- it has
+    been relocated one layer up. ``DrivingPeriodsResponse.get_driving_periods()``
+    applies the recovery / filter decision and emits a counter-summary
+    log line per response, so downstream consumers (including the
+    unifier) never see null-timestamp records.
+
     Attributes:
         period_id: Motive's internal identifier for this driving period.
         start_time: Period start timestamp (timezone-aware UTC).
+            Nullable: Motive emits null on ongoing or unterminated
+            periods. The wrapper layer recovers from ``end_time -
+            duration`` when ``duration`` is present and plausible,
+            otherwise drops the record.
         end_time: Period end timestamp (timezone-aware UTC).
+            Nullable: same semantics as ``start_time``; recovery
+            via ``start_time + duration`` when feasible.
         status: Lifecycle status (e.g., ``"complete"``). Not consumed
             by the unifier; modeled permissively (may be null).
         type: Period classification (e.g., ``"driving"``). Not
@@ -785,9 +801,13 @@ class DrivingPeriod(FrozenResponseModelBase):
             (e.g., ``1``). Not consumed by the unifier; modeled
             permissively (may be null).
         notes: Free-form driver notes attached to the period.
-        duration: Period length in seconds as reported by Motive.
-            Not consumed by the unifier -- duration is computed from
-            ``start_time`` and ``end_time`` directly. Modeled
+        duration: Period length in seconds as reported by Motive,
+            real-valued (the live API has been observed sending
+            fractional-second values like ``6420700.43``). Used by
+            the wrapper layer to recover a missing ``start_time`` or
+            ``end_time`` when the other endpoint is present.
+            Otherwise not consumed by the unifier -- duration is
+            computed from the recovered timestamps directly. Modeled
             permissively (may be null).
         start_kilometers: Vehicle odometer reading at period start (km).
             Null when the ELD did not report a reading; the unifier
@@ -813,13 +833,13 @@ class DrivingPeriod(FrozenResponseModelBase):
     """
 
     period_id: int = Field(alias='id')
-    start_time: datetime
-    end_time: datetime
+    start_time: datetime | None = None
+    end_time: datetime | None = None
     status: str | None = None
     type: str | None = None
     annotation_status: int | None = None
     notes: str | None = None
-    duration: int | None = None
+    duration: float | None = None
     start_kilometers: float | None = None
     end_kilometers: float | None = None
     source: int | None = None
@@ -881,10 +901,24 @@ class IdleEvent(FrozenResponseModelBase):
     single drifted field cannot kill the whole page during
     validation.
 
+    ``start_time`` and ``end_time`` are also nullable at the model
+    layer. Idle events have no ``duration`` field of their own
+    (``duration_seconds`` is a derived property from the two
+    timestamps), so recovery is not possible. The unifier-side
+    guarantee that records arrive with valid timestamps still
+    holds, but the boundary that enforces it has moved up:
+    ``IdleEventsResponse.get_idle_events()`` drops any record with
+    a missing timestamp and emits a counter-summary log line per
+    response.
+
     Attributes:
         event_id: Motive's internal identifier for this idle event.
         start_time: Event start timestamp (timezone-aware UTC).
+            Nullable: Motive emits null on at least one timestamp
+            for ELD anomalies. The wrapper layer drops any such
+            record; downstream consumers never see one.
         end_time: Event end timestamp (timezone-aware UTC).
+            Nullable: same semantics as ``start_time``.
         veh_fuel_start: Cumulative ELD-derived fuel reading at event
             start. ELD readings are estimates, not authoritative
             fuel data; the authoritative fuel-data pipeline lives
@@ -920,8 +954,8 @@ class IdleEvent(FrozenResponseModelBase):
     """
 
     event_id: int = Field(alias='id')
-    start_time: datetime
-    end_time: datetime
+    start_time: datetime | None = None
+    end_time: datetime | None = None
     veh_fuel_start: float | None = None
     veh_fuel_end: float | None = None
     lat: float | None = None
@@ -944,7 +978,26 @@ class IdleEvent(FrozenResponseModelBase):
 
     @property
     def duration_seconds(self) -> float:
-        """Elapsed event duration in seconds."""
+        """
+        Elapsed event duration in seconds (``end_time - start_time``).
+
+        Raises:
+            ValueError: If either ``start_time`` or ``end_time`` is
+                ``None``. Idle events have no separate ``duration``
+                field for recovery, so a missing timestamp leaves
+                the duration genuinely undefined. The wrapper layer
+                drops such records before they reach consumers, so
+                this raise should be unreachable in normal flow;
+                callers that bypass the wrapper and need to handle
+                absent timestamps should guard on the attributes
+                directly. Mirrors the ``fuel_consumed`` precedent
+                on this class.
+        """
+        if self.start_time is None or self.end_time is None:
+            raise ValueError(
+                f'duration_seconds requires both start_time and end_time; '
+                f'got start_time={self.start_time!r}, end_time={self.end_time!r}'
+            )
         return (self.end_time - self.start_time).total_seconds()
 
     @property
@@ -1197,6 +1250,101 @@ class DriverUtilizationsResponse(FrozenResponseModelBase):
         return [wrapper.driver_idle_rollup for wrapper in self.driver_idle_rollups]
 
 
+# -----------------------------------------------------------------
+# Wrapper-layer timestamp recovery / filter for /v1/driving_periods
+# and /v1/idle_events
+# -----------------------------------------------------------------
+#
+# DOT Hours-of-Service caps a single driver at 11 hours of driving
+# per duty cycle; cross-midnight is normal in long-haul telematics
+# but multi-day is not. 24 hours is a conservative threshold for
+# "this duration is a plausible driving-period length, recover the
+# missing timestamp" vs. "this is the shape of an ongoing or
+# unterminated period -- drop it." Domain-derived; not an
+# environment-tunable knob.
+_MAX_PLAUSIBLE_DRIVING_PERIOD_SECONDS: int = 24 * 3600
+
+
+class _DrivingPeriodRecoveryOutcome(StrEnum):
+    """Per-record outcome categories for driving-period timestamp recovery."""
+
+    KEPT = 'kept'
+    RECOVERED = 'recovered'
+    DROPPED_IMPLAUSIBLE = 'dropped_implausible'
+    DROPPED_UNRECOVERABLE = 'dropped_unrecoverable'
+
+
+class _IdleEventFilterOutcome(StrEnum):
+    """Per-record outcome categories for idle-event timestamp filtering."""
+
+    KEPT = 'kept'
+    DROPPED_UNRECOVERABLE = 'dropped_unrecoverable'
+
+
+def _recover_driving_period_timestamps(
+    period: DrivingPeriod,
+) -> tuple[DrivingPeriod | None, _DrivingPeriodRecoveryOutcome]:
+    """
+    Decide whether a ``DrivingPeriod`` survives the wrapper boundary, and how.
+
+    Returns ``(maybe_period, outcome)`` where ``maybe_period`` is
+    ``None`` for the two dropped categories and a (possibly
+    timestamp-recovered) ``DrivingPeriod`` for ``KEPT`` /
+    ``RECOVERED``.
+
+    Decision matrix (see prompt):
+
+    - both timestamps present -> ``KEPT`` (returned unchanged)
+    - both null -> ``DROPPED_UNRECOVERABLE``
+    - one null, ``duration`` null -> ``DROPPED_UNRECOVERABLE``
+    - one null, ``duration > _MAX_PLAUSIBLE_DRIVING_PERIOD_SECONDS``
+      -> ``DROPPED_IMPLAUSIBLE``
+    - one null, ``duration`` present and within threshold ->
+      ``RECOVERED`` (missing endpoint computed from the other +/-
+      ``timedelta(seconds=duration)``)
+    """
+    start_time = period.start_time
+    end_time = period.end_time
+    if start_time is not None and end_time is not None:
+        return period, _DrivingPeriodRecoveryOutcome.KEPT
+    if start_time is None and end_time is None:
+        return None, _DrivingPeriodRecoveryOutcome.DROPPED_UNRECOVERABLE
+    duration_seconds = period.duration
+    if duration_seconds is None:
+        return None, _DrivingPeriodRecoveryOutcome.DROPPED_UNRECOVERABLE
+    if duration_seconds > _MAX_PLAUSIBLE_DRIVING_PERIOD_SECONDS:
+        return None, _DrivingPeriodRecoveryOutcome.DROPPED_IMPLAUSIBLE
+    delta = timedelta(seconds=duration_seconds)
+    if end_time is None:
+        # ``start_time`` is non-null (the both-null branch above
+        # returned). Assert for the type-checker -- the narrowing
+        # cannot be expressed structurally.
+        assert start_time is not None
+        recovered = period.model_copy(update={'end_time': start_time + delta})
+    else:
+        # ``end_time`` is non-null; recover ``start_time``.
+        recovered = period.model_copy(update={'start_time': end_time - delta})
+    return recovered, _DrivingPeriodRecoveryOutcome.RECOVERED
+
+
+def _filter_idle_event_timestamps(
+    event: IdleEvent,
+) -> tuple[IdleEvent | None, _IdleEventFilterOutcome]:
+    """
+    Decide whether an ``IdleEvent`` survives the wrapper boundary.
+
+    Idle events have no separate ``duration`` field that could be
+    used to reconstruct a missing timestamp, so any null in
+    ``start_time`` or ``end_time`` is unrecoverable.
+
+    Returns ``(maybe_event, outcome)``; ``maybe_event`` is ``None``
+    for the dropped category.
+    """
+    if event.start_time is None or event.end_time is None:
+        return None, _IdleEventFilterOutcome.DROPPED_UNRECOVERABLE
+    return event, _IdleEventFilterOutcome.KEPT
+
+
 class DrivingPeriodsResponse(FrozenResponseModelBase):
     """
     Complete response from GET /v1/driving_periods.
@@ -1212,12 +1360,52 @@ class DrivingPeriodsResponse(FrozenResponseModelBase):
 
     def get_driving_periods(self) -> list[DrivingPeriod]:
         """
-        Extract unwrapped DrivingPeriod objects from response.
+        Extract unwrapped ``DrivingPeriod`` objects, applying timestamp recovery.
+
+        Records with both timestamps present are returned as-is.
+        Records missing exactly one timestamp are recovered via
+        ``duration`` when it is present and within the plausibility
+        threshold; otherwise dropped. Records missing both
+        timestamps are always dropped. See
+        ``_recover_driving_period_timestamps`` for the full
+        decision matrix.
+
+        A single ``WARNING`` log line is emitted per call iff any
+        record was recovered or dropped; the line carries the full
+        per-outcome breakdown so operators can spot drift in a
+        single grep.
 
         Returns:
-            List of DrivingPeriod objects without wrapper nesting.
+            List of ``DrivingPeriod`` objects, all with
+            non-null ``start_time`` and ``end_time``.
         """
-        return [wrapper.driving_period for wrapper in self.driving_periods]
+        outcomes: Counter[_DrivingPeriodRecoveryOutcome] = Counter()
+        recovered_periods: list[DrivingPeriod] = []
+        for wrapper in self.driving_periods:
+            recovered_period, recovery_outcome = _recover_driving_period_timestamps(
+                wrapper.driving_period
+            )
+            outcomes[recovery_outcome] += 1
+            if recovered_period is not None:
+                recovered_periods.append(recovered_period)
+        # Fill in any outcomes that did not occur so the log line is
+        # shape-stable regardless of input distribution.
+        for outcome_key in _DrivingPeriodRecoveryOutcome:
+            outcomes.setdefault(outcome_key, 0)
+        if any(
+            outcomes[key] > 0
+            for key in _DrivingPeriodRecoveryOutcome
+            if key is not _DrivingPeriodRecoveryOutcome.KEPT
+        ):
+            logger.warning(
+                'Driving-period unwrap: %d kept, %d recovered, '
+                '%d dropped (implausible), %d dropped (unrecoverable)',
+                outcomes[_DrivingPeriodRecoveryOutcome.KEPT],
+                outcomes[_DrivingPeriodRecoveryOutcome.RECOVERED],
+                outcomes[_DrivingPeriodRecoveryOutcome.DROPPED_IMPLAUSIBLE],
+                outcomes[_DrivingPeriodRecoveryOutcome.DROPPED_UNRECOVERABLE],
+            )
+        return recovered_periods
 
 
 class IdleEventsResponse(FrozenResponseModelBase):
@@ -1235,9 +1423,32 @@ class IdleEventsResponse(FrozenResponseModelBase):
 
     def get_idle_events(self) -> list[IdleEvent]:
         """
-        Extract unwrapped IdleEvent objects from response.
+        Extract unwrapped ``IdleEvent`` objects, filtering out null timestamps.
+
+        Idle events have no separate ``duration`` field for
+        recovery, so any record with a null ``start_time`` or
+        ``end_time`` is dropped. A single ``WARNING`` log line is
+        emitted per call iff any record was dropped.
 
         Returns:
-            List of IdleEvent objects without wrapper nesting.
+            List of ``IdleEvent`` objects, all with non-null
+            ``start_time`` and ``end_time``.
         """
-        return [wrapper.idle_event for wrapper in self.idle_events]
+        outcomes: Counter[_IdleEventFilterOutcome] = Counter()
+        filtered_events: list[IdleEvent] = []
+        for wrapper in self.idle_events:
+            filtered_event, filter_outcome = _filter_idle_event_timestamps(
+                wrapper.idle_event
+            )
+            outcomes[filter_outcome] += 1
+            if filtered_event is not None:
+                filtered_events.append(filtered_event)
+        for outcome_key in _IdleEventFilterOutcome:
+            outcomes.setdefault(outcome_key, 0)
+        if outcomes[_IdleEventFilterOutcome.DROPPED_UNRECOVERABLE] > 0:
+            logger.warning(
+                'Idle-event unwrap: %d kept, %d dropped (unrecoverable)',
+                outcomes[_IdleEventFilterOutcome.KEPT],
+                outcomes[_IdleEventFilterOutcome.DROPPED_UNRECOVERABLE],
+            )
+        return filtered_events

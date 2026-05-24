@@ -24,7 +24,8 @@ emails, vehicle IDs, VINs, addresses, or lat/lons from any production
 fleet appear in this file.
 """
 
-from datetime import UTC, date, datetime
+import logging
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -38,6 +39,7 @@ from fleet_telemetry_hub.models.motive_requests import (
     MotiveZSuffixDatetimeEndpointDefinition,
 )
 from fleet_telemetry_hub.models.motive_responses import (
+    _MAX_PLAUSIBLE_DRIVING_PERIOD_SECONDS,
     DriverIdleRollup,
     DriverIdleRollupWrapper,
     DriverSummary,
@@ -49,6 +51,10 @@ from fleet_telemetry_hub.models.motive_responses import (
     IdleEvent,
     IdleEventsResponse,
     VehicleSummary,
+    _DrivingPeriodRecoveryOutcome,
+    _filter_idle_event_timestamps,
+    _IdleEventFilterOutcome,
+    _recover_driving_period_timestamps,
 )
 from fleet_telemetry_hub.models.shared_request_models import HTTPMethod
 from fleet_telemetry_hub.models.shared_response_models import ParameterType
@@ -1201,16 +1207,27 @@ class TestMotiveModelDriftAuditCoverage:
 
 
 class TestMotiveModelDriftConsumedFieldsStrictness:
-    """Fields the unifier consumes stay strict -- loud failure on drift is intentional."""
+    """
+    Identifier fields stay strict at the model layer.
 
-    @pytest.mark.parametrize(
-        'field_name',
-        # ``start_kilometers`` and ``end_kilometers`` were previously
-        # in this list; they are now nullable since the unifier
-        # emits a row with null distance rather than dropping the
-        # event when the ELD did not report odometer data.
-        ['period_id', 'start_time', 'end_time'],
-    )
+    Timestamp strictness has moved one layer up: the model now
+    accepts null ``start_time`` / ``end_time``, and the wrapper
+    methods (``DrivingPeriodsResponse.get_driving_periods()`` and
+    ``IdleEventsResponse.get_idle_events()``) apply the
+    recovery / filter decision and emit counter-summary log lines.
+    See ``TestDrivingPeriodTimestampRecovery`` and
+    ``TestIdleEventTimestampFiltering`` for the wrapper-boundary
+    coverage. The unifier still receives records with valid
+    timestamps only -- the loud-failure boundary just lives in
+    the wrapper now.
+
+    Odometer fields (``start_kilometers`` / ``end_kilometers``)
+    were widened earlier under the null-odometer soft-warning
+    change; only the identifiers (``period_id`` /
+    ``event_id``) remain in the strict list here.
+    """
+
+    @pytest.mark.parametrize('field_name', ['period_id'])
     def test_driving_period_rejects_null_in_consumed_fields(
         self, field_name: str
     ) -> None:
@@ -1225,7 +1242,7 @@ class TestMotiveModelDriftConsumedFieldsStrictness:
         with pytest.raises(ValidationError):
             DrivingPeriod.model_validate(payload)
 
-    @pytest.mark.parametrize('field_name', ['event_id', 'start_time', 'end_time'])
+    @pytest.mark.parametrize('field_name', ['event_id'])
     def test_idle_event_rejects_null_in_consumed_fields(
         self, field_name: str
     ) -> None:
@@ -1325,3 +1342,374 @@ class TestDrivingPeriodNullOdometer:
         assert parsed.kilometers_traveled is not None
         expected_delta = 50.25
         assert abs(parsed.kilometers_traveled - expected_delta) < _FUEL_DELTA_TOLERANCE
+
+
+# ============================================================
+# Timestamp recovery / filter at the wrapper boundary
+# ============================================================
+
+_ONE_HOUR_SECONDS = 3600
+_FRACTIONAL_DURATION_SECONDS = 3600.5
+_RECOVERED_SECONDS_PAST_START = 7200  # 2 hours
+_RECOVERED_SECONDS_BEFORE_END = 1800  # 30 minutes
+_OVER_THRESHOLD_SECONDS = _MAX_PLAUSIBLE_DRIVING_PERIOD_SECONDS + 1
+_BACKFILL_FAILURE_DURATION_SECONDS = 74 * 24 * 3600  # the 74-day production failure
+
+
+def _driving_period_payload_with(
+    overrides: dict[str, Any], *, period_id: int | None = None
+) -> dict[str, Any]:
+    """Return a copy of the third-period fixture with the given overrides applied."""
+    payload = dict(_THIRD_PERIOD_RAW)
+    if period_id is not None:
+        payload['id'] = period_id
+    payload.update(overrides)
+    return payload
+
+
+def _idle_event_payload_with(
+    overrides: dict[str, Any], *, event_id: int | None = None
+) -> dict[str, Any]:
+    """Return a copy of the third-idle fixture with the given overrides applied."""
+    payload = dict(_THIRD_IDLE_RAW)
+    if event_id is not None:
+        payload['id'] = event_id
+    payload.update(overrides)
+    return payload
+
+
+def _build_driving_periods_response(
+    period_payloads: list[dict[str, Any]],
+) -> DrivingPeriodsResponse:
+    """Wrap raw period dicts in the response shape the wrapper consumes."""
+    return DrivingPeriodsResponse.model_validate(
+        {
+            'driving_periods': [
+                {'driving_period': payload} for payload in period_payloads
+            ],
+            'pagination': {'per_page': 25, 'page_no': 1, 'total': len(period_payloads)},
+        }
+    )
+
+
+def _build_idle_events_response(
+    event_payloads: list[dict[str, Any]],
+) -> IdleEventsResponse:
+    """Wrap raw idle-event dicts in the response shape the wrapper consumes."""
+    return IdleEventsResponse.model_validate(
+        {
+            'idle_events': [{'idle_event': payload} for payload in event_payloads],
+            'pagination': {'per_page': 25, 'page_no': 1, 'total': len(event_payloads)},
+        }
+    )
+
+
+class TestRecoveryThresholdIsPinned:
+    """Regression guard: the threshold's value is intentional, not a typo."""
+
+    def test_max_plausible_driving_period_seconds_equals_one_day(self) -> None:
+        """The threshold is 24 * 3600 seconds (DOT HOS rationale in the constant comment)."""
+
+        seconds_per_day = 24 * 3600
+        assert seconds_per_day == _MAX_PLAUSIBLE_DRIVING_PERIOD_SECONDS
+
+
+class TestDrivingPeriodTimestampRecovery:
+    """``_recover_driving_period_timestamps`` decides per-record fate."""
+
+    def test_both_timestamps_present_returns_kept_unchanged(self) -> None:
+        """Both timestamps present -> KEPT, record returned identity-unchanged."""
+
+        period = DrivingPeriod.model_validate(_THIRD_PERIOD_RAW)
+
+        recovered_period, outcome = _recover_driving_period_timestamps(period)
+
+        assert outcome is _DrivingPeriodRecoveryOutcome.KEPT
+        assert recovered_period is period
+
+    def test_missing_end_time_with_plausible_duration_recovers_end(self) -> None:
+        """``end_time = start_time + duration`` when end is null and duration is plausible."""
+
+        period = DrivingPeriod.model_validate(
+            _driving_period_payload_with(
+                {'end_time': None, 'duration': _RECOVERED_SECONDS_PAST_START}
+            )
+        )
+
+        recovered_period, outcome = _recover_driving_period_timestamps(period)
+
+        assert outcome is _DrivingPeriodRecoveryOutcome.RECOVERED
+        assert recovered_period is not None
+        assert recovered_period.start_time == period.start_time
+        assert recovered_period.end_time == period.start_time + timedelta(
+            seconds=_RECOVERED_SECONDS_PAST_START
+        )
+
+    def test_missing_start_time_with_plausible_duration_recovers_start(self) -> None:
+        """``start_time = end_time - duration`` when start is null and duration is plausible."""
+
+        period = DrivingPeriod.model_validate(
+            _driving_period_payload_with(
+                {'start_time': None, 'duration': _RECOVERED_SECONDS_BEFORE_END}
+            )
+        )
+
+        recovered_period, outcome = _recover_driving_period_timestamps(period)
+
+        assert outcome is _DrivingPeriodRecoveryOutcome.RECOVERED
+        assert recovered_period is not None
+        assert recovered_period.end_time == period.end_time
+        assert recovered_period.start_time == period.end_time - timedelta(
+            seconds=_RECOVERED_SECONDS_BEFORE_END
+        )
+
+    def test_missing_end_time_with_implausible_duration_is_dropped(self) -> None:
+        """``duration > threshold`` with a missing endpoint -> DROPPED_IMPLAUSIBLE."""
+
+        period = DrivingPeriod.model_validate(
+            _driving_period_payload_with(
+                {'end_time': None, 'duration': _OVER_THRESHOLD_SECONDS}
+            )
+        )
+
+        recovered_period, outcome = _recover_driving_period_timestamps(period)
+
+        assert outcome is _DrivingPeriodRecoveryOutcome.DROPPED_IMPLAUSIBLE
+        assert recovered_period is None
+
+    def test_missing_end_time_with_null_duration_is_dropped(self) -> None:
+        """Missing endpoint AND null ``duration`` -> DROPPED_UNRECOVERABLE."""
+
+        period = DrivingPeriod.model_validate(
+            _driving_period_payload_with({'end_time': None, 'duration': None})
+        )
+
+        recovered_period, outcome = _recover_driving_period_timestamps(period)
+
+        assert outcome is _DrivingPeriodRecoveryOutcome.DROPPED_UNRECOVERABLE
+        assert recovered_period is None
+
+    def test_both_timestamps_null_is_dropped(self) -> None:
+        """Both timestamps null is always unrecoverable regardless of duration."""
+
+        period = DrivingPeriod.model_validate(
+            _driving_period_payload_with(
+                {
+                    'start_time': None,
+                    'end_time': None,
+                    'duration': _ONE_HOUR_SECONDS,
+                }
+            )
+        )
+
+        recovered_period, outcome = _recover_driving_period_timestamps(period)
+
+        assert outcome is _DrivingPeriodRecoveryOutcome.DROPPED_UNRECOVERABLE
+        assert recovered_period is None
+
+    def test_duration_accepts_fractional_float(self) -> None:
+        """``duration`` accepts real-valued seconds (e.g. ``3600.5``)."""
+
+        period = DrivingPeriod.model_validate(
+            _driving_period_payload_with({'duration': _FRACTIONAL_DURATION_SECONDS})
+        )
+
+        assert period.duration == _FRACTIONAL_DURATION_SECONDS
+
+
+class TestDrivingPeriodsResponseUnwrap:
+    """Wrapper-level unwrap applies recovery + emits a single summary warning."""
+
+    def test_mixed_batch_unwraps_with_correct_count_and_order(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """
+        A mixed batch (kept, recovered, dropped-implausible, dropped-unrecoverable)
+        unwraps to exactly the survivors in input order, and ``caplog`` captures
+        one summary warning with the full breakdown.
+        """
+
+        kept_payload = _driving_period_payload_with({}, period_id=4555550001)
+        recovered_payload = _driving_period_payload_with(
+            {'end_time': None, 'duration': _ONE_HOUR_SECONDS},
+            period_id=4555550002,
+        )
+        implausible_payload = _driving_period_payload_with(
+            {'end_time': None, 'duration': _BACKFILL_FAILURE_DURATION_SECONDS},
+            period_id=4555550003,
+        )
+        unrecoverable_payload = _driving_period_payload_with(
+            {'start_time': None, 'end_time': None}, period_id=4555550004
+        )
+        response = _build_driving_periods_response(
+            [
+                kept_payload,
+                recovered_payload,
+                implausible_payload,
+                unrecoverable_payload,
+            ]
+        )
+
+        with caplog.at_level(
+            logging.WARNING,
+            logger='fleet_telemetry_hub.models.motive_responses',
+        ):
+            unwrapped = response.get_driving_periods()
+
+        # Survivors in input order.
+        expected_survivor_count = 2
+        assert len(unwrapped) == expected_survivor_count
+        assert unwrapped[0].period_id == kept_payload['id']
+        assert unwrapped[1].period_id == recovered_payload['id']
+        # Recovered survivor has a synthesized end_time.
+        recovered = unwrapped[1]
+        assert recovered.start_time is not None
+        assert recovered.end_time == recovered.start_time + timedelta(
+            seconds=_ONE_HOUR_SECONDS
+        )
+        # Exactly one summary warning with the full breakdown.
+        warning_records = [
+            record
+            for record in caplog.records
+            if 'Driving-period unwrap' in record.message
+        ]
+        assert len(warning_records) == 1
+        message = warning_records[0].message
+        assert (
+            '1 kept, 1 recovered, '
+            '1 dropped (implausible), 1 dropped (unrecoverable)' in message
+        )
+
+    def test_all_kept_emits_no_warning(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """An all-valid batch unwraps silently -- no warning fires."""
+
+        response = _build_driving_periods_response(
+            [_driving_period_payload_with({}, period_id=4555550001)]
+        )
+
+        with caplog.at_level(
+            logging.WARNING,
+            logger='fleet_telemetry_hub.models.motive_responses',
+        ):
+            unwrapped = response.get_driving_periods()
+
+        assert len(unwrapped) == 1
+        assert not any(
+            'Driving-period unwrap' in record.message for record in caplog.records
+        )
+
+
+class TestIdleEventTimestampFiltering:
+    """``_filter_idle_event_timestamps`` keeps or drops -- no recovery path."""
+
+    def test_both_timestamps_present_returns_kept_unchanged(self) -> None:
+        """Both timestamps present -> KEPT, record returned identity-unchanged."""
+
+        event = IdleEvent.model_validate(_THIRD_IDLE_RAW)
+
+        filtered_event, outcome = _filter_idle_event_timestamps(event)
+
+        assert outcome is _IdleEventFilterOutcome.KEPT
+        assert filtered_event is event
+
+    def test_missing_end_time_is_dropped(self) -> None:
+        """Null ``end_time`` -> DROPPED_UNRECOVERABLE (no duration recovery path)."""
+
+        event = IdleEvent.model_validate(
+            _idle_event_payload_with({'end_time': None})
+        )
+
+        filtered_event, outcome = _filter_idle_event_timestamps(event)
+
+        assert outcome is _IdleEventFilterOutcome.DROPPED_UNRECOVERABLE
+        assert filtered_event is None
+
+    def test_missing_start_time_is_dropped(self) -> None:
+        """Null ``start_time`` -> DROPPED_UNRECOVERABLE."""
+
+        event = IdleEvent.model_validate(
+            _idle_event_payload_with({'start_time': None})
+        )
+
+        filtered_event, outcome = _filter_idle_event_timestamps(event)
+
+        assert outcome is _IdleEventFilterOutcome.DROPPED_UNRECOVERABLE
+        assert filtered_event is None
+
+    def test_both_timestamps_null_is_dropped(self) -> None:
+        """Both null -> DROPPED_UNRECOVERABLE."""
+
+        event = IdleEvent.model_validate(
+            _idle_event_payload_with({'start_time': None, 'end_time': None})
+        )
+
+        filtered_event, outcome = _filter_idle_event_timestamps(event)
+
+        assert outcome is _IdleEventFilterOutcome.DROPPED_UNRECOVERABLE
+        assert filtered_event is None
+
+    def test_duration_seconds_raises_value_error_when_either_timestamp_is_none(
+        self,
+    ) -> None:
+        """``duration_seconds`` names both attributes in the ``ValueError`` message."""
+
+        event = IdleEvent.model_validate(
+            _idle_event_payload_with({'end_time': None})
+        )
+
+        with pytest.raises(ValueError, match='start_time') as exc_info:
+            _ = event.duration_seconds
+        assert 'end_time' in str(exc_info.value)
+
+
+class TestIdleEventsResponseUnwrap:
+    """Wrapper-level unwrap filters null-timestamp records and emits a summary warning."""
+
+    def test_mixed_batch_filters_and_logs_summary(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Kept + dropped batch -> one survivor, one summary warning."""
+
+        kept_payload = _idle_event_payload_with({}, event_id=4900000001)
+        dropped_payload = _idle_event_payload_with(
+            {'end_time': None}, event_id=4900000002
+        )
+        response = _build_idle_events_response([kept_payload, dropped_payload])
+
+        with caplog.at_level(
+            logging.WARNING,
+            logger='fleet_telemetry_hub.models.motive_responses',
+        ):
+            unwrapped = response.get_idle_events()
+
+        assert len(unwrapped) == 1
+        assert unwrapped[0].event_id == kept_payload['id']
+        warning_records = [
+            record
+            for record in caplog.records
+            if 'Idle-event unwrap' in record.message
+        ]
+        assert len(warning_records) == 1
+        assert '1 kept, 1 dropped (unrecoverable)' in warning_records[0].message
+
+    def test_all_kept_emits_no_warning(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """An all-valid batch unwraps silently -- no warning fires."""
+
+        response = _build_idle_events_response(
+            [_idle_event_payload_with({}, event_id=4900000001)]
+        )
+
+        with caplog.at_level(
+            logging.WARNING,
+            logger='fleet_telemetry_hub.models.motive_responses',
+        ):
+            unwrapped = response.get_idle_events()
+
+        assert len(unwrapped) == 1
+        assert not any(
+            'Idle-event unwrap' in record.message for record in caplog.records
+        )
