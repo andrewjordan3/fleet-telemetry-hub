@@ -195,6 +195,7 @@ The utilization pipeline produces a single Parquet file plus a metadata JSON des
 - `providers.motive.company` and `providers.samsara.company` — emitted as the `company` column value in the output. Leave null to emit null company values.
 - `pipeline.default_start_date` — used only on the first run, when no metadata file exists yet.
 - `pipeline.lookback_days` — on subsequent runs, the fetch window starts at `latest_data_date - lookback_days` to catch late-arriving data.
+- `pipeline.max_window_days` — optional cap on the span of a single run's fetch window, in days. `null`/omitted (the default) is uncapped (`end_date = today-1`), preserving prior behavior. When set it must be a **positive int strictly greater than `lookback_days`** (validated at load time) so each backfill batch advances by roughly `max_window_days - lookback_days` days. It is **inert in steady state** — a recent anchor plus the span already reaches the present, so the cap doesn't bite — and it doubles as an **outage-recovery safety cap**: any large gap (a fresh backfill, or catch-up after a multi-day/-month outage) is turned into bounded batches automatically instead of one giant run. Safe to leave set permanently. This is the utilization pipeline's own knob — distinct from the legacy `batch_increment_days`, which it ignores.
 - `storage.parquet_path` — base directory. Utilization output lands in `{parquet_path}/utilization/`.
 - `storage.parquet_compression` — shared with the legacy pipeline.
 
@@ -329,19 +330,32 @@ Field notes:
 
 ## Utilization Pipeline: Backfill
 
+A historical backfill must **not** be run as a single invocation at fleet scale: a 2025→present range across ~1300 vehicles is ~20M rows, and fetching + transforming that span in one shot builds one giant in-memory frame before DuckDB ever sees a row — an out-of-memory failure regardless of how bounded the merge is. Backfill is instead run as **bounded batches** marched forward by the `max_window_days` cap.
+
 To bootstrap or re-run the utilization pipeline over a historical range:
 
-1. Set `pipeline.default_start_date` in the config to the desired backfill start date (e.g., `"2024-01-01"` for a two-year backfill).
-2. Delete the existing utilization output directory if any:
+1. Set `pipeline.default_start_date` to the desired backfill start date (e.g., `"2025-01-01"`).
+2. Set `pipeline.max_window_days` to the span each batch should cover, e.g. `28`–`31` to fetch roughly a month per batch (it must exceed `lookback_days`).
+3. Delete the existing utilization output directory if any:
 
    ```bash
    rm -rf {parquet_path}/utilization/
    ```
 
-3. Run the pipeline once. It will fetch from `default_start_date` through `today - 1` in a single invocation, write a single Parquet, and create the metadata file.
-4. Subsequent runs use the metadata's `latest_data_date` minus `lookback_days` as the window start, so steady-state daily operation resumes automatically.
+4. Drive the batched march to the present:
 
-A multi-year backfill can take 10-30 minutes depending on fleet size due to the per-vehicle Samsara trips loop, but completes in a single run. Backfill is unchanged by the incremental update model — deleting the directory makes the next run a first run, which writes the whole range in one pass; incremental delete-then-append is the steady-state path that takes over on every subsequent run.
+   ```python
+   from fleet_telemetry_hub.utilization_pipeline import UtilizationPipeline
+
+   summary = UtilizationPipeline('config/telemetry_config.yaml').backfill_to_present()
+   print(summary.batches_run, summary.final_end_date, summary.final_row_count)
+   ```
+
+   Each batch fetches and transforms one capped window (which fits in pandas) and delete-then-appends it via the DuckDB merge (which stays bounded on the file side), so the whole backfill runs in bounded memory across many small batches. `backfill_to_present` stops with a `BackfillStalledError` if a batch can't write (an enabled provider failed) — existing data is preserved, so a later call resumes from where it left off. Alternatively, just leave `max_window_days` set and let the **scheduled daily runs** catch up one batch per invocation over successive days.
+
+5. Subsequent steady-state runs use `latest_data_date - lookback_days` as the window start; with a recent anchor the cap is inert and each run covers a single day.
+
+**Memory vs. batches tradeoff:** a smaller `max_window_days` lowers peak per-batch memory but needs more batches (more total runs, and more redundant re-fetch — each batch re-fetches the prior `lookback_days` of overlap). A larger span is fewer batches but higher peak memory. Pick the largest span that comfortably fits the run host's memory. The `max_window_days > lookback_days` requirement guarantees forward progress: each batch advances the anchor by ~`max_window_days - lookback_days` days, so a cap that didn't exceed the lookback would stall or regress the march.
 
 ## Configuration
 
