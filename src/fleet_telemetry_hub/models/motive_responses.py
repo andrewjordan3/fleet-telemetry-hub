@@ -18,7 +18,7 @@ Design Notes:
 import logging
 from collections import Counter
 from datetime import datetime, timedelta
-from enum import Enum, StrEnum
+from enum import StrEnum
 from typing import Any
 
 from pydantic import (
@@ -36,7 +36,7 @@ logger: logging.Logger = logging.getLogger(__name__)
 # =============================================================================
 
 
-class UserRole(str, Enum):
+class UserRole(StrEnum):
     """Valid roles for Motive users."""
 
     DRIVER = 'driver'
@@ -45,7 +45,7 @@ class UserRole(str, Enum):
     SAFETY_MANAGER = 'safety_manager'
 
 
-class UserStatus(str, Enum):
+class UserStatus(StrEnum):
     """Account status for Motive users."""
 
     ACTIVE = 'active'
@@ -53,7 +53,7 @@ class UserStatus(str, Enum):
     DEACTIVATED = 'deactivated'
 
 
-class VehicleStatus(str, Enum):
+class VehicleStatus(StrEnum):
     """Operational status for vehicles."""
 
     ACTIVE = 'active'
@@ -61,14 +61,14 @@ class VehicleStatus(str, Enum):
     DEACTIVATED = 'deactivated'
 
 
-class AvailabilityStatus(str, Enum):
+class AvailabilityStatus(StrEnum):
     """Vehicle availability status."""
 
     IN_SERVICE = 'in_service'
     OUT_OF_SERVICE = 'out_of_service'
 
 
-class DutyStatus(str, Enum):
+class DutyStatus(StrEnum):
     """Driver's current Hours of Service duty status."""
 
     OFF_DUTY = 'off_duty'
@@ -79,14 +79,14 @@ class DutyStatus(str, Enum):
     PERSONAL_CONVEYANCE = 'personal_conveyance'
 
 
-class EldMode(str, Enum):
+class EldMode(StrEnum):
     """ELD operational mode."""
 
     LOGS = 'logs'
     EXEMPT = 'exempt'
 
 
-class VehicleLocationType(str, Enum):
+class VehicleLocationType(StrEnum):
     """Type of location record."""
 
     BREADCRUMB = 'breadcrumb'
@@ -100,7 +100,7 @@ class VehicleLocationType(str, Enum):
     GPS_STOPPED = 'gps_stopped'
 
 
-class FuelType(str, Enum):
+class FuelType(StrEnum):
     """Vehicle fuel types."""
 
     DIESEL = 'diesel'

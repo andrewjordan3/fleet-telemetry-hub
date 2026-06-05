@@ -23,6 +23,7 @@ Transformation rules (locked):
 """
 
 import logging
+from datetime import datetime
 
 from fleet_telemetry_hub.models.motive_responses import (
     DriverSummary,
@@ -74,8 +75,7 @@ def transform_motive_bundle(bundle: MotiveUtilizationBundle) -> list[UnifiedEven
         do not appear in the output.
     """
     logger.info(
-        'Starting Motive transform: date_range=%s, '
-        '%d driving_periods, %d idle_events',
+        'Starting Motive transform: date_range=%s, %d driving_periods, %d idle_events',
         bundle.date_range,
         len(bundle.driving_periods),
         len(bundle.idle_events),
@@ -96,9 +96,7 @@ def transform_motive_bundle(bundle: MotiveUtilizationBundle) -> list[UnifiedEven
             rows.append(driving_row)
 
     for event in bundle.idle_events:
-        idle_row = _idle_event_to_row(
-            event, driving_by_vehicle, bundle.company, drops
-        )
+        idle_row = _idle_event_to_row(event, driving_by_vehicle, bundle.company, drops)
         if idle_row is not None:
             rows.append(idle_row)
 
@@ -149,6 +147,49 @@ def _extract_driver_identity(
     return (driver_id, driver_name)
 
 
+def _require_event_times(
+    start_time: datetime | None,
+    end_time: datetime | None,
+    *,
+    record_kind: str,
+    record_id: int,
+) -> tuple[datetime, datetime]:
+    """Return ``(start, end)`` as non-null datetimes.
+
+    Unreachable by contract: ``get_driving_periods()`` /
+    ``get_idle_events()`` recover or drop null timestamps at the wrapper
+    boundary, so records reaching the transform always have both. The
+    raise is a loud-failure guard for a wrapper-contract violation,
+    mirroring the existing ``IdleEvent.duration_seconds`` /
+    ``IdleEvent.fuel_consumed`` raise-on-null precedent -- not a drop
+    path (it does not increment ``_DROP_REASONS``).
+
+    Args:
+        start_time: The record's start instant, possibly ``None`` at the
+            type level.
+        end_time: The record's end instant, possibly ``None`` at the type
+            level.
+        record_kind: Record type for the error message
+            (``'driving_period'`` / ``'idle_event'``).
+        record_id: The record's provider id, for the error message.
+
+    Returns:
+        ``(start_time, end_time)`` narrowed to non-null ``datetime``.
+
+    Raises:
+        ValueError: If either timestamp is ``None`` -- a wrapper-contract
+            violation that should never occur in practice.
+    """
+    if start_time is None or end_time is None:
+        raise ValueError(
+            f'{record_kind} {record_id} reached the transform with a null '
+            f'timestamp (start={start_time!r}, end={end_time!r}); '
+            f'{record_kind} timestamps are guaranteed non-null by the '
+            f'response-wrapper recovery layer'
+        )
+    return start_time, end_time
+
+
 def _driving_period_to_row(
     period: DrivingPeriod,
     idle_by_vehicle: dict[int, list[IdleEvent]],
@@ -179,10 +220,24 @@ def _driving_period_to_row(
         drops['null_vin'] += 1
         return None
 
+    period_start, period_end = _require_event_times(
+        period.start_time,
+        period.end_time,
+        record_kind='driving_period',
+        record_id=period.period_id,
+    )
     idle_candidates = idle_by_vehicle.get(period.vehicle.vehicle_id, [])
-    idle_windows = [(event.start_time, event.end_time) for event in idle_candidates]
+    idle_windows = [
+        _require_event_times(
+            event.start_time,
+            event.end_time,
+            record_kind='idle_event',
+            record_id=event.event_id,
+        )
+        for event in idle_candidates
+    ]
     duration_seconds = compute_driving_duration_seconds(
-        period.start_time, period.end_time, idle_windows
+        period_start, period_end, idle_windows
     )
     if duration_seconds <= 0:
         logger.warning(
@@ -190,8 +245,8 @@ def _driving_period_to_row(
             'vehicle_id=%d, vin=%s, start=%s, end=%s, computed_seconds=%d',
             period.vehicle.vehicle_id,
             vin,
-            period.start_time,
-            period.end_time,
+            period_start,
+            period_end,
             duration_seconds,
         )
         drops['non_positive_duration'] += 1
@@ -209,8 +264,8 @@ def _driving_period_to_row(
             'start_kilometers=%s, end_kilometers=%s',
             period.vehicle.vehicle_id,
             vin,
-            period.start_time,
-            period.end_time,
+            period_start,
+            period_end,
             period.start_kilometers,
             period.end_kilometers,
         )
@@ -225,8 +280,8 @@ def _driving_period_to_row(
         driver_id=driver_id,
         driver_name=driver_name,
         vin=vin,
-        start_time_utc=period.start_time,
-        end_time_utc=period.end_time,
+        start_time_utc=period_start,
+        end_time_utc=period_end,
         duration_seconds=duration_seconds,
         distance_miles=distance_miles,
     )
@@ -252,13 +307,20 @@ def _idle_event_to_row(
         drops['null_vin'] += 1
         return None
 
+    event_start, event_end = _require_event_times(
+        event.start_time,
+        event.end_time,
+        record_kind='idle_event',
+        record_id=event.event_id,
+    )
+
     driver_id, driver_name = _extract_driver_identity(event.driver)
     if driver_id is None and driver_name is None:
         driver_id, driver_name = _gap_fill_idle_driver(
             event, driving_by_vehicle.get(event.vehicle.vehicle_id, []), vin
         )
 
-    duration_seconds = int((event.end_time - event.start_time).total_seconds())
+    duration_seconds = int((event_end - event_start).total_seconds())
 
     return UnifiedEventRow(
         company=company,
@@ -266,8 +328,8 @@ def _idle_event_to_row(
         driver_id=driver_id,
         driver_name=driver_name,
         vin=vin,
-        start_time_utc=event.start_time,
-        end_time_utc=event.end_time,
+        start_time_utc=event_start,
+        end_time_utc=event_end,
         duration_seconds=duration_seconds,
         distance_miles=None,
     )
@@ -279,16 +341,29 @@ def _gap_fill_idle_driver(
     vin: str,
 ) -> DriverIdentity:
     """Attribute a driver to an unattributed idle event via overlap math."""
-    driving_windows = [
-        DrivingWindow(
-            start=period.start_time,
-            end=period.end_time,
-            driver=_extract_driver_identity(period.driver),
+    event_start, event_end = _require_event_times(
+        event.start_time,
+        event.end_time,
+        record_kind='idle_event',
+        record_id=event.event_id,
+    )
+    driving_windows: list[DrivingWindow] = []
+    for period in driving_periods:
+        period_start, period_end = _require_event_times(
+            period.start_time,
+            period.end_time,
+            record_kind='driving_period',
+            record_id=period.period_id,
         )
-        for period in driving_periods
-    ]
+        driving_windows.append(
+            DrivingWindow(
+                start=period_start,
+                end=period_end,
+                driver=_extract_driver_identity(period.driver),
+            )
+        )
     winner, distribution, warn_flag = attribute_idle_driver(
-        event.start_time, event.end_time, driving_windows
+        event_start, event_end, driving_windows
     )
     if warn_flag:
         logger.warning(
@@ -297,8 +372,8 @@ def _gap_fill_idle_driver(
             'bucket_distribution=%s',
             event.vehicle.vehicle_id,
             vin,
-            event.start_time,
-            event.end_time,
+            event_start,
+            event_end,
             distribution,
         )
     return winner

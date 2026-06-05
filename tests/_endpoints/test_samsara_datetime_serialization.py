@@ -8,7 +8,7 @@ A revert of that fix would be caught by
 test_tz_aware_non_utc_datetime_converts_to_utc below.
 """
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 
 from fleet_telemetry_hub.models.samsara_requests import SamsaraEndpoints
 
@@ -19,7 +19,7 @@ class TestSamsaraDatetimeSerialization:
     def test_tz_aware_utc_datetime_serializes_with_z_suffix(self) -> None:
         """Should serialize tz-aware UTC datetimes with a Z suffix."""
 
-        utc_value = datetime(2026, 5, 6, 0, 0, 0, tzinfo=timezone.utc)
+        utc_value = datetime(2026, 5, 6, 0, 0, 0, tzinfo=UTC)
 
         query = SamsaraEndpoints.VEHICLE_STATS_HISTORY.build_query_params(
             start_time=utc_value,
@@ -47,7 +47,7 @@ class TestSamsaraDatetimeSerialization:
     def test_naive_datetime_assumed_utc(self) -> None:
         """Should format naive datetimes as-is and append Z."""
 
-        naive_value = datetime(2026, 5, 6, 0, 0, 0)
+        naive_value = datetime(2026, 5, 6, 0, 0, 0)  # noqa: DTZ001 -- intentionally naive
 
         query = SamsaraEndpoints.VEHICLE_STATS_HISTORY.build_query_params(
             start_time=naive_value,
@@ -60,7 +60,7 @@ class TestSamsaraDatetimeSerialization:
     def test_string_list_param_still_delegates_to_parent(self) -> None:
         """Should serialize STRING_LIST params as comma-separated values."""
 
-        utc_value = datetime(2026, 5, 6, 0, 0, 0, tzinfo=timezone.utc)
+        utc_value = datetime(2026, 5, 6, 0, 0, 0, tzinfo=UTC)
 
         query = SamsaraEndpoints.VEHICLE_STATS_HISTORY.build_query_params(
             start_time=utc_value,

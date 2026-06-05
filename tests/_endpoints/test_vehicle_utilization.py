@@ -10,7 +10,7 @@ All identifiers in test data are synthetic. No real VINs, vehicle IDs,
 or fleet numbers from any production fleet appear in this file.
 """
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 
 import pytest
@@ -31,6 +31,10 @@ from fleet_telemetry_hub.models.shared_response_models import (
     ProviderCredentials,
 )
 
+# Motive's documented maximum page size for /v2/vehicle_utilization.
+_MOTIVE_DOCUMENTED_MAX_PER_PAGE = 100
+# Absolute tolerance for the engine-on-hours float comparison.
+_FLOAT_TOLERANCE = 1e-9
 
 _SAMPLE_RESPONSE_JSON: dict[str, Any] = {
     'vehicle_utilizations': [
@@ -181,7 +185,10 @@ class TestVehicleUtilizationEndpointDefinition:
     def test_max_per_page_is_100(self) -> None:
         """Should cap page size at Motive's documented maximum of 100."""
 
-        assert MotiveEndpoints.VEHICLE_UTILIZATION.max_per_page == 100
+        assert (
+            MotiveEndpoints.VEHICLE_UTILIZATION.max_per_page
+            == _MOTIVE_DOCUMENTED_MAX_PER_PAGE
+        )
 
     def test_response_model_is_vehicle_utilizations_response(self) -> None:
         """Should parse responses with VehicleUtilizationsResponse."""
@@ -231,7 +238,7 @@ class TestVehicleUtilizationQueryParamSerialization:
     def test_tz_aware_utc_datetime_serializes_with_z_suffix(self) -> None:
         """Should serialize tz-aware UTC datetimes with a Z suffix."""
 
-        utc_value = datetime(2026, 5, 6, 0, 0, 0, tzinfo=timezone.utc)
+        utc_value = datetime(2026, 5, 6, 0, 0, 0, tzinfo=UTC)
 
         query = MotiveEndpoints.VEHICLE_UTILIZATION.build_query_params(
             start_at=utc_value,
@@ -257,7 +264,7 @@ class TestVehicleUtilizationQueryParamSerialization:
     def test_naive_datetime_assumed_utc(self) -> None:
         """Should format naive datetimes as-is and append Z."""
 
-        naive_value = datetime(2026, 5, 6, 0, 0, 0)
+        naive_value = datetime(2026, 5, 6, 0, 0, 0)  # noqa: DTZ001 -- intentionally naive
 
         query = MotiveEndpoints.VEHICLE_UTILIZATION.build_query_params(
             start_at=naive_value,
@@ -271,7 +278,7 @@ class TestVehicleUtilizationQueryParamSerialization:
 
         with pytest.raises(ValueError, match='start_at'):
             MotiveEndpoints.VEHICLE_UTILIZATION.build_query_params(
-                end_at=datetime(2026, 5, 6, 0, 0, 0, tzinfo=timezone.utc),
+                end_at=datetime(2026, 5, 6, 0, 0, 0, tzinfo=UTC),
             )
 
     def test_missing_end_at_raises_value_error(self) -> None:
@@ -279,13 +286,13 @@ class TestVehicleUtilizationQueryParamSerialization:
 
         with pytest.raises(ValueError, match='end_at'):
             MotiveEndpoints.VEHICLE_UTILIZATION.build_query_params(
-                start_at=datetime(2026, 5, 6, 0, 0, 0, tzinfo=timezone.utc),
+                start_at=datetime(2026, 5, 6, 0, 0, 0, tzinfo=UTC),
             )
 
     def test_pagination_params_included(self) -> None:
         """Should include first-page pagination params when none supplied."""
 
-        utc_value = datetime(2026, 5, 6, 0, 0, 0, tzinfo=timezone.utc)
+        utc_value = datetime(2026, 5, 6, 0, 0, 0, tzinfo=UTC)
         endpoint = MotiveEndpoints.VEHICLE_UTILIZATION
 
         query = endpoint.build_query_params(
@@ -301,12 +308,10 @@ class TestVehicleUtilizationQueryParamSerialization:
 class TestVehicleUtilizationRequestSpec:
     """Tests for build_request_spec on VEHICLE_UTILIZATION."""
 
-    def test_url_composition(
-        self, provider_credentials: ProviderCredentials
-    ) -> None:
+    def test_url_composition(self, provider_credentials: ProviderCredentials) -> None:
         """Should compose URL from base_url and endpoint path."""
 
-        utc_value = datetime(2026, 5, 6, 0, 0, 0, tzinfo=timezone.utc)
+        utc_value = datetime(2026, 5, 6, 0, 0, 0, tzinfo=UTC)
 
         spec = MotiveEndpoints.VEHICLE_UTILIZATION.build_request_spec(
             provider_credentials,
@@ -314,17 +319,14 @@ class TestVehicleUtilizationRequestSpec:
             end_at=utc_value,
         )
 
-        assert (
-            spec.url
-            == f'{provider_credentials.base_url}/v2/vehicle_utilization'
-        )
+        assert spec.url == f'{provider_credentials.base_url}/v2/vehicle_utilization'
 
     def test_x_api_key_header_set_from_credentials(
         self, provider_credentials: ProviderCredentials
     ) -> None:
         """Should populate X-API-Key from credentials."""
 
-        utc_value = datetime(2026, 5, 6, 0, 0, 0, tzinfo=timezone.utc)
+        utc_value = datetime(2026, 5, 6, 0, 0, 0, tzinfo=UTC)
 
         spec = MotiveEndpoints.VEHICLE_UTILIZATION.build_request_spec(
             provider_credentials,
@@ -333,8 +335,7 @@ class TestVehicleUtilizationRequestSpec:
         )
 
         assert (
-            spec.headers['X-API-Key']
-            == provider_credentials.api_key.get_secret_value()
+            spec.headers['X-API-Key'] == provider_credentials.api_key.get_secret_value()
         )
 
     def test_query_params_include_z_suffix_datetimes(
@@ -342,7 +343,7 @@ class TestVehicleUtilizationRequestSpec:
     ) -> None:
         """Should serialize start_at and end_at with Z suffix in the spec."""
 
-        utc_value = datetime(2026, 5, 6, 0, 0, 0, tzinfo=timezone.utc)
+        utc_value = datetime(2026, 5, 6, 0, 0, 0, tzinfo=UTC)
 
         spec = MotiveEndpoints.VEHICLE_UTILIZATION.build_request_spec(
             provider_credentials,
@@ -358,7 +359,7 @@ class TestVehicleUtilizationRequestSpec:
     ) -> None:
         """Should include page_no and per_page in the spec query params."""
 
-        utc_value = datetime(2026, 5, 6, 0, 0, 0, tzinfo=timezone.utc)
+        utc_value = datetime(2026, 5, 6, 0, 0, 0, tzinfo=UTC)
 
         spec = MotiveEndpoints.VEHICLE_UTILIZATION.build_request_spec(
             provider_credentials,
@@ -378,7 +379,9 @@ class TestVehicleUtilizationResponseParsing:
 
         parsed = VehicleUtilizationsResponse.model_validate(_SAMPLE_RESPONSE_JSON)
 
-        assert len(parsed.vehicle_utilizations) == 2
+        assert len(parsed.vehicle_utilizations) == len(
+            _SAMPLE_RESPONSE_JSON['vehicle_utilizations']
+        )
 
     def test_get_vehicle_utilizations_unwraps_records(self) -> None:
         """Should unwrap two VehicleUtilization instances from the response."""
@@ -387,7 +390,7 @@ class TestVehicleUtilizationResponseParsing:
 
         items = parsed.get_vehicle_utilizations()
 
-        assert len(items) == 2
+        assert len(items) == len(_SAMPLE_RESPONSE_JSON['vehicle_utilizations'])
         assert all(isinstance(item, VehicleUtilization) for item in items)
 
     def test_pagination_metadata_parsed(self) -> None:
@@ -395,9 +398,10 @@ class TestVehicleUtilizationResponseParsing:
 
         parsed = VehicleUtilizationsResponse.model_validate(_SAMPLE_RESPONSE_JSON)
 
-        assert parsed.pagination.page_no == 1
-        assert parsed.pagination.per_page == 25
-        assert parsed.pagination.total == 1455
+        expected_pagination = _SAMPLE_RESPONSE_JSON['pagination']
+        assert parsed.pagination.page_no == expected_pagination['page_no']
+        assert parsed.pagination.per_page == expected_pagination['per_page']
+        assert parsed.pagination.total == expected_pagination['total']
 
     def test_populated_message_is_preserved(self) -> None:
         """Should preserve the populated diagnostic message verbatim."""
@@ -456,16 +460,20 @@ class TestVehicleUtilizationConvenienceProperties:
     def test_engine_on_seconds_sums_idle_and_driving(self) -> None:
         """Should sum idle_time and driving_time."""
 
-        record = _build_minimal_record(idle_time=100, driving_time=200)
+        idle_seconds = 100
+        driving_seconds = 200
+        record = _build_minimal_record(
+            idle_time=idle_seconds, driving_time=driving_seconds
+        )
 
-        assert record.engine_on_seconds == 300
+        assert record.engine_on_seconds == idle_seconds + driving_seconds
 
     def test_engine_on_hours_divides_seconds_by_3600(self) -> None:
         """Should return engine_on_seconds / 3600."""
 
         record = _build_minimal_record(idle_time=1800, driving_time=1800)
 
-        assert abs(record.engine_on_hours - 1.0) < 1e-9
+        assert abs(record.engine_on_hours - 1.0) < _FLOAT_TOLERANCE
 
     def test_has_communication_issue_true_when_message_populated(self) -> None:
         """Should return True when message contains a diagnostic string."""
@@ -503,9 +511,7 @@ class TestVehicleUtilizationPaginationState:
             page_no=1, per_page=100, total=200
         )
 
-        parsed = MotiveEndpoints.VEHICLE_UTILIZATION.parse_response(
-            response_json
-        )
+        parsed = MotiveEndpoints.VEHICLE_UTILIZATION.parse_response(response_json)
 
         assert parsed.pagination.has_next_page is True
         assert parsed.pagination.next_page_params == {
@@ -520,9 +526,7 @@ class TestVehicleUtilizationPaginationState:
             page_no=2, per_page=100, total=200
         )
 
-        parsed = MotiveEndpoints.VEHICLE_UTILIZATION.parse_response(
-            response_json
-        )
+        parsed = MotiveEndpoints.VEHICLE_UTILIZATION.parse_response(response_json)
 
         assert parsed.pagination.has_next_page is False
 
@@ -533,24 +537,21 @@ class TestVehicleUtilizationPaginationState:
             page_no=1, per_page=100, total=50
         )
 
-        parsed = MotiveEndpoints.VEHICLE_UTILIZATION.parse_response(
-            response_json
-        )
+        parsed = MotiveEndpoints.VEHICLE_UTILIZATION.parse_response(response_json)
 
         assert parsed.pagination.has_next_page is False
 
     def test_pagination_state_includes_total_items(self) -> None:
         """Should propagate the response's total into PaginationState."""
 
+        expected_total_items = 200
         response_json = _build_paginated_response_json(
-            page_no=1, per_page=100, total=200
+            page_no=1, per_page=100, total=expected_total_items
         )
 
-        parsed = MotiveEndpoints.VEHICLE_UTILIZATION.parse_response(
-            response_json
-        )
+        parsed = MotiveEndpoints.VEHICLE_UTILIZATION.parse_response(response_json)
 
-        assert parsed.pagination.total_items == 200
+        assert parsed.pagination.total_items == expected_total_items
 
 
 class TestVehicleUtilizationFrozen:

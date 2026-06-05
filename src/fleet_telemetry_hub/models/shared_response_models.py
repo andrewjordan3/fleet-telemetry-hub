@@ -18,7 +18,7 @@ import logging
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from datetime import UTC, date, datetime
-from enum import Enum
+from enum import StrEnum
 from typing import Any, Self
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
@@ -33,7 +33,7 @@ logger: logging.Logger = logging.getLogger(__name__)
 # =============================================================================
 
 
-class ParameterType(str, Enum):
+class ParameterType(StrEnum):
     """Supported parameter types for automatic serialization."""
 
     STRING = 'string'

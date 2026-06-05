@@ -59,7 +59,12 @@ _TRIP_A_DISTANCE_METERS = 12500
 _TRIP_B_DISTANCE_METERS = 800
 
 TRIPS_FIXTURE: dict[str, Any] = {
-    'data': [
+    # ``/v1/fleet/trips`` is the one legacy *v1* Samsara endpoint: its
+    # records come back under a top-level ``trips`` key, NOT the v2 ``data``
+    # envelope that ``/fleet/vehicles``, ``/fleet/drivers``,
+    # ``/idling/events``, etc. use. This matches ``TripsResponse.trips`` and
+    # the live wire shape -- do not "correct" it back to ``data``.
+    'trips': [
         {
             # The real API does not echo ``vehicleId`` back per-trip;
             # the fetcher boundary stamps it on via ``VehicleTrip``.
@@ -103,7 +108,7 @@ class TestTripModelParsing:
     def test_full_record_parses_with_all_v1_fields(self) -> None:
         """A populated record produces a Trip with every V1 field set."""
 
-        trip = Trip.model_validate(TRIPS_FIXTURE['data'][0])
+        trip = Trip.model_validate(TRIPS_FIXTURE['trips'][0])
 
         assert trip.trip_id == _TRIP_A_ID
         assert trip.driver_id == _DRIVER_ID_STR
@@ -112,7 +117,7 @@ class TestTripModelParsing:
     def test_start_time_parses_to_tz_aware_utc(self) -> None:
         """startMs (int) is coerced into tz-aware UTC datetime matching the input."""
 
-        trip = Trip.model_validate(TRIPS_FIXTURE['data'][0])
+        trip = Trip.model_validate(TRIPS_FIXTURE['trips'][0])
 
         assert trip.start_time.tzinfo is UTC
         assert trip.end_time.tzinfo is UTC
@@ -122,14 +127,14 @@ class TestTripModelParsing:
     def test_driver_id_none_round_trips(self) -> None:
         """driverId: None in the payload yields trip.driver_id is None."""
 
-        trip = Trip.model_validate(TRIPS_FIXTURE['data'][1])
+        trip = Trip.model_validate(TRIPS_FIXTURE['trips'][1])
 
         assert trip.driver_id is None
 
     def test_missing_id_key_leaves_trip_id_none(self) -> None:
         """Omitting the id key leaves trip_id as None (default)."""
 
-        payload = dict(TRIPS_FIXTURE['data'][0])
+        payload = dict(TRIPS_FIXTURE['trips'][0])
         del payload['id']
 
         trip = Trip.model_validate(payload)
@@ -139,7 +144,7 @@ class TestTripModelParsing:
     def test_extras_are_silently_ignored(self) -> None:
         """Non-modeled fields don't raise and don't appear as attributes."""
 
-        trip = Trip.model_validate(TRIPS_FIXTURE['data'][0])
+        trip = Trip.model_validate(TRIPS_FIXTURE['trips'][0])
 
         for unmodeled in (
             'startLocation',
@@ -185,7 +190,7 @@ class TestTripModelParsing:
     ) -> None:
         """Removing any required key produces a ValidationError."""
 
-        payload = dict(TRIPS_FIXTURE['data'][0])
+        payload = dict(TRIPS_FIXTURE['trips'][0])
         del payload[missing_key]
 
         with pytest.raises(ValidationError):

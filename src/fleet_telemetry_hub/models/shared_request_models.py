@@ -8,7 +8,7 @@ to know about provider-specific auth patterns or pagination mechanics.
 """
 
 import logging
-from enum import Enum
+from enum import StrEnum
 from typing import Any, Self
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -16,7 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field
 logger: logging.Logger = logging.getLogger(__name__)
 
 
-class HTTPMethod(str, Enum):
+class HTTPMethod(StrEnum):
     """Supported HTTP methods for API requests."""
 
     GET = 'GET'
