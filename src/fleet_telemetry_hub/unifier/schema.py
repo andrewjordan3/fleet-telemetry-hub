@@ -26,9 +26,11 @@ import pandas as pd
 __all__: list[str] = [
     'COLUMNS',
     'DTYPES',
+    'SORT_COLUMNS',
     'EventType',
     'UnifiedEventRow',
     'build_dataframe',
+    'sort_unified_frame',
 ]
 
 
@@ -126,6 +128,37 @@ COLUMNS: tuple[str, ...] = (
     'distance_miles',
 )
 """Column order of the unified output table."""
+
+
+SORT_COLUMNS: tuple[str, ...] = ('company', 'start_time_utc', 'event_type')
+"""Canonical sort key for the unified output table, in priority order."""
+
+
+def sort_unified_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    """
+    Sort a unified frame by the canonical key, nulls-first and stably.
+
+    This is the single definition of the unified sort order, shared by
+    the per-provider orchestrator and the incremental merge so the two
+    can never drift. ``company`` nulls sort before any non-null company
+    string (matching the orchestrator's historical ``None`` -> ``''``
+    substitution). The sort is stable, so rows sharing a key keep their
+    input order -- this preserves the Motive-before-Samsara concatenation
+    order on ties. Column set and dtypes are unchanged.
+
+    Args:
+        frame: A unified DataFrame carrying the ``SORT_COLUMNS``.
+
+    Returns:
+        A new DataFrame sorted ascending by ``SORT_COLUMNS`` with a clean
+        positional ``RangeIndex``.
+    """
+    return frame.sort_values(
+        by=list(SORT_COLUMNS),
+        ascending=True,
+        na_position='first',
+        kind='stable',
+    ).reset_index(drop=True)
 
 
 DTYPES: dict[str, Any] = {

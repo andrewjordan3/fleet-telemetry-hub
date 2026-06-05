@@ -16,9 +16,11 @@ import pytest
 from fleet_telemetry_hub.unifier.schema import (
     COLUMNS,
     DTYPES,
+    SORT_COLUMNS,
     EventType,
     UnifiedEventRow,
     build_dataframe,
+    sort_unified_frame,
 )
 from tests.unifier._fixtures import dt
 
@@ -30,6 +32,9 @@ _DEFAULT_DRIVER_NAME = 'Sam Snowflake'
 _DEFAULT_COMPANY = 'test_co'
 _ONE_HOUR_SECONDS = 3600
 _TEN_MILES = 10.0
+# A distance distinct from ``_TEN_MILES`` used only to tell two
+# equal-sort-key rows apart in the stable-sort test.
+_OTHER_MILES = 99.0
 
 # Expected pandas dtype name strings used by the DataFrame builder
 # tests; pinned here rather than recomputed from ``DTYPES`` so a
@@ -262,3 +267,127 @@ class TestBuildDataframe:
         end_dtype = frame.dtypes['end_time_utc']
         assert str(start_dtype) == 'datetime64[ns, UTC]'
         assert str(end_dtype) == 'datetime64[ns, UTC]'
+
+
+def _sortable_row(
+    *,
+    company: str | None,
+    start: datetime,
+    event_type: EventType = EventType.DRIVING,
+) -> UnifiedEventRow:
+    """Build a row whose sort-key fields are explicit and others defaulted."""
+    return UnifiedEventRow(
+        company=company,
+        event_type=event_type,
+        driver_id=_DEFAULT_DRIVER_ID,
+        driver_name=_DEFAULT_DRIVER_NAME,
+        vin=_DEFAULT_VIN,
+        start_time_utc=start,
+        end_time_utc=start,
+        duration_seconds=0,
+        distance_miles=None if event_type is EventType.IDLE else _TEN_MILES,
+    )
+
+
+class TestSortUnifiedFrame:
+    """``sort_unified_frame`` orders by ``SORT_COLUMNS`` nulls-first and stably."""
+
+    def test_sort_columns_constant(self) -> None:
+        """The shared sort key is ``(company, start_time_utc, event_type)``."""
+
+        assert SORT_COLUMNS == ('company', 'start_time_utc', 'event_type')
+
+    def test_null_company_sorts_before_non_null(self) -> None:
+        """``company`` nulls land ahead of any non-null company string."""
+
+        frame = build_dataframe(
+            [
+                _sortable_row(company='aaa_co', start=dt(hour=8)),
+                _sortable_row(company=None, start=dt(hour=8)),
+            ]
+        )
+
+        result = sort_unified_frame(frame)
+
+        assert pd.isna(result.at[0, 'company'])
+        assert result.at[1, 'company'] == 'aaa_co'
+
+    def test_ties_broken_by_start_then_event_type(self) -> None:
+        """Equal company sorts by ``start_time_utc`` then ``event_type``."""
+
+        frame = build_dataframe(
+            [
+                _sortable_row(
+                    company='co', start=dt(hour=9), event_type=EventType.IDLE
+                ),
+                _sortable_row(
+                    company='co', start=dt(hour=8), event_type=EventType.IDLE
+                ),
+                _sortable_row(
+                    company='co', start=dt(hour=8), event_type=EventType.DRIVING
+                ),
+            ]
+        )
+
+        result = sort_unified_frame(frame)
+
+        assert result['start_time_utc'].tolist() == [
+            pd.Timestamp(dt(hour=8)),
+            pd.Timestamp(dt(hour=8)),
+            pd.Timestamp(dt(hour=9)),
+        ]
+        assert result['event_type'].tolist() == ['driving', 'idle', 'idle']
+
+    def test_stable_on_equal_keys(self) -> None:
+        """Rows sharing the full sort key keep their input order."""
+
+        # Two rows with an identical sort key, distinguishable only by a
+        # non-key field (distance). Input order must survive the sort.
+        first = _sortable_row(company='co', start=dt(hour=8))
+        second = UnifiedEventRow(
+            company='co',
+            event_type=EventType.DRIVING,
+            driver_id=_DEFAULT_DRIVER_ID,
+            driver_name=_DEFAULT_DRIVER_NAME,
+            vin=_DEFAULT_VIN,
+            start_time_utc=dt(hour=8),
+            end_time_utc=dt(hour=8),
+            duration_seconds=0,
+            distance_miles=_OTHER_MILES,
+        )
+        frame = build_dataframe([first, second])
+
+        result = sort_unified_frame(frame)
+
+        assert result.at[0, 'distance_miles'] == _TEN_MILES
+        assert result.at[1, 'distance_miles'] == _OTHER_MILES
+
+    def test_returns_range_index(self) -> None:
+        """The sorted frame carries a clean positional ``RangeIndex``."""
+
+        frame = build_dataframe(
+            [
+                _sortable_row(company='b_co', start=dt(hour=8)),
+                _sortable_row(company='a_co', start=dt(hour=8)),
+            ]
+        )
+
+        result = sort_unified_frame(frame)
+
+        assert isinstance(result.index, pd.RangeIndex)
+        assert result.index.tolist() == [0, 1]
+
+    def test_columns_and_dtypes_unchanged(self) -> None:
+        """Sorting preserves the locked column order and dtypes."""
+
+        frame = build_dataframe(
+            [
+                _sortable_row(company='b_co', start=dt(hour=8)),
+                _sortable_row(company='a_co', start=dt(hour=9)),
+            ]
+        )
+
+        result = sort_unified_frame(frame)
+
+        assert list(result.columns) == list(COLUMNS)
+        assert result.dtypes.to_dict() == DTYPES

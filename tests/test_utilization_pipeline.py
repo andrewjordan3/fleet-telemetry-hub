@@ -33,7 +33,10 @@ from fleet_telemetry_hub.unifier.schema import COLUMNS, DTYPES
 from fleet_telemetry_hub.utilization.motive_fetcher import MotiveUtilizationBundle
 from fleet_telemetry_hub.utilization.samsara_fetcher import SamsaraUtilizationBundle
 from fleet_telemetry_hub.utilization.vehicle_trip import VehicleTrip
-from fleet_telemetry_hub.utilization_pipeline import UtilizationPipeline
+from fleet_telemetry_hub.utilization_pipeline import (
+    CorruptUtilizationParquetError,
+    UtilizationPipeline,
+)
 
 # ---------------------------------------------------------------------------
 # Configuration helpers
@@ -200,6 +203,48 @@ def _motive_bundle_with_one_period(
     )
 
 
+def _at_date(day: date, hour: int) -> datetime:
+    """Build a tz-aware UTC datetime on a given date (for merge-window tests)."""
+    return datetime(day.year, day.month, day.day, hour, 0, 0, tzinfo=UTC)
+
+
+def _motive_period_at(
+    day: date, *, period_id: int, distance_km: float = 16.09
+) -> DrivingPeriod:
+    """A one-hour Motive driving period on ``day``, with a controllable distance."""
+    start = _at_date(day, 8)
+    end = _at_date(day, 9)
+    return DrivingPeriod.model_validate(
+        {
+            'id': period_id,
+            'start_time': start,
+            'end_time': end,
+            'status': 'complete',
+            'type': 'driving',
+            'duration': int((end - start).total_seconds()),
+            'start_kilometers': 100.0,
+            'end_kilometers': 100.0 + distance_km,
+            'source': 1,
+            'driver': _motive_driver().model_dump(by_alias=True),
+            'vehicle': _motive_vehicle().model_dump(by_alias=True),
+        }
+    )
+
+
+def _motive_bundle_with_periods(
+    periods: list[DrivingPeriod], company: str | None = 'motive_co'
+) -> MotiveUtilizationBundle:
+    """A Motive bundle carrying an explicit list of driving periods."""
+    return MotiveUtilizationBundle(
+        vehicle_utilizations_by_date={},
+        driver_idle_rollups_by_date={},
+        driving_periods=periods,
+        idle_events=[],
+        date_range=(_MAY_14, _MAY_20),
+        company=company,
+    )
+
+
 def _samsara_vehicle() -> SamsaraVehicle:
     return SamsaraVehicle.model_validate(
         {
@@ -309,9 +354,7 @@ class _PatchedFetchers:
         samsara_raises: type[Exception] | None = None,
     ) -> None:
         self._motive_class = _mock_fetcher_class(motive_bundle, raises=motive_raises)
-        self._samsara_class = _mock_fetcher_class(
-            samsara_bundle, raises=samsara_raises
-        )
+        self._samsara_class = _mock_fetcher_class(samsara_bundle, raises=samsara_raises)
         self._patches: list[Any] = []
 
     def __enter__(self) -> '_PatchedFetchers':
@@ -336,6 +379,24 @@ class _PatchedFetchers:
     def __exit__(self, *_args: Any) -> None:
         for patcher in self._patches:
             patcher.stop()
+
+
+def _seed_two_provider_file(tmp_path: Path, parquet_root: Path) -> tuple[bytes, str]:
+    """Lay down a good ``data.parquet`` + ``metadata.json`` via a both-present run.
+
+    Returns the captured ``(parquet_bytes, metadata_text)`` so a follow-up
+    skip run can assert byte-for-byte preservation.
+    """
+    config_path = _write_config(tmp_path, parquet_root=parquet_root)
+    pipeline = UtilizationPipeline(config_path)
+    with _PatchedFetchers(
+        motive_bundle=_motive_bundle_with_one_period(),
+        samsara_bundle=_samsara_bundle_with_one_trip(),
+    ):
+        pipeline.run()
+    parquet_bytes = (pipeline.parquet_dir / 'data.parquet').read_bytes()
+    metadata_text = (pipeline.parquet_dir / 'metadata.json').read_text()
+    return parquet_bytes, metadata_text
 
 
 # ---------------------------------------------------------------------------
@@ -440,9 +501,7 @@ class TestDetermineWindow:
 
         assert len(df) == 0
         # WARNING fired and the prior metadata file was NOT overwritten.
-        assert any(
-            'after end_date' in record.message for record in caplog.records
-        )
+        assert any('after end_date' in record.message for record in caplog.records)
         assert metadata_path.read_text() == original_metadata_text
 
 
@@ -522,11 +581,17 @@ class TestProviderIsolation:
         assert metadata['providers_skipped'] == ['samsara']
         assert metadata['providers_present'] == ['motive']
 
-    def test_motive_fetch_failure_is_isolated(
+    def test_motive_fetch_failure_isolated_but_skips_write(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """A raising Motive fetcher -> ``providers_failed`` + ERROR + Samsara still runs."""
+        """A raising Motive fetcher is caught and logged, but the run skips its writes.
 
+        Motive failing while Samsara succeeds means an enabled provider's
+        data is missing, so the run must not write -- writing the
+        Samsara-only frame would destroy prior Motive data. The fetch is
+        still isolated (Samsara is fetched, the failure is logged at
+        ERROR); only the *write* is skipped.
+        """
 
         config_path = _write_config(tmp_path)
         pipeline = UtilizationPipeline(config_path)
@@ -539,38 +604,34 @@ class TestProviderIsolation:
                 logging.ERROR, logger='fleet_telemetry_hub.utilization_pipeline'
             ),
         ):
-            pipeline.run()
+            df = pipeline.run()
 
-        metadata_path = pipeline.parquet_dir / 'metadata.json'
-        with metadata_path.open() as handle:
-            metadata = json.load(handle)
+        # Skip contract: empty frame, nothing written (first run -> no files).
+        assert len(df) == 0
+        assert not (pipeline.parquet_dir / 'data.parquet').exists()
+        assert not (pipeline.parquet_dir / 'metadata.json').exists()
+        # Isolation is preserved: the Motive failure was caught and logged.
+        assert any('Motive fetch failed' in record.message for record in caplog.records)
 
-        assert metadata['providers_failed'] == ['motive']
-        assert metadata['providers_present'] == ['samsara']
-        assert any(
-            'Motive fetch failed' in record.message for record in caplog.records
-        )
-
-    def test_both_providers_failing_still_writes_parquet_and_metadata(
+    def test_both_providers_failing_skips_writes_on_first_run(
         self, tmp_path: Path
     ) -> None:
-        """Both providers raise -> empty DataFrame written, metadata updated."""
+        """Both providers raise -> empty frame and neither file is written.
+
+        The data-preservation companion (a both-fail run leaving a
+        pre-existing good file untouched) lives in
+        ``TestFailureSkipPreservesData``.
+        """
 
         config_path = _write_config(tmp_path)
         pipeline = UtilizationPipeline(config_path)
 
-        with _PatchedFetchers(
-            motive_raises=RuntimeError, samsara_raises=RuntimeError
-        ):
+        with _PatchedFetchers(motive_raises=RuntimeError, samsara_raises=RuntimeError):
             df = pipeline.run()
 
         assert len(df) == 0
-        metadata_path = pipeline.parquet_dir / 'metadata.json'
-        assert metadata_path.exists()
-        with metadata_path.open() as handle:
-            metadata = json.load(handle)
-        assert metadata['providers_failed'] == ['motive', 'samsara']
-        assert metadata['row_count'] == 0
+        assert not (pipeline.parquet_dir / 'data.parquet').exists()
+        assert not (pipeline.parquet_dir / 'metadata.json').exists()
 
 
 # ---------------------------------------------------------------------------
@@ -783,19 +844,28 @@ class TestMetadataContent:
         assert metadata['by_company'] == {'(null)': 1}
 
     def test_provider_ordering_is_deterministic_in_lists(self, tmp_path: Path) -> None:
-        """Motive precedes Samsara in every provider list."""
+        """Motive precedes Samsara in the persisted provider lists.
 
-        config_path = _write_config(tmp_path, samsara_enabled=False)
+        Driven on a write path (both present) so the lists are actually
+        persisted -- a failed/skipped-only run no longer writes metadata,
+        so ordering must be asserted where metadata exists.
+        """
+
+        config_path = _write_config(tmp_path)
         pipeline = UtilizationPipeline(config_path)
-        with _PatchedFetchers(motive_raises=ValueError):
+        with _PatchedFetchers(
+            motive_bundle=_empty_motive_bundle(),
+            samsara_bundle=_empty_samsara_bundle(),
+        ):
             pipeline.run()
 
         with (pipeline.parquet_dir / 'metadata.json').open() as handle:
             metadata = json.load(handle)
 
-        # motive failed, samsara skipped -- both appear, in fixed order.
-        assert metadata['providers_failed'] == ['motive']
-        assert metadata['providers_skipped'] == ['samsara']
+        # Both present -> the populated list keeps Motive ahead of Samsara.
+        assert metadata['providers_present'] == ['motive', 'samsara']
+        assert metadata['providers_skipped'] == []
+        assert metadata['providers_failed'] == []
 
 
 # ---------------------------------------------------------------------------
@@ -821,7 +891,9 @@ class TestOutputSchema:
         assert list(df.columns) == list(COLUMNS)
         assert df.dtypes.to_dict() == DTYPES
 
-    def test_empty_result_parquet_still_has_correct_schema(self, tmp_path: Path) -> None:
+    def test_empty_result_parquet_still_has_correct_schema(
+        self, tmp_path: Path
+    ) -> None:
         """An empty result still produces a schema-correct readable parquet."""
 
         config_path = _write_config(tmp_path)
@@ -846,9 +918,7 @@ class TestOutputSchema:
 class TestDirectoryCreation:
     """The ``utilization/`` directory is created lazily on first run."""
 
-    def test_first_run_creates_utilization_subdirectory(
-        self, tmp_path: Path
-    ) -> None:
+    def test_first_run_creates_utilization_subdirectory(self, tmp_path: Path) -> None:
         """Fresh ``parquet_path`` -> the ``utilization/`` subdir appears after ``run()``."""
 
         config_path = _write_config(tmp_path)
@@ -927,7 +997,6 @@ class TestLogging:
     ) -> None:
         """INFO records cover start time, fetch window, and completion."""
 
-
         config_path = _write_config(tmp_path)
         pipeline = UtilizationPipeline(config_path)
 
@@ -946,3 +1015,218 @@ class TestLogging:
         assert any('run starting at' in message for message in messages)
         assert any('Fetch window' in message for message in messages)
         assert any('run complete' in message for message in messages)
+
+
+# ---------------------------------------------------------------------------
+# Failure-skip preserves existing data (the direct incident regression)
+# ---------------------------------------------------------------------------
+
+
+class TestFailureSkipPreservesData:
+    """A run that can't write every enabled provider leaves prior files intact.
+
+    This is the direct regression for the incident: a partial fetch must
+    never overwrite ``data.parquet`` with a short/empty frame.
+    """
+
+    def test_samsara_failure_leaves_existing_files_byte_identical(
+        self, tmp_path: Path
+    ) -> None:
+        """Motive present + Samsara failing -> empty return, files untouched."""
+
+        parquet_root = tmp_path / 'telemetry'
+        parquet_bytes, metadata_text = _seed_two_provider_file(tmp_path, parquet_root)
+
+        config_path = _write_config(tmp_path, parquet_root=parquet_root)
+        pipeline = UtilizationPipeline(config_path)
+        with _PatchedFetchers(
+            motive_bundle=_motive_bundle_with_one_period(),
+            samsara_raises=ConnectionError,
+        ):
+            df = pipeline.run()
+
+        assert len(df) == 0
+        assert (pipeline.parquet_dir / 'data.parquet').read_bytes() == parquet_bytes
+        assert (pipeline.parquet_dir / 'metadata.json').read_text() == metadata_text
+
+    def test_both_failing_leaves_existing_files_byte_identical(
+        self, tmp_path: Path
+    ) -> None:
+        """Both providers failing -> empty return, files untouched."""
+
+        parquet_root = tmp_path / 'telemetry'
+        parquet_bytes, metadata_text = _seed_two_provider_file(tmp_path, parquet_root)
+
+        config_path = _write_config(tmp_path, parquet_root=parquet_root)
+        pipeline = UtilizationPipeline(config_path)
+        with _PatchedFetchers(motive_raises=RuntimeError, samsara_raises=RuntimeError):
+            df = pipeline.run()
+
+        assert len(df) == 0
+        assert (pipeline.parquet_dir / 'data.parquet').read_bytes() == parquet_bytes
+        assert (pipeline.parquet_dir / 'metadata.json').read_text() == metadata_text
+
+    # NOTE: an all-providers-disabled run (the other ``should_write``
+    # skip branch, ``not providers_present``) is unreachable here: the
+    # config validator rejects a config with every provider disabled
+    # ("At least one provider must be enabled"), so no such pipeline can
+    # be constructed. The guard term stays as defensive spec; the failed
+    # cases above already exercise the skip-and-preserve path.
+
+    def test_present_plus_skipped_run_does_write(self, tmp_path: Path) -> None:
+        """Positive contrast: present + disabled DOES write (guard isn't over-broad).
+
+        Proves the skip guard distinguishes a *disabled* provider (which
+        legitimately contributes nothing) from a *failed* one.
+        """
+
+        parquet_root = tmp_path / 'telemetry'
+        parquet_bytes, _ = _seed_two_provider_file(tmp_path, parquet_root)
+
+        config_path = _write_config(
+            tmp_path, parquet_root=parquet_root, samsara_enabled=False
+        )
+        pipeline = UtilizationPipeline(config_path)
+        with _PatchedFetchers(motive_bundle=_motive_bundle_with_one_period()):
+            df = pipeline.run()
+
+        # A write occurred: a non-empty frame was returned and the file
+        # changed (the Samsara row was dropped from the rewritten window).
+        assert len(df) > 0
+        assert (pipeline.parquet_dir / 'data.parquet').read_bytes() != parquet_bytes
+        with (pipeline.parquet_dir / 'metadata.json').open() as handle:
+            metadata = json.load(handle)
+        assert metadata['providers_present'] == ['motive']
+        assert metadata['providers_skipped'] == ['samsara']
+
+
+# ---------------------------------------------------------------------------
+# Incremental merge across two runs (union semantics)
+# ---------------------------------------------------------------------------
+
+
+class TestIncrementalMerge:
+    """Two sequential runs prove delete-by-window + append, not whole-file replace."""
+
+    def test_second_run_retains_old_replaces_window_and_appends_new(
+        self, tmp_path: Path
+    ) -> None:
+        """Run 2 keeps pre-window rows, replaces the in-window row, appends new ones."""
+
+        may_10 = date(2026, 5, 10)
+        may_12 = date(2026, 5, 12)
+        may_13 = date(2026, 5, 13)
+        old_window_distance_miles = 10.0  # 16.09 km
+        new_window_distance_miles = 20.0  # 32.18 km
+
+        # default_start_date well before the data; lookback_days=1 so run 2's
+        # window opens at 2026-05-11 (latest_data_date 2026-05-12 minus 1).
+        config_path = _write_config(
+            tmp_path,
+            default_start_date='2026-05-01',
+            lookback_days=1,
+            samsara_enabled=False,
+        )
+        pipeline = UtilizationPipeline(config_path)
+
+        # Run 1 (first run): two driving periods, 2026-05-10 and 2026-05-12.
+        with _PatchedFetchers(
+            motive_bundle=_motive_bundle_with_periods(
+                [
+                    _motive_period_at(may_10, period_id=4550000010),
+                    _motive_period_at(
+                        may_12,
+                        period_id=4550000012,
+                        distance_km=16.09,
+                    ),
+                ]
+            )
+        ):
+            pipeline.run()
+
+        # Run 2: window opens 2026-05-11. An *updated* 2026-05-12 event
+        # (different distance) plus a new 2026-05-13 event.
+        with _PatchedFetchers(
+            motive_bundle=_motive_bundle_with_periods(
+                [
+                    _motive_period_at(
+                        may_12,
+                        period_id=4550000012,
+                        distance_km=32.18,
+                    ),
+                    _motive_period_at(may_13, period_id=4550000013),
+                ]
+            )
+        ):
+            pipeline.run()
+
+        on_disk = pd.read_parquet(pipeline.parquet_dir / 'data.parquet')
+        start_dates = on_disk['start_time_utc'].dt.date.tolist()
+
+        # 2026-05-10 started before the run-2 window -> retained from run 1.
+        assert may_10 in start_dates
+        # 2026-05-13 is the freshly appended event.
+        assert may_13 in start_dates
+        # 2026-05-12 appears exactly once -- old copy deleted, new appended.
+        assert start_dates.count(may_12) == 1
+        # ...and it is the *new* copy (distance updated), not the stale one.
+        may_12_row = on_disk[on_disk['start_time_utc'].dt.date == may_12]
+        assert may_12_row['distance_miles'].iloc[0] == new_window_distance_miles
+        # Sanity: the retained 2026-05-10 row kept its original distance.
+        may_10_row = on_disk[on_disk['start_time_utc'].dt.date == may_10]
+        assert may_10_row['distance_miles'].iloc[0] == old_window_distance_miles
+
+
+# ---------------------------------------------------------------------------
+# Corrupt existing parquet raises (never silently overwrite)
+# ---------------------------------------------------------------------------
+
+
+class TestCorruptParquetRaises:
+    """An unreadable or schema-mismatched existing parquet aborts the run."""
+
+    def test_unreadable_parquet_raises_and_is_not_overwritten(
+        self, tmp_path: Path
+    ) -> None:
+        """Non-parquet garbage bytes -> ``CorruptUtilizationParquetError``, file intact."""
+
+        config_path = _write_config(tmp_path)
+        pipeline = UtilizationPipeline(config_path)
+        pipeline.parquet_dir.mkdir(parents=True, exist_ok=True)
+        garbage = b'this is not a parquet file'
+        (pipeline.parquet_dir / 'data.parquet').write_bytes(garbage)
+
+        with (
+            _PatchedFetchers(
+                motive_bundle=_empty_motive_bundle(),
+                samsara_bundle=_empty_samsara_bundle(),
+            ),
+            pytest.raises(CorruptUtilizationParquetError),
+        ):
+            pipeline.run()
+
+        assert (pipeline.parquet_dir / 'data.parquet').read_bytes() == garbage
+
+    def test_schema_mismatched_parquet_raises_and_is_not_overwritten(
+        self, tmp_path: Path
+    ) -> None:
+        """A valid parquet with the wrong columns -> raises, file untouched."""
+
+        config_path = _write_config(tmp_path)
+        pipeline = UtilizationPipeline(config_path)
+        pipeline.parquet_dir.mkdir(parents=True, exist_ok=True)
+        # Valid parquet, but the column set does not match COLUMNS.
+        wrong_columns = pd.DataFrame({'company': ['x'], 'event_type': ['driving']})
+        wrong_columns.to_parquet(pipeline.parquet_dir / 'data.parquet', index=False)
+        before_bytes = (pipeline.parquet_dir / 'data.parquet').read_bytes()
+
+        with (
+            _PatchedFetchers(
+                motive_bundle=_empty_motive_bundle(),
+                samsara_bundle=_empty_samsara_bundle(),
+            ),
+            pytest.raises(CorruptUtilizationParquetError),
+        ):
+            pipeline.run()
+
+        assert (pipeline.parquet_dir / 'data.parquet').read_bytes() == before_bytes
