@@ -79,6 +79,7 @@ For more information, see README.md and ARCHITECTURE.md.
 
 __version__ = '0.1.0'
 
+from fleet_telemetry_hub._utilization_merge import CorruptUtilizationParquetError
 from fleet_telemetry_hub.client import (
     APIError,
     RateLimitError,
@@ -108,6 +109,7 @@ from fleet_telemetry_hub.utilization_pipeline import UtilizationPipeline
 
 __all__: list[str] = [
     'APIError',
+    'CorruptUtilizationParquetError',
     'EndpointNotFoundError',
     'EndpointRegistry',
     'PartitionedParquetHandler',
@@ -120,8 +122,8 @@ __all__: list[str] = [
     'RateLimitError',
     'TelemetryClient',
     'TransientAPIError',
+    'UtilizationPipeline',
     '__version__',
     'load_config',
     'setup_logger',
-    'UtilizationPipeline',
 ]
