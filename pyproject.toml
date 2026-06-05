@@ -154,9 +154,10 @@ strict_equality = true
 
 exclude = ["examples/", "tests/"]
 
-# Ignore missing imports for third-party packages without type stubs
+# Ignore missing imports for third-party packages without type stubs.
+# truststore is the optional ``tls`` extra and isn't installed in every env.
 [[tool.mypy.overrides]]
-module = ["pandas.*", "pyarrow.*", "duckdb.*"]
+module = ["pandas.*", "pyarrow.*", "duckdb.*", "truststore"]
 ignore_missing_imports = true
 
 ###############################################################################
