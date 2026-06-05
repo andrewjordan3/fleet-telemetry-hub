@@ -195,11 +195,11 @@ The utilization pipeline produces a single Parquet file plus a metadata JSON des
 - `providers.motive.company` and `providers.samsara.company` — emitted as the `company` column value in the output. Leave null to emit null company values.
 - `pipeline.default_start_date` — used only on the first run, when no metadata file exists yet.
 - `pipeline.lookback_days` — on subsequent runs, the fetch window starts at `latest_data_date - lookback_days` to catch late-arriving data.
-- `pipeline.max_window_days` — optional cap on the span of a single run's fetch window, in days. `null`/omitted (the default) is uncapped (`end_date = today-1`), preserving prior behavior. When set it must be a **positive int strictly greater than `lookback_days`** (validated at load time) so each backfill batch advances by roughly `max_window_days - lookback_days` days. It is **inert in steady state** — a recent anchor plus the span already reaches the present, so the cap doesn't bite — and it doubles as an **outage-recovery safety cap**: any large gap (a fresh backfill, or catch-up after a multi-day/-month outage) is turned into bounded batches automatically instead of one giant run. Safe to leave set permanently. This is the utilization pipeline's own knob — distinct from the legacy `batch_increment_days`, which it ignores.
+- `pipeline.max_window_days` — optional cap on the span of a single run's fetch window, in days. `null`/omitted (the default) is uncapped (`end_date = today-1`). When set it must be a **positive int strictly greater than `lookback_days`** (validated at load time) so each backfill batch advances by roughly `max_window_days - lookback_days` days. It is **inert in steady state** — a recent anchor plus the span already reaches the present, so the cap doesn't bite — and it doubles as an **outage-recovery safety cap**: any large gap (a fresh backfill, or catch-up after a multi-day/-month outage) is turned into bounded batches automatically instead of one giant run. Safe to leave set permanently. This is the utilization pipeline's own knob — distinct from `batch_increment_days`, the `PartitionedTelemetryPipeline`'s fetch-batch size, which the utilization pipeline does not read.
 - `storage.parquet_path` — base directory. Utilization output lands in `{parquet_path}/utilization/`.
-- `storage.parquet_compression` — shared with the legacy pipeline.
+- `storage.parquet_compression` — Parquet codec; used by both pipelines.
 
-The remaining `pipeline` fields (`batch_increment_days`, `request_delay_seconds`, `use_truststore`) are consumed by the legacy `PartitionedTelemetryPipeline` and ignored by the utilization pipeline.
+Two further `pipeline` fields are **connection-level**: they are applied by every API client the framework builds (`Provider.from_config` → `TelemetryClient`), so **both** pipelines honor them — `request_delay_seconds` (a global minimum delay between API requests) and `use_truststore` (load TLS roots from the OS trust store; see [SSL/TLS Configuration](#ssltls-configuration)). The one `pipeline` field the utilization pipeline does not read is `batch_increment_days`, which sizes the `PartitionedTelemetryPipeline`'s fetch batches.
 
 **2. Run the pipeline**:
 
@@ -262,7 +262,7 @@ Each run updates `data.parquet` in place with a **delete-then-append** over its 
 2. **Append the fresh window.** The newly-fetched, window-sized unified frame (the only thing pandas holds) is filtered to the same `[W_start, W_end)` window on `start_time_utc` and `UNION ALL`-ed in.
 3. **Sort and write.** The union is globally sorted by a total deterministic key (`company NULLS FIRST, start_time_utc, event_type, …`) — DuckDB spills the sort to disk if it doesn't fit RAM — and written with `COPY` to a temp file that the orchestrator atomically renames onto `data.parquet`.
 
-**On-disk format (Arrow-native, microsecond).** DuckDB's `COPY` writes Arrow-native parquet — microsecond timestamps, no pandas extension metadata. The locked in-memory `DTYPES` (StringDtype / Int64 / Float64 / nanosecond timestamps) is the *contract for pandas consumers*, not the on-disk encoding: a default `pd.read_parquet` of the file yields numpy dtypes, so consumers use the canonical `read_unified_parquet(path)` helper (`pd.read_parquet(path).astype(DTYPES)`) to restore the locked schema in one call. This format change is deliberate and helps the downstream load: the file is now microsecond-resolution on disk, so a direct parquet→BigQuery load (BigQuery is microsecond) no longer needs the previous nanosecond→microsecond rewrite step.
+**On-disk format (Arrow-native, microsecond).** DuckDB's `COPY` writes Arrow-native parquet — microsecond timestamps, no pandas extension metadata. The locked in-memory `DTYPES` (StringDtype / Int64 / Float64 / nanosecond timestamps) is the *contract for pandas consumers*, not the on-disk encoding: a default `pd.read_parquet` of the file yields numpy dtypes, so consumers use the canonical `read_unified_parquet(path)` helper (`pd.read_parquet(path).astype(DTYPES)`) to restore the locked schema in one call. This on-disk encoding helps the downstream load: the file is microsecond-resolution on disk, so a direct parquet→BigQuery load (BigQuery stores microseconds) needs no nanosecond→microsecond conversion.
 
 **Start-anchored normalization.** The incoming frame is filtered to in-window *starts* before appending. This neutralizes a provider whose fetch is overlap-anchored — Samsara's `/v1/fleet/trips` endpoint was verified to return any trip that merely *intersects* the query window, including trips that started earlier. Filtering on start time means a cross-boundary event is anchored to the single window that owns its start, so it is never double-counted at a window's leading edge.
 
@@ -324,7 +324,7 @@ Field notes:
 - `providers_present` / `providers_skipped` / `providers_failed` reflect each provider's outcome for the run. Motive always precedes Samsara in every list. A run is only written when there is at least one present provider and no failed provider (see [Incremental Update](#utilization-pipeline-incremental-update)), so a persisted metadata file always has an empty `providers_failed`.
 - `by_company` maps each `company` value to its row count. Null company values appear under the key `"(null)"`.
 - All timestamps are ISO-8601 UTC with the `Z` suffix.
-- `schema_version` is a literal integer for future schema evolution; bumped on a breaking metadata-shape change. Moving the merge onto DuckDB changed only the parquet *encoding* (Arrow-native / microsecond) and the write path, not the metadata shape, so `schema_version` is **not** bumped.
+- `schema_version` is a literal integer for future schema evolution; it is bumped only on a breaking change to the metadata-JSON shape. The DuckDB merge and the Arrow-native parquet encoding affect only the data file's encoding, not the metadata shape, so it stays `1`.
 
 > **Dependency note:** the utilization pipeline uses [DuckDB](https://duckdb.org/) (a core dependency, `duckdb>=1.0.0`) for the bounded-memory merge and the metadata aggregate.
 
@@ -387,6 +387,8 @@ verify_ssl: "/path/to/ca-bundle.pem"
 pipeline:
   use_truststore: true
 ```
+
+`verify_ssl` is a per-provider setting (under `providers.<name>`), while `use_truststore` is a `pipeline`-section setting. Both act at the connection layer — every API client is built through `Provider.from_config` → `TelemetryClient` — so both apply regardless of which pipeline (or direct `Provider` call) runs.
 
 ### Timeout Configuration
 
