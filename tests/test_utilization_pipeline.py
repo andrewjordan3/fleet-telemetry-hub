@@ -19,6 +19,7 @@ import pandas as pd
 import pytest
 import yaml
 
+from fleet_telemetry_hub._utilization_merge import CorruptUtilizationParquetError
 from fleet_telemetry_hub.models.motive_responses import (
     DriverSummary,
     DrivingPeriod,
@@ -29,14 +30,11 @@ from fleet_telemetry_hub.models.samsara_responses import (
     SamsaraVehicle,
     Trip,
 )
-from fleet_telemetry_hub.unifier.schema import COLUMNS, DTYPES
+from fleet_telemetry_hub.unifier.schema import COLUMNS, DTYPES, read_unified_parquet
 from fleet_telemetry_hub.utilization.motive_fetcher import MotiveUtilizationBundle
 from fleet_telemetry_hub.utilization.samsara_fetcher import SamsaraUtilizationBundle
 from fleet_telemetry_hub.utilization.vehicle_trip import VehicleTrip
-from fleet_telemetry_hub.utilization_pipeline import (
-    CorruptUtilizationParquetError,
-    UtilizationPipeline,
-)
+from fleet_telemetry_hub.utilization_pipeline import UtilizationPipeline
 
 # ---------------------------------------------------------------------------
 # Configuration helpers
@@ -497,9 +495,9 @@ class TestDetermineWindow:
                 logger='fleet_telemetry_hub.utilization_pipeline',
             ),
         ):
-            df = pipeline.run()
+            result = pipeline.run()
 
-        assert len(df) == 0
+        assert result.written is False
         # WARNING fired and the prior metadata file was NOT overwritten.
         assert any('after end_date' in record.message for record in caplog.records)
         assert metadata_path.read_text() == original_metadata_text
@@ -604,10 +602,10 @@ class TestProviderIsolation:
                 logging.ERROR, logger='fleet_telemetry_hub.utilization_pipeline'
             ),
         ):
-            df = pipeline.run()
+            result = pipeline.run()
 
-        # Skip contract: empty frame, nothing written (first run -> no files).
-        assert len(df) == 0
+        # Skip contract: nothing written (first run -> no files).
+        assert result.written is False
         assert not (pipeline.parquet_dir / 'data.parquet').exists()
         assert not (pipeline.parquet_dir / 'metadata.json').exists()
         # Isolation is preserved: the Motive failure was caught and logged.
@@ -627,9 +625,9 @@ class TestProviderIsolation:
         pipeline = UtilizationPipeline(config_path)
 
         with _PatchedFetchers(motive_raises=RuntimeError, samsara_raises=RuntimeError):
-            df = pipeline.run()
+            result = pipeline.run()
 
-        assert len(df) == 0
+        assert result.written is False
         assert not (pipeline.parquet_dir / 'data.parquet').exists()
         assert not (pipeline.parquet_dir / 'metadata.json').exists()
 
@@ -660,7 +658,12 @@ class TestAtomicWrites:
     def test_parquet_write_failure_preserves_existing_file(
         self, tmp_path: Path
     ) -> None:
-        """``to_parquet`` raising -> the pre-existing parquet stays intact."""
+        """The DuckDB merge raising -> the pre-existing parquet stays intact.
+
+        The merge writes a temp file and the orchestrator renames it onto
+        ``data.parquet``; if the merge raises before the rename, the
+        existing file must survive untouched and no ``*.tmp`` may leak.
+        """
 
         config_path = _write_config(tmp_path)
         pipeline = UtilizationPipeline(config_path)
@@ -673,19 +676,23 @@ class TestAtomicWrites:
             pipeline.run()
         first_bytes = (pipeline.parquet_dir / 'data.parquet').read_bytes()
 
-        # Second run patches ``to_parquet`` to raise and the original
-        # parquet must survive the failure.
+        # Second run: the merge raises before the atomic rename, so the
+        # original parquet must survive the failure.
         with (
             _PatchedFetchers(
                 motive_bundle=_motive_bundle_with_one_period(),
                 samsara_bundle=_empty_samsara_bundle(),
             ),
-            patch.object(pd.DataFrame, 'to_parquet', side_effect=OSError('disk full')),
+            patch(
+                'fleet_telemetry_hub.utilization_pipeline.merge_incremental_to_parquet',
+                side_effect=OSError('disk full'),
+            ),
             pytest.raises(OSError, match='disk full'),
         ):
             pipeline.run()
 
         assert (pipeline.parquet_dir / 'data.parquet').read_bytes() == first_bytes
+        assert list(pipeline.parquet_dir.glob('*.tmp')) == []
 
     def test_metadata_write_failure_preserves_existing_metadata(
         self, tmp_path: Path
@@ -874,10 +881,10 @@ class TestMetadataContent:
 
 
 class TestOutputSchema:
-    """The written parquet round-trips with the locked unified schema."""
+    """The written parquet restores the locked schema via the canonical reader."""
 
     def test_round_trip_preserves_columns_and_dtypes(self, tmp_path: Path) -> None:
-        """``pd.read_parquet`` returns a DataFrame with ``COLUMNS`` and ``DTYPES``."""
+        """``read_unified_parquet`` restores ``COLUMNS`` and ``DTYPES`` from disk."""
 
         config_path = _write_config(tmp_path)
         pipeline = UtilizationPipeline(config_path)
@@ -887,7 +894,7 @@ class TestOutputSchema:
         ):
             pipeline.run()
 
-        df = pd.read_parquet(pipeline.parquet_dir / 'data.parquet')
+        df = read_unified_parquet(pipeline.parquet_dir / 'data.parquet')
         assert list(df.columns) == list(COLUMNS)
         assert df.dtypes.to_dict() == DTYPES
 
@@ -904,7 +911,7 @@ class TestOutputSchema:
         ):
             pipeline.run()
 
-        df = pd.read_parquet(pipeline.parquet_dir / 'data.parquet')
+        df = read_unified_parquet(pipeline.parquet_dir / 'data.parquet')
         assert len(df) == 0
         assert list(df.columns) == list(COLUMNS)
         assert df.dtypes.to_dict() == DTYPES
@@ -958,7 +965,7 @@ class TestEndToEnd:
     """One integration test that exercises the entire flow."""
 
     def test_full_happy_path(self, tmp_path: Path) -> None:
-        """Fresh config + canned bundles -> returned DataFrame matches parquet on disk."""
+        """Fresh config + canned bundles -> result, on-disk file, and metadata agree."""
 
         config_path = _write_config(tmp_path)
         pipeline = UtilizationPipeline(config_path)
@@ -967,15 +974,19 @@ class TestEndToEnd:
             motive_bundle=_motive_bundle_with_one_period(),
             samsara_bundle=_samsara_bundle_with_one_trip(),
         ):
-            returned_df = pipeline.run()
+            result = pipeline.run()
 
-        # 1) Returned DataFrame is sorted by (company, start_time_utc, event_type).
-        companies = returned_df['company'].tolist()
+        # 1) The run wrote, and the result row count matches the file.
+        assert result.written is True
+        assert result.row_count == _TWO_PROVIDERS_PRESENT_ROW_COUNT
+
+        # 2) The on-disk file restores the locked schema and is globally sorted
+        #    by (company, start_time_utc, event_type).
+        on_disk = read_unified_parquet(pipeline.parquet_dir / 'data.parquet')
+        assert len(on_disk) == result.row_count
+        assert on_disk.dtypes.to_dict() == DTYPES
+        companies = on_disk['company'].tolist()
         assert companies == sorted(companies)
-
-        # 2) Parquet on disk matches the returned DataFrame.
-        on_disk = pd.read_parquet(pipeline.parquet_dir / 'data.parquet')
-        pd.testing.assert_frame_equal(on_disk, returned_df)
 
         # 3) Metadata reflects the actual content.
         with (pipeline.parquet_dir / 'metadata.json').open() as handle:
@@ -1032,7 +1043,7 @@ class TestFailureSkipPreservesData:
     def test_samsara_failure_leaves_existing_files_byte_identical(
         self, tmp_path: Path
     ) -> None:
-        """Motive present + Samsara failing -> empty return, files untouched."""
+        """Motive present + Samsara failing -> skip, files untouched."""
 
         parquet_root = tmp_path / 'telemetry'
         parquet_bytes, metadata_text = _seed_two_provider_file(tmp_path, parquet_root)
@@ -1043,16 +1054,16 @@ class TestFailureSkipPreservesData:
             motive_bundle=_motive_bundle_with_one_period(),
             samsara_raises=ConnectionError,
         ):
-            df = pipeline.run()
+            result = pipeline.run()
 
-        assert len(df) == 0
+        assert result.written is False
         assert (pipeline.parquet_dir / 'data.parquet').read_bytes() == parquet_bytes
         assert (pipeline.parquet_dir / 'metadata.json').read_text() == metadata_text
 
     def test_both_failing_leaves_existing_files_byte_identical(
         self, tmp_path: Path
     ) -> None:
-        """Both providers failing -> empty return, files untouched."""
+        """Both providers failing -> skip, files untouched."""
 
         parquet_root = tmp_path / 'telemetry'
         parquet_bytes, metadata_text = _seed_two_provider_file(tmp_path, parquet_root)
@@ -1060,9 +1071,9 @@ class TestFailureSkipPreservesData:
         config_path = _write_config(tmp_path, parquet_root=parquet_root)
         pipeline = UtilizationPipeline(config_path)
         with _PatchedFetchers(motive_raises=RuntimeError, samsara_raises=RuntimeError):
-            df = pipeline.run()
+            result = pipeline.run()
 
-        assert len(df) == 0
+        assert result.written is False
         assert (pipeline.parquet_dir / 'data.parquet').read_bytes() == parquet_bytes
         assert (pipeline.parquet_dir / 'metadata.json').read_text() == metadata_text
 
@@ -1088,11 +1099,12 @@ class TestFailureSkipPreservesData:
         )
         pipeline = UtilizationPipeline(config_path)
         with _PatchedFetchers(motive_bundle=_motive_bundle_with_one_period()):
-            df = pipeline.run()
+            result = pipeline.run()
 
-        # A write occurred: a non-empty frame was returned and the file
-        # changed (the Samsara row was dropped from the rewritten window).
-        assert len(df) > 0
+        # A write occurred: a non-empty result and the file changed (the
+        # Samsara row was dropped from the rewritten window).
+        assert result.written is True
+        assert result.row_count > 0
         assert (pipeline.parquet_dir / 'data.parquet').read_bytes() != parquet_bytes
         with (pipeline.parquet_dir / 'metadata.json').open() as handle:
             metadata = json.load(handle)
@@ -1160,7 +1172,7 @@ class TestIncrementalMerge:
         ):
             pipeline.run()
 
-        on_disk = pd.read_parquet(pipeline.parquet_dir / 'data.parquet')
+        on_disk = read_unified_parquet(pipeline.parquet_dir / 'data.parquet')
         start_dates = on_disk['start_time_utc'].dt.date.tolist()
 
         # 2026-05-10 started before the run-2 window -> retained from run 1.

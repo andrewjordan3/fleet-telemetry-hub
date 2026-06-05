@@ -1,25 +1,36 @@
-"""Tests for ``_utilization_merge.merge_incremental``: the pure delete-then-append merge.
+"""Tests for ``_utilization_merge.merge_incremental_to_parquet``: the DuckDB merge.
 
-Frames are built from ``UnifiedEventRow`` + ``build_dataframe`` so the
-cases exercise the real locked schema and its construction-time
-validation. All identifiers are synthetic. The window under test is the
-single UTC day 2026-05-14, i.e. ``W_start = 2026-05-14T00:00Z`` and
+The merge reads an existing parquet, deletes the run window, appends the
+window-sized new frame, globally sorts, and writes a new parquet -- all
+in DuckDB. Cases write the "existing" frame to a temp parquet via
+``build_dataframe(...).to_parquet(...)``, run the merge to an output
+path, then read the result back with the canonical ``read_unified_parquet``
+(the on-disk format is Arrow-native, microsecond timestamps, no pandas
+metadata, so the canonical reader restores the locked ``DTYPES``).
+
+All identifiers are synthetic. The window under test is the single UTC
+day 2026-05-14, i.e. ``W_start = 2026-05-14T00:00Z`` and
 ``W_end = 2026-05-15T00:00Z`` (exclusive).
 """
 
 import logging
 from datetime import UTC, date, datetime
+from pathlib import Path
 
 import pandas as pd
 import pytest
 
-from fleet_telemetry_hub._utilization_merge import merge_incremental
+from fleet_telemetry_hub._utilization_merge import (
+    MergeStats,
+    merge_incremental_to_parquet,
+)
 from fleet_telemetry_hub.unifier.schema import (
     COLUMNS,
     DTYPES,
     EventType,
     UnifiedEventRow,
     build_dataframe,
+    read_unified_parquet,
 )
 
 _VIN = 'TESTVIN0000000001'
@@ -66,31 +77,60 @@ def _row(
     )
 
 
-def _frame(rows: list[UnifiedEventRow]) -> pd.DataFrame:
-    """Materialize a schema-correct frame from the given rows."""
-    return build_dataframe(rows)
+def _write_existing(rows: list[UnifiedEventRow], tmp_path: Path) -> Path:
+    """Write an existing-file frame to a parquet and return its path."""
+    existing_path = tmp_path / 'existing.parquet'
+    build_dataframe(rows).to_parquet(existing_path, index=False)
+    return existing_path
+
+
+def _merge(
+    existing_rows: list[UnifiedEventRow] | None,
+    new_rows: list[UnifiedEventRow],
+    tmp_path: Path,
+) -> tuple[pd.DataFrame, MergeStats]:
+    """Run a merge over the single-day window and read the result back.
+
+    ``existing_rows is None`` models a first run (no existing file); ``[]``
+    models an existing file with zero rows. The result is read via the
+    canonical reader so dtype assertions hold against the Arrow-native
+    on-disk format.
+    """
+    existing_path = (
+        None if existing_rows is None else _write_existing(existing_rows, tmp_path)
+    )
+    output_path = tmp_path / 'out.parquet'
+    stats = merge_incremental_to_parquet(
+        existing_path,
+        build_dataframe(new_rows),
+        _START_DATE,
+        _END_DATE,
+        output_path,
+        compression='snappy',
+        temp_directory=tmp_path,
+    )
+    return read_unified_parquet(output_path), stats
 
 
 class TestFirstRun:
-    """``existing is None`` -- no file yet."""
+    """``existing_path is None`` -- no file yet."""
 
-    def test_non_empty_in_window_new_equals_new_rows(self) -> None:
-        """First run with in-window rows returns exactly those rows."""
+    def test_non_empty_in_window_new_equals_new_rows(self, tmp_path: Path) -> None:
+        """First run with in-window rows writes exactly those rows."""
 
-        new = _frame([_row(_at(14, 8)), _row(_at(14, 20))])
+        new_rows = [_row(_at(14, 8)), _row(_at(14, 20))]
+        result, _ = _merge(None, new_rows, tmp_path)
 
-        result = merge_incremental(None, new, _START_DATE, _END_DATE)
-
-        assert len(result) == len(new)
+        assert len(result) == len(new_rows)
         assert result['start_time_utc'].tolist() == [
             pd.Timestamp(_at(14, 8)),
             pd.Timestamp(_at(14, 20)),
         ]
 
-    def test_empty_new_returns_empty_schema_frame(self) -> None:
-        """First run with an empty new frame yields the locked empty schema."""
+    def test_empty_new_returns_empty_schema_frame(self, tmp_path: Path) -> None:
+        """First run with an empty new frame writes a valid 0-row schema parquet."""
 
-        result = merge_incremental(None, _frame([]), _START_DATE, _END_DATE)
+        result, _ = _merge(None, [], tmp_path)
 
         assert len(result) == 0
         assert list(result.columns) == list(COLUMNS)
@@ -100,37 +140,35 @@ class TestFirstRun:
 class TestWindowDeletion:
     """Existing rows kept or deleted based on the window predicate."""
 
-    def test_out_of_window_existing_all_retained(self) -> None:
+    def test_out_of_window_existing_all_retained(self, tmp_path: Path) -> None:
         """Existing rows entirely outside the window survive; new rows append."""
 
-        existing = _frame([_row(_at(10, 8)), _row(_at(20, 8))])
-        new = _frame([_row(_at(14, 9))])
-
-        result = merge_incremental(existing, new, _START_DATE, _END_DATE)
+        existing_rows = [_row(_at(10, 8)), _row(_at(20, 8))]
+        new_rows = [_row(_at(14, 9))]
+        result, _ = _merge(existing_rows, new_rows, tmp_path)
 
         starts = result['start_time_utc'].tolist()
         assert pd.Timestamp(_at(10, 8)) in starts
         assert pd.Timestamp(_at(20, 8)) in starts
         assert pd.Timestamp(_at(14, 9)) in starts
-        assert len(result) == len(existing) + len(new)
+        assert len(result) == len(existing_rows) + len(new_rows)
 
-    def test_in_window_existing_replaced_by_new(self) -> None:
+    def test_in_window_existing_replaced_by_new(self, tmp_path: Path) -> None:
         """In-window existing rows are deleted and replaced by the new ones."""
 
-        existing = _frame([_row(_at(14, 8), distance_miles=_OLD_DISTANCE)])
-        new = _frame([_row(_at(14, 8), distance_miles=_NEW_DISTANCE)])
-
-        result = merge_incremental(existing, new, _START_DATE, _END_DATE)
+        result, _ = _merge(
+            [_row(_at(14, 8), distance_miles=_OLD_DISTANCE)],
+            [_row(_at(14, 8), distance_miles=_NEW_DISTANCE)],
+            tmp_path,
+        )
 
         assert len(result) == 1
         assert result.at[0, 'distance_miles'] == _NEW_DISTANCE
 
-    def test_empty_new_deletes_window_keeps_outside(self) -> None:
+    def test_empty_new_deletes_window_keeps_outside(self, tmp_path: Path) -> None:
         """Empty new frame deletes the window; out-of-window existing rows stay."""
 
-        existing = _frame([_row(_at(14, 8)), _row(_at(20, 8))])
-
-        result = merge_incremental(existing, _frame([]), _START_DATE, _END_DATE)
+        result, _ = _merge([_row(_at(14, 8)), _row(_at(20, 8))], [], tmp_path)
 
         assert len(result) == 1
         assert result.at[0, 'start_time_utc'] == pd.Timestamp(_at(20, 8))
@@ -139,22 +177,18 @@ class TestWindowDeletion:
 class TestStartAnchoredNormalization:
     """The incoming filter normalizes overlap-anchored fetches to start-anchored."""
 
-    def test_pre_window_new_row_is_dropped(self) -> None:
+    def test_pre_window_new_row_is_dropped(self, tmp_path: Path) -> None:
         """A new row starting before ``W_start`` is absent; in-window rows remain."""
 
-        new = _frame([_row(_at(13, 8)), _row(_at(14, 9))])
-
-        result = merge_incremental(None, new, _START_DATE, _END_DATE)
+        result, _ = _merge(None, [_row(_at(13, 8)), _row(_at(14, 9))], tmp_path)
 
         assert len(result) == 1
         assert result.at[0, 'start_time_utc'] == pd.Timestamp(_at(14, 9))
 
-    def test_cross_midnight_trailing_event_kept_once(self) -> None:
+    def test_cross_midnight_trailing_event_kept_once(self, tmp_path: Path) -> None:
         """A new row starting in-window but ending after ``W_end`` is kept once."""
 
-        new = _frame([_row(_at(14, 23), end=_at(15, 1))])
-
-        result = merge_incremental(None, new, _START_DATE, _END_DATE)
+        result, _ = _merge(None, [_row(_at(14, 23), end=_at(15, 1))], tmp_path)
 
         assert len(result) == 1
         assert result.at[0, 'start_time_utc'] == pd.Timestamp(_at(14, 23))
@@ -164,31 +198,27 @@ class TestStartAnchoredNormalization:
 class TestBoundaryExactness:
     """Half-open ``[W_start, W_end)`` boundary handling for new and existing rows."""
 
-    def test_new_row_at_w_start_kept(self) -> None:
+    def test_new_row_at_w_start_kept(self, tmp_path: Path) -> None:
         """A new row at exactly ``W_start`` is inside the window."""
 
-        new = _frame([_row(_at(14, 0))])
-
-        result = merge_incremental(None, new, _START_DATE, _END_DATE)
+        result, _ = _merge(None, [_row(_at(14, 0))], tmp_path)
 
         assert len(result) == 1
         assert result.at[0, 'start_time_utc'] == _W_START
 
-    def test_new_row_at_w_end_dropped(self) -> None:
+    def test_new_row_at_w_end_dropped(self, tmp_path: Path) -> None:
         """A new row at exactly ``W_end`` is outside the half-open window."""
 
-        new = _frame([_row(_at(15, 0))])
-
-        result = merge_incremental(None, new, _START_DATE, _END_DATE)
+        result, _ = _merge(None, [_row(_at(15, 0))], tmp_path)
 
         assert len(result) == 0
 
-    def test_existing_at_w_start_deleted_at_w_end_retained(self) -> None:
+    def test_existing_at_w_start_deleted_at_w_end_retained(
+        self, tmp_path: Path
+    ) -> None:
         """Existing row at ``W_start`` is deleted; one at ``W_end`` is retained."""
 
-        existing = _frame([_row(_at(14, 0)), _row(_at(15, 0))])
-
-        result = merge_incremental(existing, _frame([]), _START_DATE, _END_DATE)
+        result, _ = _merge([_row(_at(14, 0)), _row(_at(15, 0))], [], tmp_path)
 
         assert len(result) == 1
         assert result.at[0, 'start_time_utc'] == _W_END
@@ -197,13 +227,14 @@ class TestBoundaryExactness:
 class TestDuplicateAcrossFrames:
     """Same event present in both frames must not duplicate."""
 
-    def test_same_in_window_event_kept_once(self) -> None:
+    def test_same_in_window_event_kept_once(self, tmp_path: Path) -> None:
         """An event with the same in-window start in both frames yields one row."""
 
-        existing = _frame([_row(_at(14, 8), distance_miles=_OLD_DISTANCE)])
-        new = _frame([_row(_at(14, 8), distance_miles=_NEW_DISTANCE)])
-
-        result = merge_incremental(existing, new, _START_DATE, _END_DATE)
+        result, _ = _merge(
+            [_row(_at(14, 8), distance_miles=_OLD_DISTANCE)],
+            [_row(_at(14, 8), distance_miles=_NEW_DISTANCE)],
+            tmp_path,
+        )
 
         # Existing copy deleted, new copy appended -- exactly one survives.
         assert len(result) == 1
@@ -211,31 +242,33 @@ class TestDuplicateAcrossFrames:
 
 
 class TestOutputShapeAndOrder:
-    """The merged frame respects the locked schema and sort order."""
+    """The written parquet respects the locked schema and sort order."""
 
-    def test_column_order_and_dtypes_match_schema(self) -> None:
-        """Output columns are in ``COLUMNS`` order with ``DTYPES`` dtypes."""
+    def test_column_order_and_dtypes_match_schema(self, tmp_path: Path) -> None:
+        """Output columns are in ``COLUMNS`` order with ``DTYPES`` dtypes.
 
-        existing = _frame([_row(_at(20, 8))])
-        new = _frame([_row(_at(14, 9))])
+        This is the gate proving the canonical reader bridges the
+        Arrow-native / microsecond drift of a DuckDB-written file back to
+        the locked in-memory ``DTYPES``.
+        """
 
-        result = merge_incremental(existing, new, _START_DATE, _END_DATE)
+        result, _ = _merge([_row(_at(20, 8))], [_row(_at(14, 9))], tmp_path)
 
         assert list(result.columns) == list(COLUMNS)
         assert result.dtypes.to_dict() == DTYPES
 
-    def test_result_sorted_with_clean_range_index(self) -> None:
+    def test_result_sorted_with_clean_range_index(self, tmp_path: Path) -> None:
         """Output is sorted null-company-first, then start, then event_type."""
 
-        new = _frame(
+        result, _ = _merge(
+            None,
             [
                 _row(_at(14, 9), company='zzz_co'),
                 _row(_at(14, 10), company=None),
                 _row(_at(14, 8), company=None),
-            ]
+            ],
+            tmp_path,
         )
-
-        result = merge_incremental(None, new, _START_DATE, _END_DATE)
 
         assert pd.isna(result.at[0, 'company'])
         assert pd.isna(result.at[1, 'company'])
@@ -246,32 +279,130 @@ class TestOutputShapeAndOrder:
         assert isinstance(result.index, pd.RangeIndex)
         assert result.index.tolist() == [0, 1, 2]
 
+    def test_dtype_round_trip_after_merge(self, tmp_path: Path) -> None:
+        """A merged file read via the canonical reader matches ``DTYPES`` exactly."""
+
+        result, _ = _merge(
+            [_row(_at(20, 8))],
+            [
+                _row(_at(14, 8), company=None),
+                _row(_at(14, 9), event_type=EventType.IDLE),
+            ],
+            tmp_path,
+        )
+
+        assert result.dtypes.to_dict() == DTYPES
+
+    def test_sort_is_input_order_independent(self, tmp_path: Path) -> None:
+        """Same rows in different input orders produce byte-identical output."""
+
+        rows_forward = [
+            _row(_at(14, 8), company='b_co'),
+            _row(_at(14, 9), company='a_co'),
+            _row(_at(14, 7), company=None),
+        ]
+        rows_reversed = list(reversed(rows_forward))
+
+        out_a = tmp_path / 'a.parquet'
+        out_b = tmp_path / 'b.parquet'
+        merge_incremental_to_parquet(
+            None,
+            build_dataframe(rows_forward),
+            _START_DATE,
+            _END_DATE,
+            out_a,
+            compression='snappy',
+            temp_directory=tmp_path,
+        )
+        merge_incremental_to_parquet(
+            None,
+            build_dataframe(rows_reversed),
+            _START_DATE,
+            _END_DATE,
+            out_b,
+            compression='snappy',
+            temp_directory=tmp_path,
+        )
+
+        # The total-key ORDER BY makes the on-disk byte order reproducible.
+        assert out_a.read_bytes() == out_b.read_bytes()
+
 
 class TestContractValidation:
-    """The pure function validates its own window contract."""
+    """The function validates its own window contract."""
 
-    def test_start_after_end_raises_value_error(self) -> None:
+    def test_start_after_end_raises_value_error(self, tmp_path: Path) -> None:
         """``start_date > end_date`` raises ``ValueError``."""
 
         with pytest.raises(ValueError, match='start_date'):
-            merge_incremental(None, _frame([]), date(2026, 5, 15), date(2026, 5, 14))
+            merge_incremental_to_parquet(
+                None,
+                build_dataframe([]),
+                date(2026, 5, 15),
+                date(2026, 5, 14),
+                tmp_path / 'out.parquet',
+                compression='snappy',
+                temp_directory=tmp_path,
+            )
+
+
+class TestMergeStats:
+    """The returned ``MergeStats`` counts match the scenario."""
+
+    def test_stats_report_row_deltas(self, tmp_path: Path) -> None:
+        """incoming / kept / deleted / retained / final reflect the merge."""
+
+        # existing: one in-window (deleted), one out-of-window (retained).
+        # new: one pre-window (dropped), one in-window (kept).
+        _, stats = _merge(
+            [_row(_at(14, 8)), _row(_at(20, 8))],
+            [_row(_at(13, 8)), _row(_at(14, 9))],
+            tmp_path,
+        )
+
+        assert stats == MergeStats(
+            incoming=2,
+            kept_in_window=1,
+            existing_deleted=1,
+            existing_retained=1,
+            final_row_count=2,
+        )
+
+    def test_first_run_stats_have_no_existing(self, tmp_path: Path) -> None:
+        """A first run reports zero deleted / retained existing rows."""
+
+        new_rows = [_row(_at(14, 8)), _row(_at(14, 9))]
+        _, stats = _merge(None, new_rows, tmp_path)
+
+        assert stats.existing_deleted == 0
+        assert stats.existing_retained == 0
+        assert stats.kept_in_window == len(new_rows)
+        assert stats.final_row_count == len(new_rows)
 
 
 class TestLogging:
     """The merge emits a single auditable DEBUG row-delta line."""
 
     def test_debug_line_reports_row_deltas(
-        self, caplog: pytest.LogCaptureFixture
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
         """A DEBUG line records incoming/kept/deleted/retained/final counts."""
 
-        existing = _frame([_row(_at(14, 8)), _row(_at(20, 8))])
-        new = _frame([_row(_at(13, 8)), _row(_at(14, 9))])
+        existing_path = _write_existing([_row(_at(14, 8)), _row(_at(20, 8))], tmp_path)
+        new_frame = build_dataframe([_row(_at(13, 8)), _row(_at(14, 9))])
 
         with caplog.at_level(
             logging.DEBUG, logger='fleet_telemetry_hub._utilization_merge'
         ):
-            merge_incremental(existing, new, _START_DATE, _END_DATE)
+            merge_incremental_to_parquet(
+                existing_path,
+                new_frame,
+                _START_DATE,
+                _END_DATE,
+                tmp_path / 'out.parquet',
+                compression='snappy',
+                temp_directory=tmp_path,
+            )
 
         debug_records = [
             record

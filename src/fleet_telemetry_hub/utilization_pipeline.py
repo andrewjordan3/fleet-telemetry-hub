@@ -5,45 +5,46 @@ The pipeline determines its own fetch window from prior metadata and
 config -- no command-line arguments. Output is a single parquet plus
 a metadata JSON, both atomically written to ``{parquet_path}/utilization/``.
 
-Each run updates the file incrementally: the fetch window is deleted
-from the existing parquet and the freshly-fetched window is appended
-(see ``_utilization_merge``). A run writes only when every enabled
-provider succeeded; if any enabled provider's fetch raised, the run is
-skipped and the existing files are left untouched, so a partial fetch
-can never destroy prior data. This is self-healing -- the next run where
-all enabled providers succeed re-fetches the whole lookback window and
-rewrites correctly. An existing parquet that is unreadable or whose
-columns do not match the schema aborts the run rather than being
-silently overwritten.
+Each run updates the file incrementally and with bounded memory: the
+fetch window is deleted from the existing parquet, the freshly-fetched
+window is appended, the union is globally sorted, and the result is
+written -- all in DuckDB, so pandas never materializes the whole
+(unbounded) file (see ``_utilization_merge``). Whole-file metadata
+aggregates come from a second streaming DuckDB pass. A run writes only
+when every enabled provider succeeded; if any enabled provider's fetch
+raised, the run is skipped and the existing files are left untouched, so
+a partial fetch can never destroy prior data. This is self-healing -- the
+next run where all enabled providers succeed re-fetches the whole
+lookback window and rewrites correctly. An existing parquet that is
+unreadable or whose columns do not match the schema aborts the run
+rather than being silently overwritten.
 
-The metadata-derivation logic lives in the sibling private module
-``_utilization_metadata`` so this file stays focused on the
-class-shaped orchestration surface.
+The merge and metadata-derivation logic live in the sibling private
+modules ``_utilization_merge`` and ``_utilization_metadata`` so this file
+stays focused on the class-shaped orchestration surface.
 """
 
 import json
 import logging
 import tempfile
 import time as time_module
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, Literal
+from uuid import uuid4
 
 import pandas as pd
-from pyarrow import (
-    ArrowInvalid as _ArrowInvalid,  # pyright: ignore[reportUnknownVariableType]
-    ArrowIOError as _ArrowIOError,  # pyright: ignore[reportUnknownVariableType]
-)
 
-from fleet_telemetry_hub._utilization_merge import merge_incremental
+from fleet_telemetry_hub._utilization_merge import merge_incremental_to_parquet
 from fleet_telemetry_hub._utilization_metadata import (
     MetadataBuildContext,
     build_metadata_dict,
+    compute_parquet_aggregates,
 )
 from fleet_telemetry_hub.common import setup_logger
 from fleet_telemetry_hub.config import TelemetryConfig, load_config
 from fleet_telemetry_hub.provider import Provider
-from fleet_telemetry_hub.unifier.schema import COLUMNS, build_dataframe
 from fleet_telemetry_hub.unifier.unify import unify
 from fleet_telemetry_hub.utilization.motive_fetcher import (
     MotiveUtilizationBundle,
@@ -54,22 +55,40 @@ from fleet_telemetry_hub.utilization.samsara_fetcher import (
     SamsaraUtilizationFetcher,
 )
 
-__all__: list[str] = ['CorruptUtilizationParquetError', 'UtilizationPipeline']
+__all__: list[str] = ['UtilizationPipeline', 'UtilizationRunResult']
 
 logger: logging.Logger = logging.getLogger(__name__)
-
-# PyArrow exception types raised by ``pd.read_parquet`` on a corrupt or
-# truncated file. They are used in an ``except`` clause, so they must be
-# real types at runtime; the stubs are incomplete, hence the cast --
-# mirrors the convention in ``common/partitioned_file_io.py``.
-ArrowInvalid: type[Exception] = cast(type[Exception], _ArrowInvalid)
-ArrowIOError: type[Exception] = cast(type[Exception], _ArrowIOError)
 
 ProviderStatus = Literal['present', 'skipped', 'failed']
 
 
-class CorruptUtilizationParquetError(Exception):
-    """Raised when an existing data.parquet is unreadable or schema-mismatched."""
+@dataclass(frozen=True, slots=True)
+class UtilizationRunResult:
+    """Outcome of one ``UtilizationPipeline.run()``.
+
+    The run no longer returns a DataFrame -- the whole file is never held
+    in memory -- so callers receive this small summary instead.
+
+    Attributes:
+        written: ``True`` when the run wrote parquet + metadata; ``False``
+            on a skipped run (start-after-end, or a failed/insufficient
+            provider run), in which case existing files are unchanged.
+        row_count: Whole-file row count after the write; ``0`` on a skip.
+        start_date: Inclusive UTC start date of the computed fetch window.
+        end_date: Inclusive UTC end date of the computed fetch window.
+        providers_present: Provider names fetched successfully, in fixed
+            order (empty on a start-after-end skip, before any fetch).
+        providers_skipped: Provider names disabled or absent from config.
+        providers_failed: Provider names that raised during fetch.
+    """
+
+    written: bool
+    row_count: int
+    start_date: date
+    end_date: date
+    providers_present: list[str]
+    providers_skipped: list[str]
+    providers_failed: list[str]
 
 
 class UtilizationPipeline:
@@ -85,6 +104,10 @@ class UtilizationPipeline:
     enabled provider succeeded, though: if any enabled provider failed
     (or none is present), the run skips both writes and preserves the
     existing files, recovering on the next all-success run.
+
+    The read + window-delete + append + global-sort + write run in DuckDB
+    and metadata aggregates stream from the written file, so the whole
+    on-disk parquet is never loaded into pandas.
 
     Attributes:
         config: The loaded ``TelemetryConfig`` instance (read-only).
@@ -123,7 +146,7 @@ class UtilizationPipeline:
         """Return the ``{parquet_path}/utilization/`` output directory."""
         return self._parquet_dir
 
-    def run(self) -> pd.DataFrame:
+    def run(self) -> UtilizationRunResult:
         """
         Execute one full daily run.
 
@@ -131,16 +154,17 @@ class UtilizationPipeline:
         fetches each provider's bundle (isolating failures), runs the
         per-provider transforms, unifies, then -- only if every enabled
         provider succeeded -- merges the window into the existing parquet
-        (delete-then-append) and writes parquet and metadata.
+        (DuckDB delete-then-append), writes parquet, and writes metadata
+        from a streaming aggregate over the written file.
 
         Returns:
-            The full merged DataFrame written to parquet (the whole file,
-            not just this run's window). Empty (zero rows, correct
-            schema) on a skipped run -- either ``start_date`` computed
-            after ``end_date`` (clock skew), or a run where an enabled
-            provider failed or no provider was present. On a skipped run
-            nothing is written and the on-disk parquet and metadata are
-            left unchanged.
+            A ``UtilizationRunResult`` describing the run. ``written`` is
+            ``False`` (and ``row_count`` is 0) on a skipped run -- either
+            ``start_date`` computed after ``end_date`` (clock skew), or a
+            run where an enabled provider failed or no provider was
+            present -- in which case the on-disk parquet and metadata are
+            left unchanged. ``written`` is ``True`` with the whole-file
+            ``row_count`` when the merge wrote the file.
 
         Raises:
             CorruptUtilizationParquetError: If the existing parquet is
@@ -164,7 +188,15 @@ class UtilizationPipeline:
                 start_date,
                 end_date,
             )
-            return build_dataframe([])
+            return UtilizationRunResult(
+                written=False,
+                row_count=0,
+                start_date=start_date,
+                end_date=end_date,
+                providers_present=[],
+                providers_skipped=[],
+                providers_failed=[],
+            )
 
         logger.info('Fetch window: %s to %s (inclusive)', start_date, end_date)
 
@@ -190,16 +222,22 @@ class UtilizationPipeline:
                 providers_failed,
                 providers_skipped,
             )
-            return build_dataframe([])
+            return UtilizationRunResult(
+                written=False,
+                row_count=0,
+                start_date=start_date,
+                end_date=end_date,
+                providers_present=providers_present,
+                providers_skipped=providers_skipped,
+                providers_failed=providers_failed,
+            )
 
-        existing = self._read_existing_parquet()
-        merged = merge_incremental(existing, df, start_date, end_date)
-        self._write_parquet_atomic(merged)
+        row_count = self._merge_and_write(df, start_date, end_date)
 
         run_completed = datetime.now(UTC)
         self._write_metadata(
             MetadataBuildContext(
-                df=merged,
+                aggregates=compute_parquet_aggregates(self._parquet_path),
                 prior_metadata=prior_metadata,
                 run_started=run_started,
                 run_completed=run_completed,
@@ -213,10 +251,18 @@ class UtilizationPipeline:
 
         logger.info(
             'UtilizationPipeline run complete: %d rows, took %.2f seconds',
-            len(merged),
+            row_count,
             time_module.monotonic() - wall_start,
         )
-        return merged
+        return UtilizationRunResult(
+            written=True,
+            row_count=row_count,
+            start_date=start_date,
+            end_date=end_date,
+            providers_present=providers_present,
+            providers_skipped=providers_skipped,
+            providers_failed=providers_failed,
+        )
 
     # --------------------------------------------------------------
     # Window determination
@@ -283,76 +329,56 @@ class UtilizationPipeline:
             return None, 'failed'
 
     # --------------------------------------------------------------
-    # Parquet read (for incremental merge) + atomic write
+    # Incremental merge + atomic write
     # --------------------------------------------------------------
 
-    def _read_existing_parquet(self) -> pd.DataFrame | None:
-        """
-        Read the existing ``data.parquet`` to merge this run's window into.
+    def _merge_and_write(
+        self, new_frame: pd.DataFrame, start_date: date, end_date: date
+    ) -> int:
+        """Merge this run's window into the parquet and atomically replace it.
+
+        Runs the DuckDB delete-then-append merge into a unique temp file
+        in the output directory, then atomically renames it onto
+        ``data.parquet``. The temp file is always removed afterwards, so a
+        failure never leaves a ``*.tmp`` behind, and the rename is the only
+        mutation of ``data.parquet`` -- so an aborted merge (e.g. a corrupt
+        existing file) leaves the prior file intact.
+
+        Args:
+            new_frame: This run's window-sized unified frame.
+            start_date: Inclusive UTC start date of the fetch window.
+            end_date: Inclusive UTC end date of the fetch window.
 
         Returns:
-            The on-disk unified DataFrame, or ``None`` when no parquet
-            file exists yet (a genuine first run). The frame is returned
-            as read -- dtype normalization is the merge's job via its
-            final ``astype(DTYPES)``; the extension dtypes survive the
-            documented parquet round-trip, so ``start_time_utc`` returns
-            tz-aware and the merge's window mask works.
+            The whole-file row count written.
 
         Raises:
-            CorruptUtilizationParquetError: If the file exists but cannot
-                be read, or its column set does not match ``COLUMNS``. An
-                unreadable or foreign file is never silently treated as a
-                first run -- doing so would re-introduce destruction. The
-                file is left intact for inspection.
+            CorruptUtilizationParquetError: If the existing parquet is
+                unreadable or schema-mismatched (aborts before the rename).
+            OSError: If the DuckDB write or the rename fails.
 
         Side Effects:
-            Reads from ``self._parquet_path``. Logs at DEBUG on the
-            absent-file (first-run) case and on a successful read.
+            Creates the output directory; writes and renames
+            ``data.parquet``.
         """
-        if not self._parquet_path.exists():
-            logger.debug(
-                'No existing parquet at %s; treating as first run',
-                self._parquet_path,
-            )
-            return None
-
-        try:
-            frame = pd.read_parquet(self._parquet_path)
-        except (OSError, ArrowInvalid, ArrowIOError) as read_error:
-            raise CorruptUtilizationParquetError(
-                f'Existing parquet at {self._parquet_path} is unreadable'
-            ) from read_error
-
-        actual_columns = set(frame.columns)
-        expected_columns = set(COLUMNS)
-        if actual_columns != expected_columns:
-            unexpected = sorted(actual_columns - expected_columns)
-            missing = sorted(expected_columns - actual_columns)
-            raise CorruptUtilizationParquetError(
-                f'Existing parquet at {self._parquet_path} has a mismatched '
-                f'column set: unexpected={unexpected}, missing={missing}'
-            )
-
-        logger.debug('Read %d existing rows from %s', len(frame), self._parquet_path)
-        return frame
-
-    def _write_parquet_atomic(self, df: pd.DataFrame) -> None:
-        """Write ``df`` to ``data.parquet`` via temp-file + rename."""
+        existing_path = self._parquet_path if self._parquet_path.exists() else None
         self._parquet_dir.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(
-            mode='wb',
-            suffix='.parquet.tmp',
-            dir=self._parquet_dir,
-            delete=False,
-        ) as tmp_file:
-            tmp_path = Path(tmp_file.name)
-        df.to_parquet(
-            tmp_path,
-            index=False,
-            compression=self._config.storage.parquet_compression,
-        )
-        tmp_path.replace(self._parquet_path)
-        logger.info('Wrote %d rows to %s', len(df), self._parquet_path)
+        temp_path = self._parquet_dir / f'data-{uuid4().hex}.parquet.tmp'
+        try:
+            stats = merge_incremental_to_parquet(
+                existing_path,
+                new_frame,
+                start_date,
+                end_date,
+                temp_path,
+                compression=self._config.storage.parquet_compression or 'uncompressed',
+                temp_directory=self._parquet_dir,
+            )
+            temp_path.replace(self._parquet_path)
+        finally:
+            temp_path.unlink(missing_ok=True)
+        logger.info('Wrote %d rows to %s', stats.final_row_count, self._parquet_path)
+        return stats.final_row_count
 
     # --------------------------------------------------------------
     # Metadata read / write
@@ -363,7 +389,8 @@ class UtilizationPipeline:
         if not self._metadata_path.exists():
             return None
         with self._metadata_path.open('r', encoding='utf-8') as metadata_file:
-            return json.load(metadata_file)
+            loaded: dict[str, Any] = json.load(metadata_file)
+            return loaded
 
     def _write_metadata(self, ctx: MetadataBuildContext) -> None:
         """Build and atomically write the metadata JSON for this run."""

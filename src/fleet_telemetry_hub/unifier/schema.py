@@ -19,6 +19,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -30,6 +31,7 @@ __all__: list[str] = [
     'EventType',
     'UnifiedEventRow',
     'build_dataframe',
+    'read_unified_parquet',
     'sort_unified_frame',
 ]
 
@@ -206,3 +208,28 @@ def build_dataframe(rows: Sequence[UnifiedEventRow]) -> pd.DataFrame:
     }
     frame = pd.DataFrame(data, columns=list(COLUMNS))
     return frame.astype(DTYPES)
+
+
+def read_unified_parquet(path: Path) -> pd.DataFrame:
+    """Read a utilization parquet back into the locked in-memory schema.
+
+    DuckDB-written parquet carries Arrow-native types and microsecond
+    timestamps with no pandas extension metadata, so a default read
+    yields numpy dtypes (``object`` / ``int64`` / ``float64`` /
+    ``timestamp[us]``). The ``astype(DTYPES)`` restores ``StringDtype`` /
+    ``Int64`` / ``Float64`` and casts timestamps us -> ns, matching the
+    locked ``DTYPES`` exactly. This is the canonical reader for tests and
+    ad-hoc / external pandas consumers; the pipeline hot path must not
+    call it on the full file.
+
+    Args:
+        path: Path to a utilization parquet file.
+
+    Returns:
+        DataFrame with the nine schema columns in ``COLUMNS`` order and
+        dtypes from ``DTYPES``.
+
+    Side Effects:
+        Reads ``path`` from disk.
+    """
+    return pd.read_parquet(path).astype(DTYPES)
