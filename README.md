@@ -251,7 +251,22 @@ The utilization pipeline writes two files under the `utilization/` subdirectory 
 └── metadata.json
 ```
 
-Both files are atomically written (temp file + rename), so a crash mid-write leaves the previous version intact. There are no date partitions — the entire window's events live in the single `data.parquet`.
+Both files are atomically written (temp file + rename), so a crash mid-write leaves the previous version intact. There are no date partitions — every event lives in the single `data.parquet`, which grows over time. Each run updates it incrementally: the run's fetch window is deleted from the existing file and the freshly-fetched window is appended, rather than replacing the whole file.
+
+## Utilization Pipeline: Incremental Update
+
+Each run updates `data.parquet` in place with a **delete-then-append** over its fetch window, not a whole-file overwrite:
+
+1. **Delete the window.** Rows in the existing file whose `start_time_utc` falls in the half-open window `[W_start, W_end)` (midnight UTC of `start_date` through midnight UTC after `end_date`) are dropped.
+2. **Append the fresh window.** The newly-fetched, unified frame is filtered to the same `[W_start, W_end)` window on `start_time_utc` and appended. The merged result is re-sorted and atomically written via the temp + rename described above.
+
+**Start-anchored normalization.** The incoming frame is filtered to in-window *starts* before appending. This neutralizes a provider whose fetch is overlap-anchored — Samsara's `/v1/fleet/trips` endpoint was verified to return any trip that merely *intersects* the query window, including trips that started earlier. Filtering on start time means a cross-boundary event is anchored to the single window that owns its start, so it is never double-counted at a window's leading edge.
+
+**Coverage can extend slightly before `start_date`.** A consequence of start-anchoring: an event that started before `W_start` but was returned by an overlap fetch is dropped from the incoming frame, because its one authoritative copy already lives in the file under the earlier window that owns its start. File coverage therefore bleeds slightly before `start_date`. This is intended — do not "fix" it by clamping start times to the window.
+
+**Write-only-on-full-success (self-healing).** A run writes only when **every enabled provider succeeded**. If any enabled provider's fetch raised, the run skips both writes and leaves the existing files byte-for-byte intact — a partial fetch can never overwrite good data with a short or empty frame. Recovery is automatic: the next run where all enabled providers succeed re-fetches the whole lookback window and rewrites it correctly, as long as `lookback_days` is at least as long as the worst failure streak. (A disabled provider legitimately contributes nothing and does not block the write; only a *failed* enabled provider does.)
+
+**Raise on corrupt parquet.** When reading the existing `data.parquet` to merge, an unreadable file or one whose columns do not match the schema aborts the run with a `CorruptUtilizationParquetError`, leaving the file untouched for inspection. A corrupt or foreign file is never silently treated as a first run — doing so would re-introduce whole-file destruction.
 
 ## Unified Utilization Schema
 
@@ -299,11 +314,13 @@ Each run writes a `metadata.json` alongside the Parquet. The next run reads it t
 
 Field notes:
 
-- `latest_data_date` is the operational anchor for the next run's window start (subtracts `lookback_days`). On an empty run, the prior value is preserved so a failed run doesn't reset the anchor.
-- `providers_present` / `providers_skipped` / `providers_failed` reflect each provider's outcome for the run. Motive always precedes Samsara in every list.
+- `latest_data_date` is the operational anchor for the next run's window start (subtracts `lookback_days`). On an empty run, the prior value is preserved so a no-data run doesn't reset the anchor. Retaining older data across an incremental merge does not move it: the newest event always lives in the most recent window, so the anchor reflects the freshest data regardless of how much history the file holds.
+- `row_count` and `by_company` are **whole-file totals** — they describe the full merged `data.parquet` after the run, not just the rows fetched in this run's window.
+- `fetch_window_start_utc` / `fetch_window_end_utc` still describe *this run's* window, independent of the file's total extent.
+- `providers_present` / `providers_skipped` / `providers_failed` reflect each provider's outcome for the run. Motive always precedes Samsara in every list. A run is only written when there is at least one present provider and no failed provider (see [Incremental Update](#utilization-pipeline-incremental-update)), so a persisted metadata file always has an empty `providers_failed`.
 - `by_company` maps each `company` value to its row count. Null company values appear under the key `"(null)"`.
 - All timestamps are ISO-8601 UTC with the `Z` suffix.
-- `schema_version` is a literal integer for future schema evolution; bumped on a breaking metadata-shape change.
+- `schema_version` is a literal integer for future schema evolution; bumped on a breaking metadata-shape change. The incremental-update change is a write-strategy change only — it does not alter the file shape, so `schema_version` is **not** bumped.
 
 ## Utilization Pipeline: Backfill
 
@@ -319,7 +336,7 @@ To bootstrap or re-run the utilization pipeline over a historical range:
 3. Run the pipeline once. It will fetch from `default_start_date` through `today - 1` in a single invocation, write a single Parquet, and create the metadata file.
 4. Subsequent runs use the metadata's `latest_data_date` minus `lookback_days` as the window start, so steady-state daily operation resumes automatically.
 
-A multi-year backfill can take 10-30 minutes depending on fleet size due to the per-vehicle Samsara trips loop, but completes in a single run.
+A multi-year backfill can take 10-30 minutes depending on fleet size due to the per-vehicle Samsara trips loop, but completes in a single run. Backfill is unchanged by the incremental update model — deleting the directory makes the next run a first run, which writes the whole range in one pass; incremental delete-then-append is the steady-state path that takes over on every subsequent run.
 
 ## Configuration
 
