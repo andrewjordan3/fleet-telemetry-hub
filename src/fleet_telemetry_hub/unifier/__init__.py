@@ -27,6 +27,7 @@ from fleet_telemetry_hub.unifier.schema import (
     EventType,
     UnifiedEventRow,
     build_dataframe,
+    read_unified_parquet,
     sort_unified_frame,
 )
 from fleet_telemetry_hub.unifier.text_normalization import (
@@ -53,6 +54,7 @@ __all__: list[str] = [
     'nfkc_strip',
     'normalize_driver_name',
     'nullify_tokens',
+    'read_unified_parquet',
     'sort_unified_frame',
     'sum_overlap_seconds',
     'transform_motive_bundle',

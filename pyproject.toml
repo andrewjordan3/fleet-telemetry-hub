@@ -32,6 +32,7 @@ dependencies = [
     "pyyaml>=6.0.0",
     "pandas>=2.0.0",
     "pyarrow>=14.0.0",
+    "duckdb>=1.0.0",
     "httpx>=0.28.0",
     "tenacity>=9.1.0",
 ]
@@ -155,7 +156,7 @@ exclude = ["examples/", "tests/"]
 
 # Ignore missing imports for third-party packages without type stubs
 [[tool.mypy.overrides]]
-module = ["pandas.*", "pyarrow.*"]
+module = ["pandas.*", "pyarrow.*", "duckdb.*"]
 ignore_missing_imports = true
 
 ###############################################################################

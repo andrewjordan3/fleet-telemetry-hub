@@ -1,162 +1,331 @@
-# pyright: reportUnknownVariableType=false
-"""Incremental delete-then-append merge for ``UtilizationPipeline``.
+"""DuckDB-backed incremental delete-then-append merge for ``UtilizationPipeline``.
 
-Internal companion module to ``utilization_pipeline.py``: holds the
-pure, side-effect-free logic that merges a freshly fetched unified
-frame into the existing on-disk frame under the half-open UTC fetch
-window. The orchestrator owns reading and writing parquet; this module
-only transforms in-memory DataFrames so the merge semantics can be
-exercised in isolation.
+Companion module to ``utilization_pipeline.py``. Owns the read + window
+delete + append + global sort + write of the output parquet entirely in
+DuckDB, so pandas never materializes the whole (unbounded) on-disk file:
+DuckDB streams ``read_parquet``, the window delete is a ``WHERE``, the
+append is ``UNION ALL`` over the registered window-sized new frame, the
+global sort is ``ORDER BY`` (spilling to ``temp_directory`` when it does
+not fit RAM), and the result is written with ``COPY``.
 
-The module-level pyright suppression mirrors the convention in the
-sibling ``_utilization_metadata.py``: boolean-mask row selection and
-``pd.concat`` return partially-Unknown types in strict mode, and the
-legible alternative is a swarm of ``cast`` calls that CLAUDE.md
-discourages. The pandas boundary here is small -- one mask, one concat,
-one ``astype`` -- so the trade-off is favorable.
+The merge normalizes every provider to start-anchored: both the incoming
+frame and the existing file are filtered on ``start_time_utc`` in the
+half-open window ``[W_start, W_end)``. Samsara's ``/v1/fleet/trips``
+endpoint is overlap-anchored (it returns any trip intersecting the query
+window), so filtering on start keeps a cross-boundary event from being
+duplicated at a window's leading edge. Events starting before the window
+are dropped from the incoming frame by design -- their single
+authoritative copy already lives under the earlier window that owns
+their start.
 
-The merge normalizes every provider to start-anchored on our side: the
-incoming frame is filtered to ``start_time_utc`` inside the window
-before it is appended, and the same window is deleted from the existing
-frame. Samsara's ``/v1/fleet/trips`` endpoint is overlap-anchored -- it
-returns any trip intersecting the query window, including trips that
-started before it -- while Motive ``driving_periods`` and Samsara
-``/idling/events`` are start-anchored. Filtering on start time is what
-keeps a cross-boundary event from being duplicated at the leading edge
-of each run. Events that start before the window are dropped from the
-incoming frame by design: their single authoritative copy already lives
-in the file under the earlier window that owns their start.
+The parquet DuckDB writes is Arrow-native (microsecond timestamps, no
+pandas extension metadata). Consumers restore the locked in-memory
+``DTYPES`` via ``unifier.schema.read_unified_parquet``.
 """
 
 import logging
-from datetime import date, timedelta
+from dataclasses import dataclass
+from datetime import UTC, date, datetime, time, timedelta
+from pathlib import Path
 
+import duckdb
 import pandas as pd
 
-from fleet_telemetry_hub.unifier.schema import (
-    COLUMNS,
-    DTYPES,
-    build_dataframe,
-    sort_unified_frame,
-)
+from fleet_telemetry_hub.unifier.schema import COLUMNS
 
-__all__: list[str] = ['merge_incremental']
+__all__: list[str] = [
+    'CorruptUtilizationParquetError',
+    'MergeStats',
+    'merge_incremental_to_parquet',
+]
 
 logger: logging.Logger = logging.getLogger(__name__)
 
+# SQL fragments built once from the locked column tuple.
+_COLUMN_LIST: str = ', '.join(COLUMNS)
 
-def merge_incremental(
-    existing: pd.DataFrame | None,
+# Half-open window predicate on ``start_time_utc``; the two ``?`` bind to
+# ``(W_start, W_end)``. Used verbatim for the incoming filter and, negated,
+# for the existing-row deletion, so the two predicates can never drift.
+_WINDOW_PREDICATE: str = 'start_time_utc >= ? AND start_time_utc < ?'
+
+# Total deterministic ordering key. SQL ``ORDER BY`` is not stable, so the
+# key must cover every column to make the on-disk byte order reproducible
+# run to run. ``NULLS FIRST`` on ``company`` matches pandas
+# ``na_position='first'``.
+_ORDER_BY: str = (
+    'company ASC NULLS FIRST, start_time_utc ASC, event_type ASC, '
+    'driver_id, driver_name, vin, end_time_utc, duration_seconds, distance_miles'
+)
+
+
+class CorruptUtilizationParquetError(Exception):
+    """Raised when an existing data.parquet is unreadable or schema-mismatched."""
+
+
+@dataclass(frozen=True, slots=True)
+class MergeStats:
+    """Row-delta counts for one merge, for logging and the run result.
+
+    Attributes:
+        incoming: Rows in ``new_frame``.
+        kept_in_window: ``new_frame`` rows with start in ``[W_start, W_end)``.
+        existing_deleted: Existing rows removed (0 on a first run).
+        existing_retained: Existing rows kept (outside the window).
+        final_row_count: Rows written to the output parquet.
+    """
+
+    incoming: int
+    kept_in_window: int
+    existing_deleted: int
+    existing_retained: int
+    final_row_count: int
+
+
+def merge_incremental_to_parquet(  # noqa: PLR0913 -- mandated public merge entrypoint; its inputs (source path, in-memory frame, the window's two dates, destination path, two write options) are heterogeneous and don't form a cohesive dataclass, and splitting the single read-merge-sort-write op would fragment an atomic unit
+    existing_path: Path | None,
     new_frame: pd.DataFrame,
     start_date: date,
     end_date: date,
-) -> pd.DataFrame:
-    """Merge a freshly fetched unified frame into the existing one by window.
+    output_path: Path,
+    *,
+    compression: str,
+    temp_directory: Path,
+) -> MergeStats:
+    """Merge a freshly fetched window into the existing parquet, in DuckDB.
 
-    Implements the incremental delete-then-append model: the half-open
-    UTC window ``[W_start, W_end)`` is deleted from ``existing`` and
-    replaced by the rows of ``new_frame`` whose ``start_time_utc`` falls
-    inside that window. Filtering the incoming frame to in-window starts
-    normalizes every provider to start-anchored, so an overlap-anchored
-    fetch cannot duplicate a cross-boundary event at the leading edge.
-    Events starting before ``W_start`` are dropped from the incoming
-    frame by design -- their authoritative copy already lives in the file
-    under the earlier window that owns their start.
-
-    Both inputs are assumed to already carry the schema ``COLUMNS`` with
-    the schema dtypes; validating an on-disk frame's shape is the
-    orchestrator's responsibility. An empty ``new_frame`` is valid input:
-    the window is deleted from ``existing`` and nothing is appended.
+    Deletes the half-open UTC window ``[W_start, W_end)`` from
+    ``existing_path`` and appends the rows of ``new_frame`` whose
+    ``start_time_utc`` falls inside that window, globally sorts the union
+    by the total deterministic key, and writes it to ``output_path`` with
+    ``COPY``. The whole pipeline streams in DuckDB; pandas only holds the
+    window-sized ``new_frame``. Atomicity (renaming ``output_path`` onto
+    ``data.parquet``) is the caller's responsibility.
 
     Args:
-        existing: The current on-disk unified frame, or ``None`` on a
-            first run with no file yet.
-        new_frame: The freshly fetched unified frame for this run.
+        existing_path: Path to the current on-disk parquet, or ``None`` on
+            a first run with no file yet.
+        new_frame: The freshly fetched, window-sized unified frame.
         start_date: Inclusive UTC start date of the fetch window.
         end_date: Inclusive UTC end date of the fetch window.
+        output_path: Destination parquet path (a caller-provided temp
+            path) that ``COPY`` writes.
+        compression: Parquet codec for ``COPY`` (e.g. ``'snappy'``,
+            ``'zstd'``, ``'uncompressed'``).
+        temp_directory: Directory DuckDB spills the global ``ORDER BY`` to
+            when it does not fit in memory. Must already exist.
 
     Returns:
-        A new unified DataFrame with the window's rows replaced, sorted
-        by ``SORT_COLUMNS`` with a clean ``RangeIndex`` and normalized to
-        the locked ``COLUMNS`` order and ``DTYPES``.
+        ``MergeStats`` with the incoming / kept / deleted / retained /
+        final row counts.
 
     Raises:
         ValueError: If ``start_date > end_date``.
+        CorruptUtilizationParquetError: If ``existing_path`` is unreadable
+            or its column set does not match ``COLUMNS``. Never silently
+            treated as a first run.
 
     Side Effects:
-        Emits a single ``DEBUG`` log line recording the row deltas
-        (incoming, kept, deleted, retained, final). Performs no I/O.
+        Writes ``output_path`` via DuckDB ``COPY``; reads ``existing_path``
+        if given. Emits one ``DEBUG`` row-delta line. Does not rename or
+        delete any file.
     """
     if start_date > end_date:
         raise ValueError(f'start_date ({start_date}) must be <= end_date ({end_date})')
 
-    window_start, window_end = _window_bounds(start_date, end_date)
+    window = _window_bounds(start_date, end_date)
 
-    filtered_new = new_frame.loc[
-        _start_in_window_mask(new_frame, window_start, window_end)
-    ]
+    with duckdb.connect() as connection:
+        connection.execute(f'SET temp_directory = {_sql_literal(str(temp_directory))}')
 
-    if existing is None:
-        retained = build_dataframe([])
-    else:
-        retained = existing.loc[
-            ~_start_in_window_mask(existing, window_start, window_end)
-        ]
+        if existing_path is not None:
+            _validate_existing_columns(connection, existing_path)
 
-    merged = pd.concat([retained, filtered_new], ignore_index=True)
-    sorted_frame = sort_unified_frame(merged)
-    normalized = sorted_frame[list(COLUMNS)].astype(DTYPES)
+        connection.register('new_frame', new_frame)
+        _copy_merged(connection, existing_path, output_path, window, compression)
+        stats = _compute_stats(connection, existing_path, len(new_frame), window)
 
-    existing_deleted = 0 if existing is None else len(existing) - len(retained)
     logger.debug(
         'merge_incremental: incoming=%d kept_in_window=%d '
         'existing_deleted=%d existing_retained=%d final=%d',
-        len(new_frame),
-        len(filtered_new),
-        existing_deleted,
-        len(retained),
-        len(normalized),
+        stats.incoming,
+        stats.kept_in_window,
+        stats.existing_deleted,
+        stats.existing_retained,
+        stats.final_row_count,
     )
-    return normalized
+    return stats
 
 
-def _window_bounds(
-    start_date: date, end_date: date
-) -> tuple[pd.Timestamp, pd.Timestamp]:
-    """Compute the half-open UTC window ``[W_start, W_end)`` for the fetch dates.
+def _window_bounds(start_date: date, end_date: date) -> tuple[datetime, datetime]:
+    """Half-open UTC window ``[W_start, W_end)`` as tz-aware ``datetime`` bounds.
 
     Args:
         start_date: Inclusive UTC start date of the fetch window.
         end_date: Inclusive UTC end date of the fetch window.
 
     Returns:
-        ``(window_start, window_end)`` where ``window_start`` is midnight
-        UTC of ``start_date`` and ``window_end`` is midnight UTC of the
-        day after ``end_date`` (the exclusive upper bound).
+        ``(window_start, window_end)``: midnight UTC of ``start_date`` and
+        midnight UTC of the day after ``end_date`` (exclusive). These are
+        bound to DuckDB as parameters, not string-formatted into SQL.
     """
-    window_start = pd.Timestamp(start_date, tz='UTC')
-    window_end = pd.Timestamp(end_date + timedelta(days=1), tz='UTC')
+    window_start = datetime.combine(start_date, time.min, tzinfo=UTC)
+    window_end = datetime.combine(end_date + timedelta(days=1), time.min, tzinfo=UTC)
     return window_start, window_end
 
 
-def _start_in_window_mask(
-    frame: pd.DataFrame,
-    window_start: pd.Timestamp,
-    window_end: pd.Timestamp,
-) -> pd.Series:
-    """Boolean mask of rows whose ``start_time_utc`` lies in ``[window_start, window_end)``.
+def _validate_existing_columns(
+    connection: duckdb.DuckDBPyConnection, path: Path
+) -> None:
+    """Validate the existing parquet's readability and column set, no data scan.
 
-    Shared by both the incoming-frame filter and the existing-row
-    deletion so the two window predicates can never drift apart.
+    Uses ``DESCRIBE SELECT *`` so only the schema is read. An unreadable
+    file (``duckdb.Error``, e.g. ``InvalidInputException``) or a column set
+    that does not match ``COLUMNS`` raises ``CorruptUtilizationParquetError``
+    rather than being treated as a first run.
 
     Args:
-        frame: A unified frame carrying the ``start_time_utc`` column.
-        window_start: Inclusive lower bound (tz-aware UTC).
-        window_end: Exclusive upper bound (tz-aware UTC).
+        connection: Open DuckDB connection.
+        path: Path to the existing parquet.
+
+    Raises:
+        CorruptUtilizationParquetError: On an unreadable file or a column
+            mismatch (naming ``unexpected=`` / ``missing=``).
+    """
+    try:
+        described = connection.execute(
+            'DESCRIBE SELECT * FROM read_parquet(?)', [str(path)]
+        ).fetchall()
+    except duckdb.Error as describe_error:
+        raise CorruptUtilizationParquetError(
+            f'Existing parquet at {path} is unreadable'
+        ) from describe_error
+
+    actual_columns = {row[0] for row in described}
+    expected_columns = set(COLUMNS)
+    if actual_columns != expected_columns:
+        unexpected = sorted(actual_columns - expected_columns)
+        missing = sorted(expected_columns - actual_columns)
+        raise CorruptUtilizationParquetError(
+            f'Existing parquet at {path} has a mismatched column set: '
+            f'unexpected={unexpected}, missing={missing}'
+        )
+
+
+def _copy_merged(
+    connection: duckdb.DuckDBPyConnection,
+    existing_path: Path | None,
+    output_path: Path,
+    window: tuple[datetime, datetime],
+    compression: str,
+) -> None:
+    """Build and execute the ``COPY`` that writes the merged, sorted parquet.
+
+    The COPY target path and compression are escaped string literals
+    (DuckDB binds the COPY target before the inner query's parameters, so
+    it cannot be a ``?``); the ``read_parquet`` path and the window bounds
+    are bound parameters.
+
+    Args:
+        connection: Open DuckDB connection with ``new_frame`` registered.
+        existing_path: Existing parquet path, or ``None`` on a first run.
+        output_path: Destination parquet the COPY writes.
+        window: The half-open ``(window_start, window_end)`` bounds.
+        compression: Parquet codec for the COPY.
+
+    Side Effects:
+        Writes ``output_path``.
+    """
+    window_start, window_end = window
+    if existing_path is None:
+        select_sql = f'SELECT {_COLUMN_LIST} FROM new_frame WHERE {_WINDOW_PREDICATE}'
+        params: list[object] = [window_start, window_end]
+    else:
+        select_sql = (
+            f'SELECT {_COLUMN_LIST} FROM read_parquet(?) '
+            f'WHERE NOT ({_WINDOW_PREDICATE}) '
+            f'UNION ALL '
+            f'SELECT {_COLUMN_LIST} FROM new_frame WHERE {_WINDOW_PREDICATE}'
+        )
+        params = [
+            str(existing_path),
+            window_start,
+            window_end,
+            window_start,
+            window_end,
+        ]
+
+    copy_sql = (
+        f'COPY ({select_sql} ORDER BY {_ORDER_BY}) '
+        f'TO {_sql_literal(str(output_path))} '
+        f'(FORMAT parquet, COMPRESSION {_sql_literal(compression)})'
+    )
+    connection.execute(copy_sql, params)
+
+
+def _compute_stats(
+    connection: duckdb.DuckDBPyConnection,
+    existing_path: Path | None,
+    incoming: int,
+    window: tuple[datetime, datetime],
+) -> MergeStats:
+    """Compute the row-delta counts with bounded ``count(*)`` aggregates.
+
+    Args:
+        connection: Open DuckDB connection with ``new_frame`` registered.
+        existing_path: Existing parquet path, or ``None`` on a first run.
+        incoming: Row count of ``new_frame`` (already known to the caller).
+        window: The half-open ``(window_start, window_end)`` bounds.
 
     Returns:
-        Boolean Series aligned to ``frame``, ``True`` where
-        ``start_time_utc >= window_start`` and ``< window_end``.
+        ``MergeStats`` for the merge. ``final_row_count`` is
+        ``kept_in_window + existing_retained`` (the ``UNION ALL`` does not
+        deduplicate), avoiding a re-scan of the written file.
     """
-    start_times: pd.Series = frame['start_time_utc']
-    return (start_times >= window_start) & (start_times < window_end)
+    window_start, window_end = window
+    kept_in_window = _count(
+        connection,
+        f'SELECT count(*) FROM new_frame WHERE {_WINDOW_PREDICATE}',
+        [window_start, window_end],
+    )
+
+    if existing_path is None:
+        existing_deleted = 0
+        existing_retained = 0
+    else:
+        existing_deleted = _count(
+            connection,
+            f'SELECT count(*) FROM read_parquet(?) WHERE {_WINDOW_PREDICATE}',
+            [str(existing_path), window_start, window_end],
+        )
+        existing_retained = _count(
+            connection,
+            f'SELECT count(*) FROM read_parquet(?) WHERE NOT ({_WINDOW_PREDICATE})',
+            [str(existing_path), window_start, window_end],
+        )
+
+    return MergeStats(
+        incoming=incoming,
+        kept_in_window=kept_in_window,
+        existing_deleted=existing_deleted,
+        existing_retained=existing_retained,
+        final_row_count=kept_in_window + existing_retained,
+    )
+
+
+def _count(
+    connection: duckdb.DuckDBPyConnection, sql: str, params: list[object]
+) -> int:
+    """Run a single-column ``count(*)`` query and return the scalar as ``int``.
+
+    A ``count(*)`` aggregate always returns exactly one row, so the
+    ``fetchone() is None`` branch is unreachable in practice; it satisfies
+    the typed (``Optional``) DuckDB cursor API without a spurious cast.
+    """
+    row = connection.execute(sql, params).fetchone()
+    return 0 if row is None else int(row[0])
+
+
+def _sql_literal(value: str) -> str:
+    """Return ``value`` as a single-quoted SQL string literal, quotes escaped."""
+    return "'" + value.replace("'", "''") + "'"

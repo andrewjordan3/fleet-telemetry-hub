@@ -251,14 +251,17 @@ The utilization pipeline writes two files under the `utilization/` subdirectory 
 └── metadata.json
 ```
 
-Both files are atomically written (temp file + rename), so a crash mid-write leaves the previous version intact. There are no date partitions — every event lives in the single `data.parquet`, which grows over time. Each run updates it incrementally: the run's fetch window is deleted from the existing file and the freshly-fetched window is appended, rather than replacing the whole file.
+Both files are atomically written (temp file + rename), so a crash mid-write leaves the previous version intact. There are no date partitions — every event lives in the single `data.parquet`, which grows over time. Each run updates it incrementally and with **bounded memory**: the read, window delete, append, global sort, and write all run in DuckDB, so the whole (unbounded) file is never loaded into pandas.
 
 ## Utilization Pipeline: Incremental Update
 
-Each run updates `data.parquet` in place with a **delete-then-append** over its fetch window, not a whole-file overwrite:
+Each run updates `data.parquet` in place with a **delete-then-append** over its fetch window, not a whole-file overwrite, and does so entirely in **DuckDB** so the whole file never enters pandas:
 
-1. **Delete the window.** Rows in the existing file whose `start_time_utc` falls in the half-open window `[W_start, W_end)` (midnight UTC of `start_date` through midnight UTC after `end_date`) are dropped.
-2. **Append the fresh window.** The newly-fetched, unified frame is filtered to the same `[W_start, W_end)` window on `start_time_utc` and appended. The merged result is re-sorted and atomically written via the temp + rename described above.
+1. **Delete the window.** Rows in the existing file whose `start_time_utc` falls in the half-open window `[W_start, W_end)` (midnight UTC of `start_date` through midnight UTC after `end_date`) are dropped — a streaming `read_parquet` with a `WHERE`.
+2. **Append the fresh window.** The newly-fetched, window-sized unified frame (the only thing pandas holds) is filtered to the same `[W_start, W_end)` window on `start_time_utc` and `UNION ALL`-ed in.
+3. **Sort and write.** The union is globally sorted by a total deterministic key (`company NULLS FIRST, start_time_utc, event_type, …`) — DuckDB spills the sort to disk if it doesn't fit RAM — and written with `COPY` to a temp file that the orchestrator atomically renames onto `data.parquet`.
+
+**On-disk format (Arrow-native, microsecond).** DuckDB's `COPY` writes Arrow-native parquet — microsecond timestamps, no pandas extension metadata. The locked in-memory `DTYPES` (StringDtype / Int64 / Float64 / nanosecond timestamps) is the *contract for pandas consumers*, not the on-disk encoding: a default `pd.read_parquet` of the file yields numpy dtypes, so consumers use the canonical `read_unified_parquet(path)` helper (`pd.read_parquet(path).astype(DTYPES)`) to restore the locked schema in one call. This format change is deliberate and helps the downstream load: the file is now microsecond-resolution on disk, so a direct parquet→BigQuery load (BigQuery is microsecond) no longer needs the previous nanosecond→microsecond rewrite step.
 
 **Start-anchored normalization.** The incoming frame is filtered to in-window *starts* before appending. This neutralizes a provider whose fetch is overlap-anchored — Samsara's `/v1/fleet/trips` endpoint was verified to return any trip that merely *intersects* the query window, including trips that started earlier. Filtering on start time means a cross-boundary event is anchored to the single window that owns its start, so it is never double-counted at a window's leading edge.
 
@@ -266,11 +269,11 @@ Each run updates `data.parquet` in place with a **delete-then-append** over its 
 
 **Write-only-on-full-success (self-healing).** A run writes only when **every enabled provider succeeded**. If any enabled provider's fetch raised, the run skips both writes and leaves the existing files byte-for-byte intact — a partial fetch can never overwrite good data with a short or empty frame. Recovery is automatic: the next run where all enabled providers succeed re-fetches the whole lookback window and rewrites it correctly, as long as `lookback_days` is at least as long as the worst failure streak. (A disabled provider legitimately contributes nothing and does not block the write; only a *failed* enabled provider does.)
 
-**Raise on corrupt parquet.** When reading the existing `data.parquet` to merge, an unreadable file or one whose columns do not match the schema aborts the run with a `CorruptUtilizationParquetError`, leaving the file untouched for inspection. A corrupt or foreign file is never silently treated as a first run — doing so would re-introduce whole-file destruction.
+**Raise on corrupt parquet.** Before merging, the existing `data.parquet` is validated with a `DESCRIBE` (schema only, no data scan); an unreadable file or one whose columns do not match the schema aborts the run with a `CorruptUtilizationParquetError`, leaving the file untouched for inspection. A corrupt or foreign file is never silently treated as a first run — doing so would re-introduce whole-file destruction.
 
 ## Unified Utilization Schema
 
-`data.parquet` is a 9-column event-grain table. Both pipelines emit pandas extension types so the schema survives a Parquet round-trip without silent coercion.
+`data.parquet` is a 9-column event-grain table. The dtypes below are the locked **in-memory** contract (`DTYPES`); restore them from the Arrow-native on-disk file with `read_unified_parquet(path)` (see [Incremental Update](#utilization-pipeline-incremental-update)).
 
 | Column | Pandas Dtype | Nullable | Description |
 |---|---|---|---|
@@ -293,7 +296,7 @@ Semantic notes:
 
 ## Utilization Pipeline: Metadata
 
-Each run writes a `metadata.json` alongside the Parquet. The next run reads it to compute its own fetch window.
+Each run writes a `metadata.json` alongside the Parquet. The next run reads it to compute its own fetch window. The whole-file fields (`row_count`, `by_company`, `latest_event_end_utc`) are derived by a streaming DuckDB aggregate over the written file (`count(*)`, a per-company count, and `max(end_time_utc)`), so metadata derivation is also bounded-memory.
 
 ```json
 {
@@ -314,13 +317,15 @@ Each run writes a `metadata.json` alongside the Parquet. The next run reads it t
 
 Field notes:
 
-- `latest_data_date` is the operational anchor for the next run's window start (subtracts `lookback_days`). On an empty run, the prior value is preserved so a no-data run doesn't reset the anchor. Retaining older data across an incremental merge does not move it: the newest event always lives in the most recent window, so the anchor reflects the freshest data regardless of how much history the file holds.
-- `row_count` and `by_company` are **whole-file totals** — they describe the full merged `data.parquet` after the run, not just the rows fetched in this run's window.
+- `latest_data_date` is the operational anchor for the next run's window start (subtracts `lookback_days`). It is the UTC date of the exact `max(end_time_utc)` over the whole file. On an empty run (`latest_event_end_utc` is null), the prior value is preserved so a no-data run doesn't reset the anchor. Retaining older data across an incremental merge does not move it: the newest event always lives in the most recent window, so the anchor reflects the freshest data regardless of how much history the file holds.
+- `row_count` and `by_company` are **whole-file totals** — they describe the full merged `data.parquet` after the run, not just the rows fetched in this run's window. They come from the streaming DuckDB aggregate, not from a pandas pass.
 - `fetch_window_start_utc` / `fetch_window_end_utc` still describe *this run's* window, independent of the file's total extent.
 - `providers_present` / `providers_skipped` / `providers_failed` reflect each provider's outcome for the run. Motive always precedes Samsara in every list. A run is only written when there is at least one present provider and no failed provider (see [Incremental Update](#utilization-pipeline-incremental-update)), so a persisted metadata file always has an empty `providers_failed`.
 - `by_company` maps each `company` value to its row count. Null company values appear under the key `"(null)"`.
 - All timestamps are ISO-8601 UTC with the `Z` suffix.
-- `schema_version` is a literal integer for future schema evolution; bumped on a breaking metadata-shape change. The incremental-update change is a write-strategy change only — it does not alter the file shape, so `schema_version` is **not** bumped.
+- `schema_version` is a literal integer for future schema evolution; bumped on a breaking metadata-shape change. Moving the merge onto DuckDB changed only the parquet *encoding* (Arrow-native / microsecond) and the write path, not the metadata shape, so `schema_version` is **not** bumped.
+
+> **Dependency note:** the utilization pipeline uses [DuckDB](https://duckdb.org/) (a core dependency, `duckdb>=1.0.0`) for the bounded-memory merge and the metadata aggregate.
 
 ## Utilization Pipeline: Backfill
 
