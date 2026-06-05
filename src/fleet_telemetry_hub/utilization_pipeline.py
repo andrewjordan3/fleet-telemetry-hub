@@ -26,6 +26,7 @@ stays focused on the class-shaped orchestration surface.
 
 import json
 import logging
+import math
 import tempfile
 import time as time_module
 from dataclasses import dataclass
@@ -55,11 +56,31 @@ from fleet_telemetry_hub.utilization.samsara_fetcher import (
     SamsaraUtilizationFetcher,
 )
 
-__all__: list[str] = ['UtilizationPipeline', 'UtilizationRunResult']
+__all__: list[str] = [
+    'BackfillStalledError',
+    'BackfillSummary',
+    'UtilizationPipeline',
+    'UtilizationRunResult',
+]
 
 logger: logging.Logger = logging.getLogger(__name__)
 
 ProviderStatus = Literal['present', 'skipped', 'failed']
+
+# Slack added to the computed backfill iteration ceiling, so off-by-one
+# edge effects (the final batch landing exactly on today-1) never trip the
+# safety abort. The ceiling is itself only a backstop against a logic bug.
+_BACKFILL_ITERATION_BUFFER: int = 2
+
+
+class BackfillStalledError(Exception):
+    """Raised when ``backfill_to_present`` cannot reach the present.
+
+    Distinct from a clean catch-up: a stall means a batch wrote nothing (an
+    enabled provider failed), the window stopped advancing, or the iteration
+    ceiling was hit. Existing data is preserved, so a later
+    ``backfill_to_present`` resumes from where the file left off.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,6 +112,26 @@ class UtilizationRunResult:
     providers_failed: list[str]
 
 
+@dataclass(frozen=True, slots=True)
+class BackfillSummary:
+    """Outcome of a ``backfill_to_present`` march.
+
+    Attributes:
+        batches_run: Number of ``run()`` invocations the march made.
+        final_end_date: ``end_date`` of the last batch that ran.
+        caught_up: ``True`` when the march reached ``today_utc - 1``. A
+            stalled march raises ``BackfillStalledError`` rather than
+            returning ``caught_up=False``, so on return this is always
+            ``True``; the field documents the success contract.
+        final_row_count: Whole-file row count after the last batch.
+    """
+
+    batches_run: int
+    final_end_date: date
+    caught_up: bool
+    final_row_count: int
+
+
 class UtilizationPipeline:
     """
     Daily-run pipeline that fetches Motive + Samsara utilization, unifies,
@@ -107,7 +148,11 @@ class UtilizationPipeline:
 
     The read + window-delete + append + global-sort + write run in DuckDB
     and metadata aggregates stream from the written file, so the whole
-    on-disk parquet is never loaded into pandas.
+    on-disk parquet is never loaded into pandas. The optional
+    ``pipeline.max_window_days`` cap bounds each run's fetch span; the
+    ``backfill_to_present`` driver marches the capped batches forward, so a
+    large backfill or outage gap runs in bounded memory across many small
+    batches instead of one giant run.
 
     Attributes:
         config: The loaded ``TelemetryConfig`` instance (read-only).
@@ -265,6 +310,116 @@ class UtilizationPipeline:
         )
 
     # --------------------------------------------------------------
+    # Batched backfill driver
+    # --------------------------------------------------------------
+
+    def backfill_to_present(self) -> BackfillSummary:
+        """March bounded batched runs forward until the file reaches the present.
+
+        Calls ``run()`` repeatedly. Each call reads the metadata the prior
+        batch wrote, so ``latest_data_date`` -- and therefore the fetch
+        window -- advances batch to batch, while the ``max_window_days`` cap
+        keeps every batch's fetch + transform bounded in memory. Because each
+        window is delete-then-appended into the growing file (prompts 1-2 + A),
+        overlapping batch boundaries neither duplicate nor overwrite data.
+
+        Each batch re-fetches the prior ``lookback_days`` of overlap; that is
+        correct (the merge dedupes by window) and is the price of a one-time
+        backfill. A smaller ``lookback_days`` trims the redundant API volume.
+
+        Returns:
+            A ``BackfillSummary`` for a march that reached ``today_utc - 1``
+            (``caught_up=True``).
+
+        Raises:
+            ValueError: If ``max_window_days`` is unset -- an uncapped backfill
+                is the single-shot out-of-memory failure this driver avoids.
+            BackfillStalledError: If a batch wrote nothing (an enabled provider
+                failed), the window stopped advancing, or the iteration ceiling
+                was hit. Existing data is preserved; re-running resumes.
+
+        Side Effects:
+            Performs repeated fetches and parquet/metadata writes -- one set
+            per batch. Logs per-batch progress at INFO.
+        """
+        max_window_days = self._config.pipeline.max_window_days
+        if max_window_days is None:
+            raise ValueError(
+                'backfill_to_present requires pipeline.max_window_days to be set; '
+                'an uncapped backfill fetches the entire span in a single run -- '
+                'the out-of-memory failure this driver exists to avoid'
+            )
+
+        iteration_ceiling = self._backfill_iteration_ceiling(max_window_days)
+        batches_run = 0
+        prior_end_date: date | None = None
+
+        while batches_run < iteration_ceiling:
+            result = self.run()
+            batches_run += 1
+            logger.info(
+                'Backfill batch %d/%d: window %s..%s, written=%s, file rows=%d',
+                batches_run,
+                iteration_ceiling,
+                result.start_date,
+                result.end_date,
+                result.written,
+                result.row_count,
+            )
+
+            if not result.written:
+                raise BackfillStalledError(
+                    f'Backfill stalled at batch {batches_run}: the run wrote '
+                    f'nothing (providers_failed={result.providers_failed}). '
+                    f'Existing data is preserved; resolve the provider and '
+                    f're-run backfill_to_present to resume.'
+                )
+
+            today_minus_one = (datetime.now(UTC) - timedelta(days=1)).date()
+            if result.end_date >= today_minus_one:
+                return BackfillSummary(
+                    batches_run=batches_run,
+                    final_end_date=result.end_date,
+                    caught_up=True,
+                    final_row_count=result.row_count,
+                )
+
+            if prior_end_date is not None and result.end_date <= prior_end_date:
+                raise BackfillStalledError(
+                    f'Backfill made no forward progress at batch {batches_run}: '
+                    f'end_date {result.end_date} did not advance past '
+                    f'{prior_end_date}.'
+                )
+            prior_end_date = result.end_date
+
+        raise BackfillStalledError(
+            f'Backfill exceeded its iteration ceiling ({iteration_ceiling}) '
+            f'without reaching the present; aborting to avoid an unbounded loop.'
+        )
+
+    def _backfill_iteration_ceiling(self, max_window_days: int) -> int:
+        """Upper bound on backfill batches: total span / per-batch advance + buffer.
+
+        A belt-and-suspenders ceiling against a window-advance logic bug, so
+        the march can never loop unboundedly even if the per-batch progress
+        check is somehow defeated. Each batch advances the anchor by roughly
+        ``max_window_days - lookback_days`` days.
+
+        Args:
+            max_window_days: The configured cap (already known to be set).
+
+        Returns:
+            The maximum number of batches the march may attempt.
+        """
+        advance_per_batch = max(
+            1, max_window_days - self._config.pipeline.lookback_days
+        )
+        first_start, _ = self._determine_window(self._load_metadata())
+        today_minus_one = (datetime.now(UTC) - timedelta(days=1)).date()
+        total_days = max((today_minus_one - first_start).days, 0)
+        return math.ceil(total_days / advance_per_batch) + _BACKFILL_ITERATION_BUFFER
+
+    # --------------------------------------------------------------
     # Window determination
     # --------------------------------------------------------------
 
@@ -274,12 +429,18 @@ class UtilizationPipeline:
         """
         Compute ``(start_date, end_date)`` inclusive for the fetch.
 
-        ``end_date`` is always ``today_utc - 1`` (never the current
-        incomplete UTC day). ``start_date`` is the configured default
-        on a first run, otherwise ``latest_data_date - lookback_days``
-        from prior metadata.
+        ``start_date`` is the configured default on a first run, otherwise
+        ``latest_data_date - lookback_days`` from prior metadata.
+
+        ``end_date`` is ``today_utc - 1`` (never the current incomplete UTC
+        day), optionally capped to ``start_date + max_window_days`` when
+        ``max_window_days`` is set. The cap is a no-op in steady state (a
+        recent ``start_date`` plus the span already reaches ``today-1``) and
+        bites only when a large gap -- a fresh backfill or an outage
+        recovery -- would otherwise fetch the whole span in one run.
+        ``backfill_to_present`` marches the capped batches forward.
         """
-        end_date = (datetime.now(UTC) - timedelta(days=1)).date()
+        uncapped_end = (datetime.now(UTC) - timedelta(days=1)).date()
         prior_latest = (
             prior_metadata.get('latest_data_date')
             if prior_metadata is not None
@@ -290,6 +451,12 @@ class UtilizationPipeline:
         else:
             latest = date.fromisoformat(prior_latest)
             start_date = latest - timedelta(days=self._config.pipeline.lookback_days)
+
+        max_window_days = self._config.pipeline.max_window_days
+        if max_window_days is None:
+            end_date = uncapped_end
+        else:
+            end_date = min(uncapped_end, start_date + timedelta(days=max_window_days))
         return start_date, end_date
 
     # --------------------------------------------------------------

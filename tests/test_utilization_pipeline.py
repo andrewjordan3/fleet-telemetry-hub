@@ -11,6 +11,7 @@ Mocks via ``unittest.mock.patch`` on module-level class references in
 import json
 import logging
 from datetime import UTC, date, datetime, timedelta
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -34,7 +35,12 @@ from fleet_telemetry_hub.unifier.schema import COLUMNS, DTYPES, read_unified_par
 from fleet_telemetry_hub.utilization.motive_fetcher import MotiveUtilizationBundle
 from fleet_telemetry_hub.utilization.samsara_fetcher import SamsaraUtilizationBundle
 from fleet_telemetry_hub.utilization.vehicle_trip import VehicleTrip
-from fleet_telemetry_hub.utilization_pipeline import UtilizationPipeline
+from fleet_telemetry_hub.utilization_pipeline import (
+    BackfillStalledError,
+    BackfillSummary,
+    UtilizationPipeline,
+    UtilizationRunResult,
+)
 
 # ---------------------------------------------------------------------------
 # Configuration helpers
@@ -72,6 +78,7 @@ def _write_config(  # noqa: PLR0913 -- one knob per dimension we vary across tes
     *,
     default_start_date: str = '2026-05-14',
     lookback_days: int = 7,
+    max_window_days: int | None = None,
     parquet_root: Path | None = None,
     motive_enabled: bool = True,
     samsara_enabled: bool = True,
@@ -88,15 +95,18 @@ def _write_config(  # noqa: PLR0913 -- one knob per dimension we vary across tes
     if include_samsara:
         providers['samsara'] = {**_VALID_PROVIDER_BASE['samsara']}
         providers['samsara']['enabled'] = samsara_enabled
+    pipeline_config: dict[str, Any] = {
+        'default_start_date': default_start_date,
+        'lookback_days': lookback_days,
+        'batch_increment_days': 1.0,
+        'request_delay_seconds': 0.0,
+        'use_truststore': False,
+    }
+    if max_window_days is not None:
+        pipeline_config['max_window_days'] = max_window_days
     config_data: dict[str, Any] = {
         'providers': providers,
-        'pipeline': {
-            'default_start_date': default_start_date,
-            'lookback_days': lookback_days,
-            'batch_increment_days': 1.0,
-            'request_delay_seconds': 0.0,
-            'use_truststore': False,
-        },
+        'pipeline': pipeline_config,
         'storage': {
             'parquet_path': str(parquet_root),
             'parquet_compression': 'snappy',
@@ -241,6 +251,21 @@ def _motive_bundle_with_periods(
         date_range=(_MAY_14, _MAY_20),
         company=company,
     )
+
+
+def _daily_motive_bundle(start: date, end: date) -> MotiveUtilizationBundle:
+    """A Motive bundle with one driving period per UTC day in ``[start, end]``.
+
+    The mock fetcher returns this whole bundle on every batch regardless of
+    window; the merge's per-window filter is what slices it across a backfill
+    march, so daily coverage lets a test assert the file ends up with exactly
+    one row per day and no gaps or duplicates at batch boundaries.
+    """
+    periods = [
+        _motive_period_at(start + timedelta(days=offset), period_id=4550000000 + offset)
+        for offset in range((end - start).days + 1)
+    ]
+    return _motive_bundle_with_periods(periods)
 
 
 def _samsara_vehicle() -> SamsaraVehicle:
@@ -457,6 +482,46 @@ class TestDetermineWindow:
         start, _ = pipeline._determine_window({'latest_data_date': '2026-05-20'})
 
         assert start == date(2026, 4, 20)
+
+    def test_cap_inert_in_steady_state(self, tmp_path: Path) -> None:
+        """A recent anchor + a set cap leaves ``end_date == today-1`` (cap no-op)."""
+
+        today_minus_one = (datetime.now(UTC) - timedelta(days=1)).date()
+        # A recent anchor: start = (today-1) - lookback, well within the cap.
+        recent_latest = today_minus_one.isoformat()
+        config_path = _write_config(tmp_path, lookback_days=7, max_window_days=28)
+        pipeline = UtilizationPipeline(config_path)
+
+        start, end = pipeline._determine_window({'latest_data_date': recent_latest})
+
+        assert start == today_minus_one - timedelta(days=7)
+        assert end == today_minus_one
+
+    def test_cap_bites_on_far_past_start(self, tmp_path: Path) -> None:
+        """A far-past first-run start + cap -> ``end == start + max_window_days``."""
+
+        config_path = _write_config(
+            tmp_path, default_start_date='2025-01-01', max_window_days=28
+        )
+        pipeline = UtilizationPipeline(config_path)
+
+        start, end = pipeline._determine_window(None)
+
+        assert start == date(2025, 1, 1)
+        assert end == start + timedelta(days=28)
+
+    def test_no_cap_uses_today_minus_one_even_for_far_past_start(
+        self, tmp_path: Path
+    ) -> None:
+        """With no cap, a far-past start still ends at ``today-1`` (old behavior)."""
+
+        config_path = _write_config(tmp_path, default_start_date='2025-01-01')
+        pipeline = UtilizationPipeline(config_path)
+
+        start, end = pipeline._determine_window(None)
+
+        assert start == date(2025, 1, 1)
+        assert end == (datetime.now(UTC) - timedelta(days=1)).date()
 
     def test_start_after_end_skips_run_without_fetch_or_metadata_write(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
@@ -1242,3 +1307,178 @@ class TestCorruptParquetRaises:
             pipeline.run()
 
         assert (pipeline.parquet_dir / 'data.parquet').read_bytes() == before_bytes
+
+
+# ---------------------------------------------------------------------------
+# Batched backfill driver
+# ---------------------------------------------------------------------------
+
+
+def _run_result(end_date: date, *, written: bool = True) -> UtilizationRunResult:
+    """A minimal ``UtilizationRunResult`` for driving the backfill loop directly."""
+    return UtilizationRunResult(
+        written=written,
+        row_count=0,
+        start_date=end_date,
+        end_date=end_date,
+        providers_present=['motive'] if written else [],
+        providers_skipped=[],
+        providers_failed=[] if written else ['motive'],
+    )
+
+
+class TestBackfillToPresent:
+    """``backfill_to_present`` marches capped batches forward to the present."""
+
+    def test_marches_across_multiple_batches_to_present(self, tmp_path: Path) -> None:
+        """A far-past start + cap runs >1 batch, catches up, covers the full range."""
+
+        today_minus_one = (datetime.now(UTC) - timedelta(days=1)).date()
+        span_days = 34
+        default_start = today_minus_one - timedelta(days=span_days)
+
+        config_path = _write_config(
+            tmp_path,
+            default_start_date=default_start.isoformat(),
+            lookback_days=7,
+            max_window_days=28,
+            samsara_enabled=False,
+        )
+        pipeline = UtilizationPipeline(config_path)
+
+        with _PatchedFetchers(
+            motive_bundle=_daily_motive_bundle(default_start, today_minus_one)
+        ):
+            summary = pipeline.backfill_to_present()
+
+        assert isinstance(summary, BackfillSummary)
+        assert summary.caught_up is True
+        assert summary.batches_run > 1
+        assert summary.final_end_date >= today_minus_one
+
+        # The file covers every UTC day in [default_start, today-1], once each.
+        on_disk = read_unified_parquet(pipeline.parquet_dir / 'data.parquet')
+        covered_dates = sorted(set(on_disk['start_time_utc'].dt.date.tolist()))
+        expected_dates = [
+            default_start + timedelta(days=offset) for offset in range(span_days + 1)
+        ]
+        assert covered_dates == expected_dates
+        # No duplicates across batch-boundary overlaps.
+        assert len(on_disk) == len(expected_dates)
+        assert summary.final_row_count == len(expected_dates)
+
+    def test_anchor_advances_each_batch(self, tmp_path: Path) -> None:
+        """The fetch-window start moves strictly forward batch to batch."""
+
+        today_minus_one = (datetime.now(UTC) - timedelta(days=1)).date()
+        default_start = today_minus_one - timedelta(days=34)
+
+        config_path = _write_config(
+            tmp_path,
+            default_start_date=default_start.isoformat(),
+            lookback_days=7,
+            max_window_days=28,
+            samsara_enabled=False,
+        )
+        pipeline = UtilizationPipeline(config_path)
+
+        captured: list[UtilizationRunResult] = []
+        real_run = pipeline.run
+
+        def _recording_run() -> UtilizationRunResult:
+            result = real_run()
+            captured.append(result)
+            return result
+
+        with (
+            _PatchedFetchers(
+                motive_bundle=_daily_motive_bundle(default_start, today_minus_one)
+            ),
+            patch.object(pipeline, 'run', side_effect=_recording_run),
+        ):
+            pipeline.backfill_to_present()
+
+        starts = [result.start_date for result in captured]
+        assert len(starts) > 1
+        # Strictly increasing: never an infinite re-fetch of the earliest data.
+        assert all(later > earlier for earlier, later in pairwise(starts))
+
+    def test_stops_and_raises_on_failed_provider(self, tmp_path: Path) -> None:
+        """A batch where a provider raises -> the march stops with a stall error."""
+
+        today_minus_one = (datetime.now(UTC) - timedelta(days=1)).date()
+        default_start = today_minus_one - timedelta(days=60)
+
+        config_path = _write_config(
+            tmp_path,
+            default_start_date=default_start.isoformat(),
+            lookback_days=7,
+            max_window_days=28,
+        )
+        pipeline = UtilizationPipeline(config_path)
+
+        with (
+            _PatchedFetchers(
+                motive_bundle=_daily_motive_bundle(default_start, today_minus_one),
+                samsara_raises=ConnectionError,
+            ),
+            pytest.raises(BackfillStalledError, match='wrote nothing'),
+        ):
+            pipeline.backfill_to_present()
+
+        # Nothing was written, so a later backfill can resume cleanly.
+        assert not (pipeline.parquet_dir / 'data.parquet').exists()
+
+    def test_requires_max_window_days(self, tmp_path: Path) -> None:
+        """Calling without a cap raises -- an uncapped backfill is the OOM case."""
+
+        config_path = _write_config(tmp_path)  # max_window_days defaults to None
+        pipeline = UtilizationPipeline(config_path)
+
+        with pytest.raises(ValueError, match='max_window_days'):
+            pipeline.backfill_to_present()
+
+    def test_no_progress_guard_terminates(self, tmp_path: Path) -> None:
+        """A non-advancing ``end_date`` stops the loop instead of spinning forever."""
+
+        config_path = _write_config(
+            tmp_path,
+            default_start_date='2025-01-01',
+            lookback_days=7,
+            max_window_days=28,
+        )
+        pipeline = UtilizationPipeline(config_path)
+
+        # Every batch reports the same (written) end_date -> no forward progress.
+        stuck_date = date(2025, 2, 1)
+        with (
+            patch.object(pipeline, 'run', side_effect=lambda: _run_result(stuck_date)),
+            pytest.raises(BackfillStalledError, match='no forward progress'),
+        ):
+            pipeline.backfill_to_present()
+
+    def test_iteration_ceiling_terminates(self, tmp_path: Path) -> None:
+        """An advance slower than the configured rate aborts at the ceiling."""
+
+        config_path = _write_config(
+            tmp_path,
+            default_start_date='2025-01-01',
+            lookback_days=7,
+            max_window_days=28,
+        )
+        pipeline = UtilizationPipeline(config_path)
+
+        # Advance end_date by only one day per batch -- far slower than the
+        # ceiling assumes (~21 days/batch) -- so the ceiling trips before the
+        # present is ever reached. end_date advances, so the no-progress guard
+        # does not fire first.
+        batch_end_dates = (
+            date(2025, 1, 1) + timedelta(days=offset) for offset in range(1, 10_000)
+        )
+        with (
+            patch.object(
+                pipeline, 'run', side_effect=lambda: _run_result(next(batch_end_dates))
+            ),
+            pytest.raises(BackfillStalledError, match='iteration ceiling'),
+        ):
+            pipeline.backfill_to_present()

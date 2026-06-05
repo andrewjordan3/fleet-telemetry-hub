@@ -339,6 +339,16 @@ class PipelineConfig(BaseModel):
         batch_increment_days: Size of each processing batch in days. Supports
             fractional values (e.g., 0.5 for 12-hour batches). Smaller batches
             save more frequently but have more overhead. Range: 0.25-7.0 days.
+            Consumed only by ``PartitionedTelemetryPipeline``; the utilization
+            pipeline ignores it and uses ``max_window_days`` instead.
+        max_window_days: Optional cap on the span of a single utilization
+            run's fetch window, in days. ``None`` (default) is uncapped
+            (``end_date = today-1``), preserving prior behavior. When set it
+            must be a positive int strictly greater than ``lookback_days`` so
+            each backfill batch advances; it is inert in steady state (a recent
+            anchor plus the span already reaches the present) and only bites on
+            a large gap, turning a fresh backfill or a long-outage recovery into
+            bounded batches. Safe to leave set permanently.
         request_delay_seconds: Artificial delay between sequential API requests.
             Use to stay well under rate limits or reduce load on provider APIs.
         use_truststore: When True, use truststore library to build SSLContext
@@ -362,6 +372,15 @@ class PipelineConfig(BaseModel):
         ge=0.25,
         le=7.0,
         description='Batch size in days; supports fractional (0.5 = 12 hours)',
+    )
+    max_window_days: int | None = Field(
+        default=None,
+        description=(
+            "Cap on a single utilization run's fetch-window span in days. "
+            'None (default) is uncapped (end_date = today-1). When set, must '
+            'be a positive int strictly greater than lookback_days; inert in '
+            'steady state, bounds backfill/outage gaps into batches'
+        ),
     )
     request_delay_seconds: float = Field(
         ge=0.0,
@@ -398,6 +417,39 @@ class PipelineConfig(BaseModel):
             ) from parse_error
 
         return date_string
+
+    @model_validator(mode='after')
+    def validate_max_window_days(self) -> Self:
+        """Ensure max_window_days, when set, is positive and exceeds lookback_days.
+
+        Each backfill batch advances the anchor by roughly
+        ``max_window_days - lookback_days`` days (the next batch re-fetches
+        the ``lookback_days`` overlap), so a cap that does not exceed
+        ``lookback_days`` would stall or regress the march rather than
+        progressing. Making this impossible to construct turns a subtle
+        runtime stall into a load-time error.
+
+        Returns:
+            The validated configuration.
+
+        Raises:
+            ValueError: If max_window_days is set but is not a positive int,
+                or is not strictly greater than lookback_days.
+        """
+        if self.max_window_days is None:
+            return self
+        if self.max_window_days <= 0:
+            raise ValueError(
+                f'max_window_days must be a positive integer when set, '
+                f'got {self.max_window_days}'
+            )
+        if self.max_window_days <= self.lookback_days:
+            raise ValueError(
+                f'max_window_days ({self.max_window_days}) must be strictly '
+                f'greater than lookback_days ({self.lookback_days}) so each '
+                f'backfill batch advances by ~(max_window_days - lookback_days) days'
+            )
+        return self
 
 
 # =============================================================================
