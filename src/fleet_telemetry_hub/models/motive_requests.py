@@ -11,7 +11,7 @@ a uniform interface, never needing to know endpoint-specific details.
 """
 
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -290,7 +290,7 @@ class MotiveZSuffixDatetimeEndpointDefinition[
         """
         if parameter_type == ParameterType.DATETIME and isinstance(value, datetime):
             if value.tzinfo is not None:
-                utc_value: datetime = value.astimezone(timezone.utc)
+                utc_value: datetime = value.astimezone(UTC)
             else:
                 utc_value = value
             return utc_value.strftime('%Y-%m-%dT%H:%M:%SZ')
