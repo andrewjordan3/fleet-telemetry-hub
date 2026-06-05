@@ -14,10 +14,11 @@ a shared low-level API layer:
    - Automatic deduplication on (provider, provider_vehicle_id, timestamp)
    - Built-in data retention with delete_old_partitions()
 
-2. **Utilization Pipeline** (event grain): Daily driving and idle event
+2. **Utilization Pipeline** (event grain): driving and idle event
    rollups normalized across Motive and Samsara.
    - UtilizationPipeline produces a single Parquet plus a companion
-     metadata JSON, suitable for self-service Power BI semantic models
+     metadata JSON, loadable directly into BigQuery and suitable for
+     self-service Power BI semantic models
    - 9-column event-grain schema; driving and idle rows on one table
    - Automatic fetch-window resolution from prior metadata; today-minus-one
      end cutoff so no incomplete UTC day is ever fetched
@@ -33,7 +34,7 @@ a shared low-level API layer:
 Quick Start - Partitioned Telemetry Pipeline (Scheduled Data Collection):
     >>> from fleet_telemetry_hub import PartitionedTelemetryPipeline
     >>>
-    >>> # One-liner for cron jobs
+    >>> # Invoke once per run from your scheduler
     >>> PartitionedTelemetryPipeline('config/telemetry_config.yaml').run()
     >>>
     >>> # Load data for analysis
@@ -44,10 +45,10 @@ Quick Start - Partitioned Telemetry Pipeline (Scheduled Data Collection):
     ...     end_date=date(2024, 1, 31),
     ... )
 
-Quick Start - Utilization Pipeline (Daily Driving and Idle Events):
+Quick Start - Utilization Pipeline (Driving and Idle Events):
     >>> from fleet_telemetry_hub.utilization_pipeline import UtilizationPipeline
     >>>
-    >>> # Daily run (cron-invoked)
+    >>> # Invoked once per run by your scheduler
     >>> UtilizationPipeline('config/telemetry_config.yaml').run()
 
 Quick Start - API Abstraction (Direct Provider Access):
@@ -64,7 +65,7 @@ Features:
     - Multi-provider support (Motive, Samsara, extensible)
     - Two pipelines for different grains: scalable date-partitioned
       breadcrumbs (billions of records) and single-file event-grain
-      utilization (driving + idle, Power BI ready)
+      utilization (driving + idle, BigQuery- and Power BI-ready)
     - BigQuery direct query support via Hive partitioning on the
       breadcrumb pipeline
     - Atomic Parquet and metadata writes on both pipelines

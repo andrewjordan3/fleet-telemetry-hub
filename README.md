@@ -17,7 +17,7 @@ Fleet Telemetry Hub is a **dual-purpose system**:
 The pipeline layer ships **two ETL pipelines for different grains of data**, which coexist and serve different downstream consumers:
 
 - **`PartitionedTelemetryPipeline`** — breadcrumb-grain (location point) data, date-partitioned Parquet output. Designed for scale (billions of records) and BigQuery external-table consumption. See [Quick Start Option 1](#option-1-data-pipeline-recommended-for-continuous-data-collection).
-- **`UtilizationPipeline`** — event-grain driving and idle utilization data, single-file Parquet output with a companion metadata JSON. Sized for self-service Power BI semantic models with no Power Query transformations. See [Quick Start Option 2](#option-2-utilization-pipeline-event-grain-driving-and-idle-data).
+- **`UtilizationPipeline`** — event-grain driving and idle utilization data, single-file Parquet output with a companion metadata JSON. The single file is ready for two co-equal consumers: self-service Power BI semantic models (no Power Query transformations) and a direct BigQuery load (single-file Parquet, microsecond timestamps, no conversion). See [Quick Start Option 2](#option-2-utilization-pipeline-event-grain-driving-and-idle-data).
 
 Whether you need one-off API queries, scalable breadcrumb collection, or daily utilization rollups, Fleet Telemetry Hub provides the right abstraction.
 
@@ -45,7 +45,7 @@ Whether you need one-off API queries, scalable breadcrumb collection, or daily u
 
 ### Utilization Pipeline Features
 - **Event-Grain Unified Schema**: Driving and idle events from Motive and Samsara normalized to a single 9-column table
-- **Single-File Output**: One Parquet file plus a companion metadata JSON — suitable for self-service Power BI semantic models with no Power Query transformations
+- **Single-File Output**: One Parquet file plus a companion metadata JSON — loadable directly into BigQuery (single-file load or external table) and equally suitable for self-service Power BI semantic models with no Power Query transformations
 - **Automatic Window Resolution**: Pipeline derives its fetch window from the previous run's metadata; no scheduling logic needed inside the codebase
 - **Today-Minus-One End Cutoff**: Never fetches the current incomplete UTC day, eliminating partial-day artifacts
 - **Per-Provider Failure Isolation**: A single provider's API outage produces a partial DataFrame rather than failing the run
@@ -136,7 +136,7 @@ logging:
 ```python
 from fleet_telemetry_hub.pipeline_partitioned import PartitionedTelemetryPipeline
 
-# One-liner for scheduled jobs (cron, etc.)
+# Invoke once per run from your scheduler
 PartitionedTelemetryPipeline('config/telemetry_config.yaml').run()
 
 # Or work with specific date ranges
@@ -171,12 +171,17 @@ data/telemetry/
 └── _metadata.json
 ```
 
-**3. Schedule it** (optional):
+**3. Schedule it** (with your own scheduler — the package ships none):
+
+`fleet-telemetry-hub` provides `run()` but no scheduler; you wire up whatever your environment uses, invoking `run()` once per tick. A cron one-liner:
 
 ```bash
-# Run daily at 2 AM
-0 2 * * * cd /path/to/project && python -c "from fleet_telemetry_hub.pipeline_partitioned import PartitionedTelemetryPipeline; PartitionedTelemetryPipeline('config.yaml').run()"
+# Example only — the package ships no scheduler. Invoke run() once per tick.
+# Daily at 02:00 host time:
+0 2 * * * cd /path/to/project && /path/to/venv/bin/python -c "from fleet_telemetry_hub.pipeline_partitioned import PartitionedTelemetryPipeline; PartitionedTelemetryPipeline('config/telemetry_config.yaml').run()"
 ```
+
+For a systemd-timer alternative, see the [scheduling examples under Option 2](#option-2-utilization-pipeline-event-grain-driving-and-idle-data) and swap in the `PartitionedTelemetryPipeline` import shown above.
 
 The pipeline will:
 - Fetch data from all enabled providers
@@ -188,7 +193,7 @@ The pipeline will:
 
 ### Option 2: Utilization Pipeline (Event-Grain Driving and Idle Data)
 
-The utilization pipeline produces a single Parquet file plus a metadata JSON describing driving and idle events normalized across Motive and Samsara. It runs as a cron-invoked daily job and figures out its own fetch window from prior metadata.
+The utilization pipeline produces a single Parquet file plus a metadata JSON describing driving and idle events normalized across Motive and Samsara. It is invoked by an external scheduler you supply (the package provides `run()`; you wire up the scheduling). On each invocation it resolves its own fetch window from prior metadata — no arguments needed.
 
 **1. Configuration** — uses the same `config/telemetry_config.yaml` file shown in Option 1. The fields the utilization pipeline cares about:
 
@@ -206,18 +211,56 @@ Two further `pipeline` fields are **connection-level**: they are applied by ever
 ```python
 from fleet_telemetry_hub.utilization_pipeline import UtilizationPipeline
 
-# One-liner for scheduled jobs (cron, etc.)
+# Invoke once per run from your scheduler
 UtilizationPipeline('config/telemetry_config.yaml').run()
 ```
 
 The pipeline determines its own fetch window from the metadata file — no command-line arguments needed.
 
-**3. Schedule it** (cron example):
+**3. Schedule it** (with your own scheduler — the package ships none):
+
+The package provides `run()` but no scheduler; how you invoke it once per tick is your choice. Two common options follow — neither is required or preferred over the other.
+
+cron:
 
 ```bash
-# Run daily at 2 AM (host time)
-0 2 * * * cd /path/to/project && python -c "from fleet_telemetry_hub.utilization_pipeline import UtilizationPipeline; UtilizationPipeline('config/telemetry_config.yaml').run()"
+# Example only — the package ships no scheduler. Invoke run() once per tick.
+# Daily at 02:00 host time:
+0 2 * * * cd /path/to/project && /path/to/venv/bin/python -c "from fleet_telemetry_hub.utilization_pipeline import UtilizationPipeline; UtilizationPipeline('config/telemetry_config.yaml').run()"
 ```
+
+systemd timer (a `.service` plus a `.timer` unit):
+
+```ini
+# /etc/systemd/system/fleet-telemetry.service  (example only)
+[Unit]
+Description=fleet-telemetry-hub utilization run
+
+[Service]
+Type=oneshot
+WorkingDirectory=/path/to/project
+ExecStart=/path/to/venv/bin/python -c "from fleet_telemetry_hub.utilization_pipeline import UtilizationPipeline; UtilizationPipeline('config/telemetry_config.yaml').run()"
+```
+
+```ini
+# /etc/systemd/system/fleet-telemetry.timer  (example only)
+[Unit]
+Description=Run fleet-telemetry-hub utilization daily
+
+[Timer]
+OnCalendar=*-*-* 02:00:00
+Persistent=true   # fire on next boot if the scheduled run was missed (pairs with the pipeline's lookback)
+
+[Install]
+WantedBy=timers.target
+```
+
+```bash
+# enable:
+systemctl enable --now fleet-telemetry.timer
+```
+
+`Persistent=true` makes the timer fire on the next boot if a scheduled run was missed. This dovetails with the pipeline's `lookback_days` self-healing: a skipped day is recovered on the next successful run regardless (the window re-fetches from `latest_data_date - lookback_days`), but firing on boot narrows the gap.
 
 ### Option 3: Direct API Access (For Custom Integrations)
 
@@ -253,6 +296,22 @@ The utilization pipeline writes two files under the `utilization/` subdirectory 
 ```
 
 Both files are atomically written (temp file + rename), so a crash mid-write leaves the previous version intact. There are no date partitions — every event lives in the single `data.parquet`, which grows over time. Each run updates it incrementally and with **bounded memory**: the read, window delete, append, global sort, and write all run in DuckDB, so the whole (unbounded) file is never loaded into pandas.
+
+### Consuming the Utilization Output
+
+The single `data.parquet` is ready for direct consumption — no transformation step. Two common targets, presented co-equally:
+
+- **Power BI** — point a self-service semantic model at the file directly; no Power Query transformations are needed.
+- **BigQuery** — because the output is one file (not Hive-partitioned like the breadcrumb pipeline's output), load it as a single file rather than as a partitioned external table:
+
+  ```bash
+  # Example only. Load the single utilization parquet into a BigQuery table:
+  bq load --source_format=PARQUET \
+    your_dataset.fleet_utilization \
+    data/telemetry/utilization/data.parquet
+  ```
+
+  (The path matches the documented `{parquet_path}/utilization/data.parquet` layout given the example `parquet_path: "data/telemetry"`.) A single-file external table over the same file works too. The on-disk timestamps are already microsecond-resolution, so they load with no conversion — see [Incremental Update](#utilization-pipeline-incremental-update) for why.
 
 ## Utilization Pipeline: Incremental Update
 
@@ -351,7 +410,7 @@ To bootstrap or re-run the utilization pipeline over a historical range:
    print(summary.batches_run, summary.final_end_date, summary.final_row_count)
    ```
 
-   Each batch fetches and transforms one capped window (which fits in pandas) and delete-then-appends it via the DuckDB merge (which stays bounded on the file side), so the whole backfill runs in bounded memory across many small batches. `backfill_to_present` stops with a `BackfillStalledError` if a batch can't write (an enabled provider failed) — existing data is preserved, so a later call resumes from where it left off. Alternatively, just leave `max_window_days` set and let the **scheduled daily runs** catch up one batch per invocation over successive days.
+   Each batch fetches and transforms one capped window (which fits in pandas) and delete-then-appends it via the DuckDB merge (which stays bounded on the file side), so the whole backfill runs in bounded memory across many small batches. `backfill_to_present` stops with a `BackfillStalledError` if a batch can't write (an enabled provider failed) — existing data is preserved, so a later call resumes from where it left off. Alternatively, just leave `max_window_days` set and let your **scheduled runs** catch up one batch per invocation over successive ticks.
 
 5. Subsequent steady-state runs use `latest_data_date - lookback_days` as the window start; with a recent anchor the cap is inert and each run covers a single day.
 
