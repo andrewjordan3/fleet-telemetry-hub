@@ -24,7 +24,7 @@ Usage:
 ------
     from fleet_telemetry_hub.pipeline_partitioned import PartitionedTelemetryPipeline
 
-    # One-liner for cron jobs
+    # Invoke once per run from your scheduler (cron, systemd timer, etc.)
     PartitionedTelemetryPipeline('config.yaml').run()
 """
 

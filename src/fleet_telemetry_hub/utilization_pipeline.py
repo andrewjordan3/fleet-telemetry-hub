@@ -1,9 +1,12 @@
-"""Cron-driven daily entrypoint for the unified utilization pipeline.
+"""Entrypoint for the unified utilization pipeline.
 
-External scheduling (cron) invokes ``UtilizationPipeline(config_path).run()``.
-The pipeline determines its own fetch window from prior metadata and
-config -- no command-line arguments. Output is a single parquet plus
-a metadata JSON, both atomically written to ``{parquet_path}/utilization/``.
+An external scheduler you supply (e.g. cron or a systemd timer) invokes
+``UtilizationPipeline(config_path).run()`` -- the package ships no
+scheduler of its own, and the cadence (daily is typical, not required) is
+your choice. The pipeline determines its own fetch window from prior
+metadata and config on each invocation -- no command-line arguments.
+Output is a single parquet plus a metadata JSON, both atomically written
+to ``{parquet_path}/utilization/``.
 
 Each run updates the file incrementally and with bounded memory: the
 fetch window is deleted from the existing parquet, the freshly-fetched
@@ -134,11 +137,13 @@ class BackfillSummary:
 
 class UtilizationPipeline:
     """
-    Daily-run pipeline that fetches Motive + Samsara utilization, unifies,
+    Pipeline that fetches Motive + Samsara utilization, unifies,
     and writes a single parquet plus a metadata JSON.
 
-    External scheduling (cron) invokes ``run()``. The pipeline figures
-    out its own fetch window from prior metadata and config.
+    An external scheduler you supply (e.g. cron or a systemd timer)
+    invokes ``run()``; the package ships no scheduler and imposes no
+    cadence. The pipeline figures out its own fetch window from prior
+    metadata and config on each invocation.
 
     Per-provider failure is isolated during the fetch -- one provider's
     outage does not block the other. The run only writes when every
@@ -193,7 +198,7 @@ class UtilizationPipeline:
 
     def run(self) -> UtilizationRunResult:
         """
-        Execute one full daily run.
+        Execute one full run.
 
         Determines the fetch window from prior metadata and config,
         fetches each provider's bundle (isolating failures), runs the
