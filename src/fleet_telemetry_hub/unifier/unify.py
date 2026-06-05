@@ -14,13 +14,16 @@ parquet consumers never see a different shape on a no-data day.
 
 import logging
 from collections import Counter
-from datetime import datetime
 
 import pandas as pd
 
 from fleet_telemetry_hub.unifier.motive_transform import transform_motive_bundle
 from fleet_telemetry_hub.unifier.samsara_transform import transform_samsara_bundle
-from fleet_telemetry_hub.unifier.schema import UnifiedEventRow, build_dataframe
+from fleet_telemetry_hub.unifier.schema import (
+    UnifiedEventRow,
+    build_dataframe,
+    sort_unified_frame,
+)
 from fleet_telemetry_hub.utilization.motive_fetcher import MotiveUtilizationBundle
 from fleet_telemetry_hub.utilization.samsara_fetcher import SamsaraUtilizationBundle
 
@@ -69,22 +72,8 @@ def unify(
     if samsara_bundle is not None:
         rows.extend(transform_samsara_bundle(samsara_bundle))
 
-    rows.sort(key=_sort_key)
-
     _log_exit(rows)
-    return build_dataframe(rows)
-
-
-def _sort_key(row: UnifiedEventRow) -> tuple[str, datetime, str]:
-    """
-    Sort key for unified rows: ``(company_or_empty, start_time_utc, event_type)``.
-
-    Substituting ``''`` for a ``None`` company makes null-company rows
-    sort deterministically ahead of any real company string.
-    ``event_type`` is a ``StrEnum`` (subclasses ``str``) and sorts
-    naturally as its underlying value.
-    """
-    return (row.company or '', row.start_time_utc, row.event_type)
+    return sort_unified_frame(build_dataframe(rows))
 
 
 def _log_entry(

@@ -23,9 +23,11 @@ from fleet_telemetry_hub.unifier.samsara_transform import transform_samsara_bund
 from fleet_telemetry_hub.unifier.schema import (
     COLUMNS,
     DTYPES,
+    SORT_COLUMNS,
     EventType,
     UnifiedEventRow,
     build_dataframe,
+    sort_unified_frame,
 )
 from fleet_telemetry_hub.unifier.text_normalization import (
     nfkc_strip,
@@ -37,6 +39,7 @@ from fleet_telemetry_hub.unifier.unify import unify
 __all__: list[str] = [
     'COLUMNS',
     'DTYPES',
+    'SORT_COLUMNS',
     'DriverIdentity',
     'DrivingWindow',
     'EventType',
@@ -50,6 +53,7 @@ __all__: list[str] = [
     'nfkc_strip',
     'normalize_driver_name',
     'nullify_tokens',
+    'sort_unified_frame',
     'sum_overlap_seconds',
     'transform_motive_bundle',
     'transform_samsara_bundle',
