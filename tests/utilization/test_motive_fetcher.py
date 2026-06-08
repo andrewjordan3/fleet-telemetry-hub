@@ -2,18 +2,19 @@
 
 Uses ``unittest.mock`` to stand in for the Provider/TelemetryClient
 context-manager pair, but constructs real Pydantic record instances
-(VehicleUtilization, DriverIdleRollup, DrivingPeriod, IdleEvent, etc.)
-for the data the fake client yields. Tests assert the fetcher
-orchestrates the four Motive endpoints correctly without performing
+(DrivingPeriod, IdleEvent, etc.) for the data the fake client yields.
+Tests assert the fetcher orchestrates the two event-grain Motive
+endpoints (driving_periods, idle_events) correctly without performing
 any transformation: identity equality is used for records flowing
-through the bundle, and ``is`` identity is used for endpoint
-constants on the call list.
+through the bundle, and ``is`` identity is used for endpoint constants
+on the call list. The fetcher must make no aggregate-endpoint
+(VEHICLE_UTILIZATION / DRIVER_UTILIZATION) calls.
 
 All identifiers in test data are synthetic.
 """
 
 import dataclasses
-from datetime import UTC, date, datetime, timedelta
+from datetime import date, datetime, timedelta
 from itertools import pairwise
 from typing import Any
 from unittest.mock import MagicMock
@@ -23,13 +24,11 @@ import pytest
 from fleet_telemetry_hub.client import TelemetryClient
 from fleet_telemetry_hub.models.motive_requests import MotiveEndpoints
 from fleet_telemetry_hub.models.motive_responses import (
-    DriverIdleRollup,
     DriverSummary,
     DrivingPeriod,
     EldDeviceInfo,
     IdleEvent,
     VehicleSummary,
-    VehicleUtilization,
 )
 from fleet_telemetry_hub.provider import Provider
 from fleet_telemetry_hub.utilization import (
@@ -44,10 +43,11 @@ _MAY_14 = date(2026, 5, 14)
 _MAY_15 = date(2026, 5, 15)
 _MAY_16 = date(2026, 5, 16)
 
-_MAY_14_START = datetime(2026, 5, 14, 0, 0, 0, tzinfo=UTC)
-_MAY_15_START = datetime(2026, 5, 15, 0, 0, 0, tzinfo=UTC)
-_MAY_16_START = datetime(2026, 5, 16, 0, 0, 0, tzinfo=UTC)
-_MAY_17_START = datetime(2026, 5, 17, 0, 0, 0, tzinfo=UTC)
+# The two event-grain endpoints the fetcher is allowed to call. Any call
+# outside this set is a regression (the aggregate endpoints were dropped).
+_ALLOWED_ENDPOINTS = frozenset(
+    {MotiveEndpoints.DRIVING_PERIODS, MotiveEndpoints.IDLE_EVENTS}
+)
 
 
 def _make_vehicle_summary(vehicle_id: int = 8000001) -> VehicleSummary:
@@ -75,36 +75,6 @@ def _make_driver_summary(driver_id: int = 9000001) -> DriverSummary:
             'driver_company_id': f'TEST-{driver_id}-OTR',
             'status': 'active',
             'role': 'driver',
-        }
-    )
-
-
-def _make_vehicle_utilization(vehicle_id: int = 8000001) -> VehicleUtilization:
-    return VehicleUtilization.model_validate(
-        {
-            'message': '',
-            'last_located_at': '2026-05-14T12:00:00Z',
-            'utilization_percentage': 50.0,
-            'idle_time': 1000,
-            'idle_fuel': 0.5,
-            'driving_time': 2000,
-            'driving_fuel': 5.0,
-            'total_fuel': 5.5,
-            'total_distance': 100.0,
-            'vehicle': _make_vehicle_summary(vehicle_id).model_dump(by_alias=True),
-        }
-    )
-
-
-def _make_driver_idle_rollup(driver_id: int = 9000001) -> DriverIdleRollup:
-    return DriverIdleRollup.model_validate(
-        {
-            'utilization': 66.6,
-            'idle_time': 500,
-            'driving_time': 1000,
-            'driver': _make_driver_summary(driver_id).model_dump(by_alias=True),
-            'idle_fuel': 0.25,
-            'driving_fuel': 2.5,
         }
     )
 
@@ -179,25 +149,16 @@ class _FakeBackendRecords:
     """
     Frozen fixture bundling the records the fake backend dispatches.
 
-    ``*_by_window`` maps key on the request kwargs the fetcher passes
-    to the corresponding endpoint; missing keys yield an empty
-    iterator (so the fake silently models "no records for that
-    window" without raising). ``driving_period_records`` /
-    ``idle_event_records`` are flat lists returned regardless of
-    window, preserving the pre-chunking helper contract; tests that
-    want chunk-window dispatch populate the ``*_by_window`` maps for
-    those endpoints instead.
+    ``driving_period_records`` / ``idle_event_records`` are flat lists
+    returned regardless of window; tests that want chunk-window dispatch
+    populate the ``*_by_window`` maps (keyed on the chunk's
+    ``(start_date, end_date)``) instead, and a missing window key yields
+    an empty iterator.
 
     Frozen+slots is structural only -- the held collections remain
     mutable Python dicts/lists, which is fine for a test fixture.
     """
 
-    vehicle_records_by_window: dict[
-        tuple[datetime, datetime], list[VehicleUtilization]
-    ] = dataclasses.field(default_factory=dict)
-    driver_records_by_window: dict[
-        tuple[datetime, datetime], list[DriverIdleRollup]
-    ] = dataclasses.field(default_factory=dict)
     driving_period_records: list[DrivingPeriod] = dataclasses.field(
         default_factory=list
     )
@@ -217,20 +178,15 @@ def _build_fake_provider_and_client(
     """
     Construct a fake (Provider, TelemetryClient) pair wired together.
 
-    The fake client's ``fetch_all`` dispatches on the endpoint
-    constant:
+    The fake client's ``fetch_all`` dispatches on the endpoint constant:
+    DRIVING_PERIODS / IDLE_EVENTS first check the ``*_by_window`` maps
+    keyed on the chunk's ``(start_date, end_date)``; an empty map falls
+    back to the flat ``*_records`` list. Any other endpoint yields an
+    empty iterator -- the fetcher should never request one.
 
-    - VEHICLE_UTILIZATION / DRIVER_UTILIZATION lookups use the
-      ``(start_at, end_at)`` or ``(start_date, end_date)`` datetime
-      window as the key into the per-window record maps.
-    - DRIVING_PERIODS / IDLE_EVENTS first check the ``*_by_window``
-      maps keyed on the chunk's ``(start_date, end_date)``; an empty
-      map falls back to the flat ``*_records`` list so existing
-      callers see unchanged behavior.
-
-    Returns ``(fake_provider, fake_client)`` so tests can also
-    assert on the client side (e.g. context-manager invocation
-    counts, call-list dispatch).
+    Returns ``(fake_provider, fake_client)`` so tests can also assert on
+    the client side (e.g. context-manager invocation counts, call-list
+    dispatch).
     """
 
     backend_records = records or _FakeBackendRecords()
@@ -256,12 +212,6 @@ def _build_fake_provider_and_client(
         return iter(backend_records.idle_event_records)
 
     def fake_fetch_all(endpoint: Any, **params: Any) -> Any:
-        if endpoint is MotiveEndpoints.VEHICLE_UTILIZATION:
-            window = (params['start_at'], params['end_at'])
-            return iter(backend_records.vehicle_records_by_window.get(window, []))
-        if endpoint is MotiveEndpoints.DRIVER_UTILIZATION:
-            window = (params['start_date'], params['end_date'])
-            return iter(backend_records.driver_records_by_window.get(window, []))
         if endpoint is MotiveEndpoints.DRIVING_PERIODS:
             return dispatch_driving_periods(**params)
         if endpoint is MotiveEndpoints.IDLE_EVENTS:
@@ -304,72 +254,44 @@ class TestMotiveUtilizationFetcherValidation:
         assert str(_MAY_14) in str(exc_info.value)
 
 
-class TestMotiveUtilizationFetcherSingleDay:
-    """Single-day range fetches all four endpoints exactly once."""
+class TestMotiveUtilizationFetcherCallShape:
+    """Only the two event-grain endpoints are called -- no aggregate fetches."""
 
-    def test_one_key_per_by_date_dict_and_four_calls(self) -> None:
-        """Should produce one by-date key per dict and 4 total fetch_all calls."""
-
-        fake_provider, fake_client = _build_fake_provider_and_client()
-        fetcher = MotiveUtilizationFetcher(fake_provider)
-
-        bundle = fetcher.fetch(_MAY_14, _MAY_14)
-
-        assert list(bundle.vehicle_utilizations_by_date) == [_MAY_14]
-        assert list(bundle.driver_idle_rollups_by_date) == [_MAY_14]
-        expected_call_count = 4
-        assert fake_client.fetch_all.call_count == expected_call_count
-
-
-class TestMotiveUtilizationFetcherMultiDay:
-    """Multi-day range loops per-day endpoints; full-range event endpoints once each."""
-
-    def test_three_day_range_keys_and_call_count(self) -> None:
-        """Should fan out 3 days x 2 per-day endpoints + driving_periods + idle_events = 8."""
+    def test_single_day_makes_only_event_calls(self) -> None:
+        """A single-day fetch calls DRIVING_PERIODS + IDLE_EVENTS once each."""
 
         fake_provider, fake_client = _build_fake_provider_and_client()
         fetcher = MotiveUtilizationFetcher(fake_provider)
 
-        bundle = fetcher.fetch(_MAY_14, _MAY_16)
+        fetcher.fetch(_MAY_14, _MAY_14)
 
-        assert list(bundle.vehicle_utilizations_by_date) == [
-            _MAY_14,
-            _MAY_15,
-            _MAY_16,
+        endpoints_called = [
+            call.args[0] for call in fake_client.fetch_all.call_args_list
         ]
-        assert list(bundle.driver_idle_rollups_by_date) == [
-            _MAY_14,
-            _MAY_15,
-            _MAY_16,
-        ]
-        expected_call_count = 8
-        assert fake_client.fetch_all.call_count == expected_call_count
+        # One chunk (single day) -> exactly one call per event endpoint.
+        expected_call_count = 2
+        assert len(endpoints_called) == expected_call_count
+        assert set(endpoints_called) == set(_ALLOWED_ENDPOINTS)
 
+    def test_no_aggregate_endpoint_is_ever_called(self) -> None:
+        """The fetcher never calls VEHICLE_UTILIZATION or DRIVER_UTILIZATION.
 
-class TestMotiveUtilizationFetcherEmptyDaysPreserved:
-    """Days with zero records still appear in the by-date dicts."""
+        A multi-day range previously fanned out a per-day aggregate call
+        pair; that path is gone, so every recorded call must target one of
+        the two allowed event-grain endpoints.
+        """
 
-    def test_empty_vehicle_day_still_has_key(self) -> None:
-        """Should preserve a key with value [] when an aggregate day is empty."""
+        fake_provider, fake_client = _build_fake_provider_and_client()
+        fetcher = MotiveUtilizationFetcher(fake_provider)
 
-        vehicle_records_by_window = {
-            (_MAY_14_START, _MAY_15_START): [_make_vehicle_utilization(8000001)],
-            # No entry for May 15 -> fake_fetch_all returns iter([]).
-            (_MAY_16_START, _MAY_17_START): [_make_vehicle_utilization(8000002)],
+        fetcher.fetch(_MAY_14, _MAY_16)
+
+        endpoints_called = {
+            call.args[0] for call in fake_client.fetch_all.call_args_list
         }
-        fake_provider, _ = _build_fake_provider_and_client(
-            records=_FakeBackendRecords(
-                vehicle_records_by_window=vehicle_records_by_window,
-            ),
-        )
-        fetcher = MotiveUtilizationFetcher(fake_provider)
-
-        bundle = fetcher.fetch(_MAY_14, _MAY_16)
-
-        assert _MAY_15 in bundle.vehicle_utilizations_by_date
-        assert bundle.vehicle_utilizations_by_date[_MAY_15] == []
-        assert len(bundle.vehicle_utilizations_by_date[_MAY_14]) == 1
-        assert len(bundle.vehicle_utilizations_by_date[_MAY_16]) == 1
+        assert endpoints_called <= set(_ALLOWED_ENDPOINTS)
+        assert MotiveEndpoints.VEHICLE_UTILIZATION not in endpoints_called
+        assert MotiveEndpoints.DRIVER_UTILIZATION not in endpoints_called
 
 
 class TestMotiveUtilizationFetcherEndpointAndParameterShapes:
@@ -377,77 +299,39 @@ class TestMotiveUtilizationFetcherEndpointAndParameterShapes:
 
     def _fetch_and_partition_calls(
         self,
-    ) -> tuple[list[Any], list[Any], list[Any], list[Any]]:
-        """Run a 2-day fetch and partition calls by endpoint constant."""
+    ) -> tuple[list[Any], list[Any]]:
+        """Run a 2-day fetch and partition calls into (period, idle)."""
 
         fake_provider, fake_client = _build_fake_provider_and_client()
         fetcher = MotiveUtilizationFetcher(fake_provider)
 
         fetcher.fetch(_MAY_14, _MAY_15)
 
-        vehicle_calls: list[Any] = []
-        driver_calls: list[Any] = []
         period_calls: list[Any] = []
         idle_calls: list[Any] = []
         for call in fake_client.fetch_all.call_args_list:
             endpoint = call.args[0]
-            if endpoint is MotiveEndpoints.VEHICLE_UTILIZATION:
-                vehicle_calls.append(call)
-            elif endpoint is MotiveEndpoints.DRIVER_UTILIZATION:
-                driver_calls.append(call)
-            elif endpoint is MotiveEndpoints.DRIVING_PERIODS:
+            if endpoint is MotiveEndpoints.DRIVING_PERIODS:
                 period_calls.append(call)
             elif endpoint is MotiveEndpoints.IDLE_EVENTS:
                 idle_calls.append(call)
 
-        return vehicle_calls, driver_calls, period_calls, idle_calls
+        return period_calls, idle_calls
 
     def test_endpoint_identity_per_call_class(self) -> None:
-        """Each call's positional endpoint argument matches the expected constant."""
+        """Only DRIVING_PERIODS and IDLE_EVENTS are called, once each (one chunk)."""
 
-        vehicle_calls, driver_calls, period_calls, idle_calls = (
-            self._fetch_and_partition_calls()
-        )
+        period_calls, idle_calls = self._fetch_and_partition_calls()
 
-        expected_per_day_calls = 2
-        assert len(vehicle_calls) == expected_per_day_calls
-        assert len(driver_calls) == expected_per_day_calls
         assert len(period_calls) == 1
         assert len(idle_calls) == 1
-
-        for call in vehicle_calls:
-            assert call.args[0] is MotiveEndpoints.VEHICLE_UTILIZATION
-        for call in driver_calls:
-            assert call.args[0] is MotiveEndpoints.DRIVER_UTILIZATION
         assert period_calls[0].args[0] is MotiveEndpoints.DRIVING_PERIODS
         assert idle_calls[0].args[0] is MotiveEndpoints.IDLE_EVENTS
-
-    def test_vehicle_utilization_params_are_utc_datetimes(self) -> None:
-        """VEHICLE_UTILIZATION receives start_at / end_at as UTC datetimes."""
-
-        vehicle_calls, _, _, _ = self._fetch_and_partition_calls()
-
-        for call in vehicle_calls:
-            assert isinstance(call.kwargs['start_at'], datetime)
-            assert isinstance(call.kwargs['end_at'], datetime)
-            assert call.kwargs['start_at'].tzinfo is UTC
-            assert call.kwargs['end_at'].tzinfo is UTC
-
-    def test_driver_utilization_params_are_utc_datetimes(self) -> None:
-        """DRIVER_UTILIZATION receives start_date / end_date as UTC datetimes."""
-
-        _, driver_calls, _, _ = self._fetch_and_partition_calls()
-
-        for call in driver_calls:
-            assert isinstance(call.kwargs['start_date'], datetime)
-            assert isinstance(call.kwargs['end_date'], datetime)
-            assert call.kwargs['start_date'].tzinfo is UTC
-            assert call.kwargs['end_date'].tzinfo is UTC
 
     def test_driving_periods_params_are_bare_dates(self) -> None:
         """DRIVING_PERIODS receives start_date / end_date as bare date instances."""
 
-        _, _, period_calls, _ = self._fetch_and_partition_calls()
+        period_calls, _ = self._fetch_and_partition_calls()
 
         period_call = period_calls[0]
         assert isinstance(period_call.kwargs['start_date'], date)
@@ -458,7 +342,7 @@ class TestMotiveUtilizationFetcherEndpointAndParameterShapes:
     def test_idle_events_params_are_bare_dates(self) -> None:
         """IDLE_EVENTS receives start_date / end_date as bare date instances."""
 
-        _, _, _, idle_calls = self._fetch_and_partition_calls()
+        _, idle_calls = self._fetch_and_partition_calls()
 
         idle_call = idle_calls[0]
         assert isinstance(idle_call.kwargs['start_date'], date)
@@ -468,10 +352,10 @@ class TestMotiveUtilizationFetcherEndpointAndParameterShapes:
 
 
 class TestMotiveUtilizationFetcherWindowBoundaries:
-    """Exact window boundaries for both aggregate and event endpoints."""
+    """Exact window boundaries for the event endpoints."""
 
-    def test_may_14_windows_are_exact(self) -> None:
-        """A May 14 fetch produces midnight-to-midnight UTC windows for aggregates."""
+    def test_may_14_event_windows_are_exact(self) -> None:
+        """A single-day fetch passes the bare start/end date to both endpoints."""
 
         fake_provider, fake_client = _build_fake_provider_and_client()
         fetcher = MotiveUtilizationFetcher(fake_provider)
@@ -481,14 +365,6 @@ class TestMotiveUtilizationFetcherWindowBoundaries:
         calls_by_endpoint: dict[Any, Any] = {
             call.args[0]: call for call in fake_client.fetch_all.call_args_list
         }
-
-        vehicle_call = calls_by_endpoint[MotiveEndpoints.VEHICLE_UTILIZATION]
-        assert vehicle_call.kwargs['start_at'] == _MAY_14_START
-        assert vehicle_call.kwargs['end_at'] == _MAY_15_START
-
-        driver_call = calls_by_endpoint[MotiveEndpoints.DRIVER_UTILIZATION]
-        assert driver_call.kwargs['start_date'] == _MAY_14_START
-        assert driver_call.kwargs['end_date'] == _MAY_15_START
 
         period_call = calls_by_endpoint[MotiveEndpoints.DRIVING_PERIODS]
         assert period_call.kwargs['start_date'] == _MAY_14
@@ -505,9 +381,6 @@ class TestMotiveUtilizationFetcherPassThrough:
     def test_records_pass_through_by_identity(self) -> None:
         """Bundle entries are the exact instances the fake client yielded."""
 
-        v_rec_14 = _make_vehicle_utilization(8000001)
-        v_rec_15 = _make_vehicle_utilization(8000002)
-        d_rec_14 = _make_driver_idle_rollup(9000001)
         period_a = _make_driving_period(4550000001)
         period_b = _make_driving_period(4550000002)
         idle_a = _make_idle_event(4860000001)
@@ -515,13 +388,6 @@ class TestMotiveUtilizationFetcherPassThrough:
 
         fake_provider, _ = _build_fake_provider_and_client(
             records=_FakeBackendRecords(
-                vehicle_records_by_window={
-                    (_MAY_14_START, _MAY_15_START): [v_rec_14],
-                    (_MAY_15_START, _MAY_16_START): [v_rec_15],
-                },
-                driver_records_by_window={
-                    (_MAY_14_START, _MAY_15_START): [d_rec_14],
-                },
                 driving_period_records=[period_a, period_b],
                 idle_event_records=[idle_a, idle_b],
             ),
@@ -530,9 +396,6 @@ class TestMotiveUtilizationFetcherPassThrough:
 
         bundle = fetcher.fetch(_MAY_14, _MAY_15)
 
-        assert bundle.vehicle_utilizations_by_date[_MAY_14][0] is v_rec_14
-        assert bundle.vehicle_utilizations_by_date[_MAY_15][0] is v_rec_15
-        assert bundle.driver_idle_rollups_by_date[_MAY_14][0] is d_rec_14
         assert bundle.driving_periods[0] is period_a
         assert bundle.driving_periods[1] is period_b
         assert bundle.idle_events[0] is idle_a
@@ -540,7 +403,7 @@ class TestMotiveUtilizationFetcherPassThrough:
 
 
 class TestMotiveUtilizationFetcherBundleMetadata:
-    """date_range and bundle immutability."""
+    """date_range, exact field set, and bundle immutability."""
 
     def test_date_range_matches_input(self) -> None:
         """Bundle.date_range equals the (start, end) tuple originally passed."""
@@ -552,12 +415,21 @@ class TestMotiveUtilizationFetcherBundleMetadata:
 
         assert bundle.date_range == (_MAY_14, _MAY_16)
 
+    def test_field_set_is_exact(self) -> None:
+        """The bundle carries exactly the four event-grain fields."""
+
+        field_names = {field.name for field in dataclasses.fields(MotiveUtilizationBundle)}
+        assert field_names == {
+            'driving_periods',
+            'idle_events',
+            'date_range',
+            'company',
+        }
+
     def test_bundle_is_frozen_dataclass(self) -> None:
         """Assigning to a bundle attribute raises FrozenInstanceError."""
 
         bundle = MotiveUtilizationBundle(
-            vehicle_utilizations_by_date={},
-            driver_idle_rollups_by_date={},
             driving_periods=[],
             idle_events=[],
             date_range=(_MAY_14, _MAY_14),
@@ -565,7 +437,7 @@ class TestMotiveUtilizationFetcherBundleMetadata:
         )
 
         with pytest.raises(dataclasses.FrozenInstanceError):
-            bundle.vehicle_utilizations_by_date = {}  # pyright: ignore[reportAttributeAccessIssue]
+            bundle.driving_periods = []  # pyright: ignore[reportAttributeAccessIssue]
 
 
 class TestMotiveUtilizationFetcherClientLifecycle:
