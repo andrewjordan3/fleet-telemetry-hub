@@ -414,7 +414,7 @@ To bootstrap or re-run the utilization pipeline over a historical range:
 
 5. Subsequent steady-state runs use `latest_data_date - lookback_days` as the range start; with a recent anchor the range fits in a single window and the cap is inert.
 
-**Memory vs. windows tradeoff:** a smaller `max_window_days` lowers peak per-window memory but needs more windows (more redundant re-fetch — each window re-fetches the prior `lookback_days` of overlap). A larger span is fewer windows but higher peak memory. Pick the largest span that comfortably fits the run host's memory. The `max_window_days > lookback_days` requirement guarantees forward progress: each window advances the leading edge by ~`max_window_days - lookback_days` days, so a cap that didn't exceed the lookback would stall the march.
+**Memory vs. windows tradeoff:** a smaller `max_window_days` lowers peak per-window memory but needs more windows. A larger span is fewer windows but higher peak memory. Pick the largest span that comfortably fits the run host's memory. Windows within a run are **contiguous** — the next window starts the day after the prior window's end — so each day is fetched exactly once regardless of `lookback_days`; a backfill therefore runs self-overlap-free at the normal steady-state `lookback_days` with no redundant re-fetch. (`lookback_days` re-fetches the trailing window only *across separate runs*, via the resolved range start — see `lookback_days` above.) Each window advances the leading edge by `max_window_days + 1` days, so any positive cap makes forward progress.
 
 ## Configuration
 
