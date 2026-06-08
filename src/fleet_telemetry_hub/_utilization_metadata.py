@@ -1,14 +1,18 @@
-"""Metadata-JSON derivation for ``UtilizationPipeline``.
+"""Metadata-JSON derivation and persistence for ``UtilizationPipeline``.
 
-Companion module to ``utilization_pipeline.py``: derives the locked
-metadata-dict shape from precomputed whole-file aggregates plus the run
-context, so the pipeline module stays close to its size target. The
-aggregates come from a streaming DuckDB pass over the written parquet
-(``compute_parquet_aggregates``), so metadata derivation never loads the
-file into pandas.
+Companion module to ``utilization_pipeline.py``. The pure layer
+(``compute_parquet_aggregates``, ``build_metadata_dict``) derives the
+locked metadata-dict shape from whole-file aggregates plus the run
+context, never loading the parquet into pandas. ``MetadataStore`` wraps
+that layer with the on-disk concerns -- loading the prior metadata,
+computing the aggregates over the sibling ``data.parquet``, and writing
+the result atomically -- so the pipeline module stays close to its size
+target and owns no persistence logic.
 """
 
+import json
 import logging
+import tempfile
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
@@ -19,6 +23,7 @@ import duckdb
 __all__: list[str] = [
     'MetadataAggregates',
     'MetadataBuildContext',
+    'MetadataStore',
     'build_metadata_dict',
     'compute_parquet_aggregates',
 ]
@@ -57,14 +62,14 @@ class MetadataAggregates:
 
 @dataclass(frozen=True, slots=True)
 class MetadataBuildContext:
-    """Frozen bundle of inputs to ``build_metadata_dict``.
+    """Frozen run-context bundle for ``build_metadata_dict``.
 
-    Bundling keeps the metadata-builder signature under the PLR0913
-    five-parameter cap and makes the writer side a single-argument call
-    site.
+    Carries everything the metadata shape needs *except* the whole-file
+    aggregates, which ``MetadataStore`` derives from the written parquet
+    and passes alongside this context. Bundling keeps the builder signature
+    under the PLR0913 five-parameter cap.
 
     Attributes:
-        aggregates: Whole-file aggregates over the written parquet.
         prior_metadata: The previous run's metadata dict, or ``None`` on
             a first run. Used to preserve ``latest_data_date`` when the
             file has no events.
@@ -81,7 +86,6 @@ class MetadataBuildContext:
             transform, in fixed order.
     """
 
-    aggregates: MetadataAggregates
     prior_metadata: dict[str, Any] | None
     run_started: datetime
     run_completed: datetime
@@ -150,18 +154,21 @@ def compute_parquet_aggregates(path: Path) -> MetadataAggregates:
     return aggregates
 
 
-def build_metadata_dict(ctx: MetadataBuildContext) -> dict[str, Any]:
-    """Derive the metadata JSON dict from a run context.
+def build_metadata_dict(
+    aggregates: MetadataAggregates, ctx: MetadataBuildContext
+) -> dict[str, Any]:
+    """Derive the metadata JSON dict from whole-file aggregates and run context.
 
     Args:
-        ctx: Bundled run inputs (whole-file aggregates, prior metadata,
-            timing, window, provider-status lists).
+        aggregates: Whole-file aggregates over the written parquet.
+        ctx: Bundled run inputs (prior metadata, timing, window,
+            provider-status lists).
 
     Returns:
         Dict matching the locked metadata-JSON shape, ready for
         ``json.dump``.
     """
-    latest_event_end = ctx.aggregates.latest_event_end
+    latest_event_end = aggregates.latest_event_end
     return {
         'last_run_started_utc': _iso_z(ctx.run_started),
         'last_run_completed_utc': _iso_z(ctx.run_completed),
@@ -175,13 +182,90 @@ def build_metadata_dict(ctx: MetadataBuildContext) -> dict[str, Any]:
             None if latest_event_end is None else _iso_z(latest_event_end)
         ),
         'latest_data_date': _latest_data_date(latest_event_end, ctx.prior_metadata),
-        'row_count': ctx.aggregates.row_count,
-        'by_company': ctx.aggregates.by_company,
+        'row_count': aggregates.row_count,
+        'by_company': aggregates.by_company,
         'providers_present': ctx.providers_present,
         'providers_skipped': ctx.providers_skipped,
         'providers_failed': ctx.providers_failed,
         'schema_version': _METADATA_SCHEMA_VERSION,
     }
+
+
+class MetadataStore:
+    """Owns ``metadata.json`` for one utilization output directory.
+
+    Reads the prior metadata, computes whole-file aggregates over the
+    sibling ``data.parquet``, builds the locked metadata shape, and writes
+    it atomically. The pure functions it calls
+    (``compute_parquet_aggregates``, ``build_metadata_dict``) stay
+    side-effect-free; this class is the only side-effecting layer.
+
+    Attributes:
+        parquet_dir: The output directory holding ``data.parquet`` and
+            ``metadata.json`` (read-only).
+    """
+
+    def __init__(self, parquet_dir: Path) -> None:
+        """Bind the store to ``parquet_dir`` and derive its file paths.
+
+        Args:
+            parquet_dir: The ``{parquet_path}/utilization/`` directory that
+                holds (or will hold) ``data.parquet`` and ``metadata.json``.
+        """
+        self._parquet_dir: Path = parquet_dir
+        self._metadata_path: Path = parquet_dir / 'metadata.json'
+        self._parquet_path: Path = parquet_dir / 'data.parquet'
+
+    def load(self) -> dict[str, Any] | None:
+        """Return the prior metadata dict, or ``None`` if no file exists.
+
+        Returns:
+            The parsed metadata dict, or ``None`` on a first run with no
+            metadata file yet.
+
+        Raises:
+            json.JSONDecodeError: If the metadata file exists but is
+                malformed. Never silently treated as a first run.
+
+        Side Effects:
+            Reads ``metadata.json`` from disk when present.
+        """
+        if not self._metadata_path.exists():
+            return None
+        with self._metadata_path.open('r', encoding='utf-8') as metadata_file:
+            loaded: dict[str, Any] = json.load(metadata_file)
+            return loaded
+
+    def write(self, ctx: MetadataBuildContext) -> None:
+        """Build and atomically write the metadata JSON for this run.
+
+        Computes whole-file aggregates over the sibling ``data.parquet``,
+        builds the metadata dict, and writes it via a temp file + rename so
+        a failed write leaves any prior metadata intact.
+
+        Args:
+            ctx: The run-context bundle (timing, window, provider lists,
+                prior metadata) for this run.
+
+        Side Effects:
+            Reads ``data.parquet``; creates the output directory; writes
+            ``metadata.json`` via a temp file and atomic rename. Logs the
+            write at INFO.
+        """
+        aggregates: MetadataAggregates = compute_parquet_aggregates(self._parquet_path)
+        metadata: dict[str, Any] = build_metadata_dict(aggregates, ctx)
+        self._parquet_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            mode='w',
+            suffix='.json.tmp',
+            dir=self._parquet_dir,
+            delete=False,
+            encoding='utf-8',
+        ) as tmp_file:
+            tmp_path: Path = Path(tmp_file.name)
+            json.dump(metadata, tmp_file, indent=2, sort_keys=True)
+        tmp_path.replace(self._metadata_path)
+        logger.info('Wrote metadata to %s', self._metadata_path)
 
 
 def _iso_z(value: datetime) -> str:

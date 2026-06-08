@@ -27,24 +27,20 @@ modules ``_utilization_merge`` and ``_utilization_metadata`` so this file
 stays focused on the class-shaped orchestration surface.
 """
 
-import json
 import logging
 import math
-import tempfile
 import time as time_module
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
-from uuid import uuid4
 
 import pandas as pd
 
 from fleet_telemetry_hub._utilization_merge import merge_incremental_to_parquet
 from fleet_telemetry_hub._utilization_metadata import (
     MetadataBuildContext,
-    build_metadata_dict,
-    compute_parquet_aggregates,
+    MetadataStore,
 )
 from fleet_telemetry_hub.common import setup_logger
 from fleet_telemetry_hub.config import TelemetryConfig, load_config
@@ -183,8 +179,8 @@ class UtilizationPipeline:
         self._parquet_dir: Path = (
             Path(self._config.storage.parquet_path) / 'utilization'
         )
-        self._metadata_path: Path = self._parquet_dir / 'metadata.json'
         self._parquet_path: Path = self._parquet_dir / 'data.parquet'
+        self._metadata_store: MetadataStore = MetadataStore(self._parquet_dir)
 
     @property
     def config(self) -> TelemetryConfig:
@@ -229,7 +225,7 @@ class UtilizationPipeline:
         wall_start = time_module.monotonic()
         logger.info('UtilizationPipeline run starting at %s', run_started.isoformat())
 
-        prior_metadata = self._load_metadata()
+        prior_metadata = self._metadata_store.load()
         start_date, end_date = self._determine_window(prior_metadata)
 
         if start_date > end_date:
@@ -260,7 +256,7 @@ class UtilizationPipeline:
         providers_skipped = [name for name, status in statuses if status == 'skipped']
         providers_failed = [name for name, status in statuses if status == 'failed']
 
-        df = unify(motive_bundle, samsara_bundle)
+        df: pd.DataFrame = unify(motive_bundle, samsara_bundle)
 
         should_write = bool(providers_present) and not providers_failed
         if not should_write:
@@ -282,12 +278,19 @@ class UtilizationPipeline:
                 providers_failed=providers_failed,
             )
 
-        row_count = self._merge_and_write(df, start_date, end_date)
+        stats = merge_incremental_to_parquet(
+            df,
+            start_date,
+            end_date,
+            self._parquet_path,
+            compression=self._config.storage.parquet_compression or 'uncompressed',
+        )
+        row_count = stats.final_row_count
+        logger.info('Wrote %d rows to %s', row_count, self._parquet_path)
 
         run_completed = datetime.now(UTC)
-        self._write_metadata(
+        self._metadata_store.write(
             MetadataBuildContext(
-                aggregates=compute_parquet_aggregates(self._parquet_path),
                 prior_metadata=prior_metadata,
                 run_started=run_started,
                 run_completed=run_completed,
@@ -419,7 +422,7 @@ class UtilizationPipeline:
         advance_per_batch = max(
             1, max_window_days - self._config.pipeline.lookback_days
         )
-        first_start, _ = self._determine_window(self._load_metadata())
+        first_start, _ = self._determine_window(self._metadata_store.load())
         today_minus_one = (datetime.now(UTC) - timedelta(days=1)).date()
         total_days = max((today_minus_one - first_start).days, 0)
         return math.ceil(total_days / advance_per_batch) + _BACKFILL_ITERATION_BUFFER
@@ -499,83 +502,3 @@ class UtilizationPipeline:
         except Exception:
             logger.exception('Samsara fetch failed; treating as missing bundle')
             return None, 'failed'
-
-    # --------------------------------------------------------------
-    # Incremental merge + atomic write
-    # --------------------------------------------------------------
-
-    def _merge_and_write(
-        self, new_frame: pd.DataFrame, start_date: date, end_date: date
-    ) -> int:
-        """Merge this run's window into the parquet and atomically replace it.
-
-        Runs the DuckDB delete-then-append merge into a unique temp file
-        in the output directory, then atomically renames it onto
-        ``data.parquet``. The temp file is always removed afterwards, so a
-        failure never leaves a ``*.tmp`` behind, and the rename is the only
-        mutation of ``data.parquet`` -- so an aborted merge (e.g. a corrupt
-        existing file) leaves the prior file intact.
-
-        Args:
-            new_frame: This run's window-sized unified frame.
-            start_date: Inclusive UTC start date of the fetch window.
-            end_date: Inclusive UTC end date of the fetch window.
-
-        Returns:
-            The whole-file row count written.
-
-        Raises:
-            CorruptUtilizationParquetError: If the existing parquet is
-                unreadable or schema-mismatched (aborts before the rename).
-            OSError: If the DuckDB write or the rename fails.
-
-        Side Effects:
-            Creates the output directory; writes and renames
-            ``data.parquet``.
-        """
-        existing_path = self._parquet_path if self._parquet_path.exists() else None
-        self._parquet_dir.mkdir(parents=True, exist_ok=True)
-        temp_path = self._parquet_dir / f'data-{uuid4().hex}.parquet.tmp'
-        try:
-            stats = merge_incremental_to_parquet(
-                existing_path,
-                new_frame,
-                start_date,
-                end_date,
-                temp_path,
-                compression=self._config.storage.parquet_compression or 'uncompressed',
-                temp_directory=self._parquet_dir,
-            )
-            temp_path.replace(self._parquet_path)
-        finally:
-            temp_path.unlink(missing_ok=True)
-        logger.info('Wrote %d rows to %s', stats.final_row_count, self._parquet_path)
-        return stats.final_row_count
-
-    # --------------------------------------------------------------
-    # Metadata read / write
-    # --------------------------------------------------------------
-
-    def _load_metadata(self) -> dict[str, Any] | None:
-        """Return the prior metadata dict, or ``None`` if no file exists."""
-        if not self._metadata_path.exists():
-            return None
-        with self._metadata_path.open('r', encoding='utf-8') as metadata_file:
-            loaded: dict[str, Any] = json.load(metadata_file)
-            return loaded
-
-    def _write_metadata(self, ctx: MetadataBuildContext) -> None:
-        """Build and atomically write the metadata JSON for this run."""
-        metadata = build_metadata_dict(ctx)
-        self._parquet_dir.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(
-            mode='w',
-            suffix='.json.tmp',
-            dir=self._parquet_dir,
-            delete=False,
-            encoding='utf-8',
-        ) as tmp_file:
-            tmp_path = Path(tmp_file.name)
-            json.dump(metadata, tmp_file, indent=2, sort_keys=True)
-        tmp_path.replace(self._metadata_path)
-        logger.info('Wrote metadata to %s', self._metadata_path)

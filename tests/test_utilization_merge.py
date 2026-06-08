@@ -1,12 +1,14 @@
 """Tests for ``_utilization_merge.merge_incremental_to_parquet``: the DuckDB merge.
 
-The merge reads an existing parquet, deletes the run window, appends the
-window-sized new frame, globally sorts, and writes a new parquet -- all
-in DuckDB. Cases write the "existing" frame to a temp parquet via
-``build_dataframe(...).to_parquet(...)``, run the merge to an output
-path, then read the result back with the canonical ``read_unified_parquet``
-(the on-disk format is Arrow-native, microsecond timestamps, no pandas
-metadata, so the canonical reader restores the locked ``DTYPES``).
+The merge reads the existing parquet at ``destination_path``, deletes the
+run window, appends the window-sized new frame, globally sorts, and
+atomically rewrites ``destination_path`` -- all in DuckDB, owning its own
+temp file and rename. Cases write the "existing" frame straight to
+``destination_path`` via ``build_dataframe(...).to_parquet(...)``, run the
+merge, then read the result back from ``destination_path`` with the
+canonical ``read_unified_parquet`` (the on-disk format is Arrow-native,
+microsecond timestamps, no pandas metadata, so the canonical reader
+restores the locked ``DTYPES``).
 
 All identifiers are synthetic. The window under test is the single UTC
 day 2026-05-14, i.e. ``W_start = 2026-05-14T00:00Z`` and
@@ -16,6 +18,7 @@ day 2026-05-14, i.e. ``W_start = 2026-05-14T00:00Z`` and
 import logging
 from datetime import UTC, date, datetime
 from pathlib import Path
+from unittest.mock import patch
 
 import pandas as pd
 import pytest
@@ -77,11 +80,14 @@ def _row(
     )
 
 
-def _write_existing(rows: list[UnifiedEventRow], tmp_path: Path) -> Path:
-    """Write an existing-file frame to a parquet and return its path."""
-    existing_path = tmp_path / 'existing.parquet'
-    build_dataframe(rows).to_parquet(existing_path, index=False)
-    return existing_path
+def _write_existing(rows: list[UnifiedEventRow], destination_path: Path) -> None:
+    """Write an existing-file frame straight to ``destination_path``.
+
+    The merge now owns existing-file detection (it reads whatever sits at
+    ``destination_path``), so the "existing" rows are laid down at the very
+    path the merge will read from and atomically rewrite.
+    """
+    build_dataframe(rows).to_parquet(destination_path, index=False)
 
 
 def _merge(
@@ -96,20 +102,17 @@ def _merge(
     canonical reader so dtype assertions hold against the Arrow-native
     on-disk format.
     """
-    existing_path = (
-        None if existing_rows is None else _write_existing(existing_rows, tmp_path)
-    )
-    output_path = tmp_path / 'out.parquet'
+    destination_path = tmp_path / 'data.parquet'
+    if existing_rows is not None:
+        _write_existing(existing_rows, destination_path)
     stats = merge_incremental_to_parquet(
-        existing_path,
         build_dataframe(new_rows),
         _START_DATE,
         _END_DATE,
-        output_path,
+        destination_path,
         compression='snappy',
-        temp_directory=tmp_path,
     )
-    return read_unified_parquet(output_path), stats
+    return read_unified_parquet(destination_path), stats
 
 
 class TestFirstRun:
@@ -306,22 +309,18 @@ class TestOutputShapeAndOrder:
         out_a = tmp_path / 'a.parquet'
         out_b = tmp_path / 'b.parquet'
         merge_incremental_to_parquet(
-            None,
             build_dataframe(rows_forward),
             _START_DATE,
             _END_DATE,
             out_a,
             compression='snappy',
-            temp_directory=tmp_path,
         )
         merge_incremental_to_parquet(
-            None,
             build_dataframe(rows_reversed),
             _START_DATE,
             _END_DATE,
             out_b,
             compression='snappy',
-            temp_directory=tmp_path,
         )
 
         # The total-key ORDER BY makes the on-disk byte order reproducible.
@@ -336,13 +335,11 @@ class TestContractValidation:
 
         with pytest.raises(ValueError, match='start_date'):
             merge_incremental_to_parquet(
-                None,
                 build_dataframe([]),
                 date(2026, 5, 15),
                 date(2026, 5, 14),
                 tmp_path / 'out.parquet',
                 compression='snappy',
-                temp_directory=tmp_path,
             )
 
 
@@ -388,20 +385,19 @@ class TestLogging:
     ) -> None:
         """A DEBUG line records incoming/kept/deleted/retained/final counts."""
 
-        existing_path = _write_existing([_row(_at(14, 8)), _row(_at(20, 8))], tmp_path)
+        destination_path = tmp_path / 'data.parquet'
+        _write_existing([_row(_at(14, 8)), _row(_at(20, 8))], destination_path)
         new_frame = build_dataframe([_row(_at(13, 8)), _row(_at(14, 9))])
 
         with caplog.at_level(
             logging.DEBUG, logger='fleet_telemetry_hub._utilization_merge'
         ):
             merge_incremental_to_parquet(
-                existing_path,
                 new_frame,
                 _START_DATE,
                 _END_DATE,
-                tmp_path / 'out.parquet',
+                destination_path,
                 compression='snappy',
-                temp_directory=tmp_path,
             )
 
         debug_records = [
@@ -416,3 +412,58 @@ class TestLogging:
         assert 'existing_deleted=1' in message
         assert 'existing_retained=1' in message
         assert 'final=2' in message
+
+
+class TestWriteTransaction:
+    """The merge owns its own temp file, atomic rename, and directory creation."""
+
+    def test_mid_write_failure_preserves_existing_and_leaves_no_tmp(
+        self, tmp_path: Path
+    ) -> None:
+        """A failure after the COPY but before the rename leaves things pristine.
+
+        The COPY has written the temp file by the time stats are computed;
+        patching ``_compute_stats`` to raise exercises the ``try/finally``,
+        which must remove that temp file and leave the existing destination
+        byte-identical (the rename never ran).
+        """
+
+        destination_path = tmp_path / 'data.parquet'
+        _write_existing([_row(_at(20, 8))], destination_path)
+        original_bytes = destination_path.read_bytes()
+
+        with (
+            patch(
+                'fleet_telemetry_hub._utilization_merge._compute_stats',
+                side_effect=RuntimeError('mid-write boom'),
+            ),
+            pytest.raises(RuntimeError, match='mid-write boom'),
+        ):
+            merge_incremental_to_parquet(
+                build_dataframe([_row(_at(14, 9))]),
+                _START_DATE,
+                _END_DATE,
+                destination_path,
+                compression='snappy',
+            )
+
+        assert destination_path.read_bytes() == original_bytes
+        assert list(tmp_path.glob('*.tmp')) == []
+
+    def test_creates_destination_parent_when_absent(self, tmp_path: Path) -> None:
+        """The merge creates ``destination_path.parent`` when it does not exist."""
+
+        destination_path = tmp_path / 'nested' / 'sub' / 'data.parquet'
+        assert not destination_path.parent.exists()
+
+        merge_incremental_to_parquet(
+            build_dataframe([_row(_at(14, 8))]),
+            _START_DATE,
+            _END_DATE,
+            destination_path,
+            compression='snappy',
+        )
+
+        assert destination_path.is_file()
+        result = read_unified_parquet(destination_path)
+        assert len(result) == 1
