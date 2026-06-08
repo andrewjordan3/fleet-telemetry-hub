@@ -3,17 +3,19 @@
 An external scheduler you supply (e.g. cron or a systemd timer) invokes
 ``UtilizationPipeline(config_path).run()`` -- the package ships no
 scheduler of its own, and the cadence (daily is typical, not required) is
-your choice. The pipeline determines its own fetch window from prior
-metadata and config on each invocation -- no command-line arguments.
-Output is a single parquet plus a metadata JSON, both atomically written
-to ``{parquet_path}/utilization/``.
+your choice. The pipeline resolves its own date range from prior metadata
+and config on each invocation -- no command-line arguments -- and covers
+it as a sequence of bounded windows (one in steady state, many for a
+backfill or outage gap; see ``_utilization_windows``). Output is a single
+parquet plus a metadata JSON, both atomically written to
+``{parquet_path}/utilization/``.
 
-Each run updates the file incrementally and with bounded memory: the
-fetch window is deleted from the existing parquet, the freshly-fetched
-window is appended, the union is globally sorted, and the result is
-written -- all in DuckDB, so pandas never materializes the whole
-(unbounded) file (see ``_utilization_merge``). Whole-file metadata
-aggregates come from a second streaming DuckDB pass. Both Motive and
+Each window updates the file incrementally and with bounded memory: the
+window is deleted from the existing parquet, the freshly-fetched window
+is appended, the union is globally sorted, and the result is written --
+all in DuckDB, so pandas never materializes the whole (unbounded) file
+(see ``_utilization_merge``). Whole-file metadata aggregates come from a
+second streaming DuckDB pass, written per window. Both Motive and
 Samsara are required (the pipeline refuses to construct otherwise), and a
 fetch failure aborts the run by raising before any write, so a partial
 fetch can never destroy prior data; the next successful run re-fetches
@@ -27,7 +29,6 @@ stays focused on the class-shaped orchestration surface.
 """
 
 import logging
-import math
 import time as time_module
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
@@ -41,6 +42,7 @@ from fleet_telemetry_hub._utilization_metadata import (
     MetadataBuildContext,
     MetadataStore,
 )
+from fleet_telemetry_hub._utilization_windows import iter_windows
 from fleet_telemetry_hub.common import setup_logger
 from fleet_telemetry_hub.config import ProviderConfig, TelemetryConfig, load_config
 from fleet_telemetry_hub.provider import Provider
@@ -55,8 +57,6 @@ from fleet_telemetry_hub.utilization.samsara_fetcher import (
 )
 
 __all__: list[str] = [
-    'BackfillStalledError',
-    'BackfillSummary',
     'UtilizationPipeline',
     'UtilizationRunResult',
 ]
@@ -65,77 +65,61 @@ logger: logging.Logger = logging.getLogger(__name__)
 
 # The two providers ``UtilizationPipeline`` requires, in the fixed order
 # the metadata JSON lists them. Both must be enabled to construct the
-# pipeline; a written run always reports exactly these as present.
+# pipeline; a written window always reports exactly these as present.
 _UTILIZATION_PROVIDERS: tuple[str, str] = ('motive', 'samsara')
-
-# Slack added to the computed backfill iteration ceiling, so off-by-one
-# edge effects (the final batch landing exactly on today-1) never trip the
-# safety abort. The ceiling is itself only a backstop against a logic bug.
-_BACKFILL_ITERATION_BUFFER: int = 2
-
-
-class BackfillStalledError(Exception):
-    """Raised when ``backfill_to_present`` cannot reach the present.
-
-    Distinct from a clean catch-up: a stall means a batch wrote nothing (an
-    enabled provider failed), the window stopped advancing, or the iteration
-    ceiling was hit. Existing data is preserved, so a later
-    ``backfill_to_present`` resumes from where the file left off.
-    """
 
 
 @dataclass(frozen=True, slots=True)
 class UtilizationRunResult:
-    """Outcome of one ``UtilizationPipeline.run()``.
+    """Summary of one ``UtilizationPipeline.run()`` march over its range.
 
-    The run no longer returns a DataFrame -- the whole file is never held
-    in memory -- so callers receive this small summary instead.
+    A run covers ``[range_start, today_utc - 1]`` as one or more bounded
+    windows (see ``iter_windows``). The run never holds the whole file in
+    memory, so callers receive these aggregate counts rather than a frame.
 
     Attributes:
-        written: ``True`` when the run wrote parquet + metadata; ``False``
-            only on the start-after-end skip (clock skew, nothing to
-            fetch), in which case existing files are unchanged. Under the
-            binary provider model a fetch failure raises rather than
-            returning ``written=False``.
-        row_count: Whole-file row count after the write; ``0`` on a skip.
-        start_date: Inclusive UTC start date of the computed fetch window.
-        end_date: Inclusive UTC end date of the computed fetch window.
-        providers_present: Provider names fetched, in fixed order --
-            ``['motive', 'samsara']`` on a written run, empty only on the
-            start-after-end skip (before any fetch).
-        providers_skipped: Always empty; retained for metadata-shape
-            stability (a disabled provider is now a construction error).
-        providers_failed: Always empty; retained for metadata-shape
-            stability (a fetch failure now raises instead).
+        windows_run: Number of windows fetched, merged, and persisted.
+            ``0`` when the resolved range was empty (``range_start`` after
+            ``range_end``) -- nothing was fetched and any existing files
+            are unchanged (not necessarily empty).
+        final_start_date: Inclusive UTC start of the last window run, or
+            ``None`` when ``windows_run == 0``.
+        final_end_date: Inclusive UTC end of the last window run, or
+            ``None`` when ``windows_run == 0``.
+        final_row_count: Whole-file row count after the last window; ``0``
+            when ``windows_run == 0`` (the existing file, if any, is
+            untouched -- this is not a measured count of it).
     """
 
-    written: bool
-    row_count: int
-    start_date: date
-    end_date: date
-    providers_present: list[str]
-    providers_skipped: list[str]
-    providers_failed: list[str]
+    windows_run: int
+    final_start_date: date | None
+    final_end_date: date | None
+    final_row_count: int
+
+    @property
+    def written(self) -> bool:
+        """True when at least one window was fetched and written."""
+        return self.windows_run > 0
 
 
 @dataclass(frozen=True, slots=True)
-class BackfillSummary:
-    """Outcome of a ``backfill_to_present`` march.
+class UtilizationBatch:
+    """One window's fetched bundles, ready to unify and merge.
+
+    The binary provider model guarantees both bundles are present -- a
+    fetch failure raises rather than producing a partial batch.
 
     Attributes:
-        batches_run: Number of ``run()`` invocations the march made.
-        final_end_date: ``end_date`` of the last batch that ran.
-        caught_up: ``True`` when the march reached ``today_utc - 1``. A
-            stalled march raises ``BackfillStalledError`` rather than
-            returning ``caught_up=False``, so on return this is always
-            ``True``; the field documents the success contract.
-        final_row_count: Whole-file row count after the last batch.
+        batch_start_date: Inclusive UTC start date of the window.
+        batch_end_date: Inclusive UTC end date of the window.
+        motive_bundle: The Motive bundle fetched for the window.
+        samsara_bundle: The Samsara bundle fetched for the window.
     """
 
-    batches_run: int
-    final_end_date: date
-    caught_up: bool
-    final_row_count: int
+    batch_start_date: date
+    batch_end_date: date
+    motive_bundle: MotiveUtilizationBundle
+    samsara_bundle: SamsaraUtilizationBundle
 
 
 class UtilizationPipeline:
@@ -156,11 +140,14 @@ class UtilizationPipeline:
 
     The read + window-delete + append + global-sort + write run in DuckDB
     and metadata aggregates stream from the written file, so the whole
-    on-disk parquet is never loaded into pandas. The optional
-    ``pipeline.max_window_days`` cap bounds each run's fetch span; the
-    ``backfill_to_present`` driver marches the capped batches forward, so a
-    large backfill or outage gap runs in bounded memory across many small
-    batches instead of one giant run.
+    on-disk parquet is never loaded into pandas. A single ``run()`` covers
+    its resolved range as a sequence of bounded windows: one window in
+    steady state (a recent anchor, or ``max_window_days`` unset), and many
+    when a far-past ``default_start_date`` or an outage gap is capped by
+    ``pipeline.max_window_days``. Each window is fetched, merged, and has
+    its metadata written before the next begins, so a large backfill runs
+    in bounded memory and a mid-march failure resumes on the next ``run()``
+    from the last persisted window.
 
     Attributes:
         config: The loaded ``TelemetryConfig`` instance (read-only).
@@ -216,256 +203,166 @@ class UtilizationPipeline:
 
     def run(self) -> UtilizationRunResult:
         """
-        Execute one full run.
+        Cover the resolved range as a sequence of bounded windows.
 
-        Determines the fetch window from prior metadata and config,
-        fetches both providers' bundles, runs the per-provider transforms,
+        Resolves ``[range_start, today_utc - 1]`` from prior metadata and
+        config, then walks ``iter_windows`` -- one window in steady state,
+        many for a far-past ``default_start_date`` or outage gap capped by
+        ``max_window_days``. For each window it fetches both providers,
         unifies, merges the window into the existing parquet (DuckDB
-        delete-then-append), writes parquet, and writes metadata from a
-        streaming aggregate over the written file.
+        delete-then-append), and writes metadata from a streaming aggregate
+        over the written file, before the next window begins.
 
         Returns:
-            A ``UtilizationRunResult`` describing the run. ``written`` is
-            ``False`` (and ``row_count`` is 0) only on the start-after-end
-            skip (``start_date`` computed after ``end_date`` from clock
-            skew), in which case the on-disk parquet and metadata are left
-            unchanged. Otherwise ``written`` is ``True`` with the
-            whole-file ``row_count`` the merge wrote.
+            A ``UtilizationRunResult`` summarizing the march. When the
+            resolved range is empty (``range_start`` after ``range_end``)
+            ``windows_run`` is ``0`` and ``written`` is ``False`` -- no
+            fetch occurred and existing files are unchanged. Otherwise
+            ``windows_run`` is the number of windows persisted and the
+            ``final_*`` fields describe the last one.
 
         Raises:
             Exception: If either provider's fetch fails. The exception
-                propagates before any write, leaving existing files intact
-                (the fetch is logged at ERROR first).
+                propagates and aborts the march; windows already written
+                stay persisted (a re-run resumes from the last one), and
+                the in-flight window leaves existing files intact (the
+                fetch is logged at ERROR first).
             CorruptUtilizationParquetError: If the existing parquet is
                 unreadable or its columns do not match the schema. The
-                run aborts before any write, leaving the file intact.
+                window aborts before any write, leaving the file intact.
             json.JSONDecodeError: If an existing metadata file is
                 malformed (do not silently treat as a first run).
-            OSError: If the parquet or metadata write fails. The
-                originals (if any) remain intact in this case.
+            OSError: If a parquet or metadata write fails. The originals
+                (if any) remain intact in this case.
         """
-        run_started = datetime.now(UTC)
-        wall_start = time_module.monotonic()
+        run_started: datetime = datetime.now(UTC)
+        wall_start: float = time_module.monotonic()
         logger.info('UtilizationPipeline run starting at %s', run_started.isoformat())
 
-        prior_metadata = self._metadata_store.load()
-        start_date, end_date = self._determine_window(prior_metadata)
+        range_start, range_end = self._resolve_range(self._metadata_store.load())
+        window_days: int = self._effective_window_days(range_start, range_end)
+        lookback_days: int = self._config.pipeline.lookback_days
 
-        if start_date > end_date:
+        windows_run: int = 0
+        final_start: date | None = None
+        final_end: date | None = None
+        final_row_count: int = 0
+
+        for window_start, window_end in iter_windows(
+            range_start, range_end, window_days, lookback_days
+        ):
+            prior_metadata: dict[str, Any] | None = self._metadata_store.load()
+            logger.info(
+                'Fetch window: %s to %s (inclusive)', window_start, window_end
+            )
+
+            batch: UtilizationBatch = self._fetch_batch(window_start, window_end)
+            df: pd.DataFrame = unify(batch.motive_bundle, batch.samsara_bundle)
+            stats = merge_incremental_to_parquet(
+                df,
+                window_start,
+                window_end,
+                self._parquet_path,
+                compression=self._config.storage.parquet_compression or 'uncompressed',
+            )
+            self._metadata_store.write(
+                MetadataBuildContext(
+                    prior_metadata=prior_metadata,
+                    run_started=run_started,
+                    run_completed=datetime.now(UTC),
+                    start_date=window_start,
+                    end_date=window_end,
+                    providers_present=list(_UTILIZATION_PROVIDERS),
+                    providers_skipped=[],
+                    providers_failed=[],
+                )
+            )
+
+            windows_run += 1
+            final_start, final_end, final_row_count = (
+                window_start,
+                window_end,
+                stats.final_row_count,
+            )
+            logger.info(
+                'Window %d complete: %s..%s, file rows=%d',
+                windows_run,
+                window_start,
+                window_end,
+                stats.final_row_count,
+            )
+
+        if windows_run == 0:
             logger.warning(
-                'Computed start_date %s is after end_date %s; skipping run',
-                start_date,
-                end_date,
-            )
-            return UtilizationRunResult(
-                written=False,
-                row_count=0,
-                start_date=start_date,
-                end_date=end_date,
-                providers_present=[],
-                providers_skipped=[],
-                providers_failed=[],
+                'Resolved range start %s is after end %s; nothing to fetch',
+                range_start,
+                range_end,
             )
 
-        logger.info('Fetch window: %s to %s (inclusive)', start_date, end_date)
+        logger.info(
+            'UtilizationPipeline run complete: %d window(s), took %.2f seconds',
+            windows_run,
+            time_module.monotonic() - wall_start,
+        )
+        return UtilizationRunResult(
+            windows_run=windows_run,
+            final_start_date=final_start,
+            final_end_date=final_end,
+            final_row_count=final_row_count,
+        )
 
+    def _fetch_batch(self, start_date: date, end_date: date) -> UtilizationBatch:
+        """Fetch both providers for one window into a batch (fetch failure raises)."""
         motive_bundle: MotiveUtilizationBundle = self._fetch_motive(
             start_date, end_date
         )
         samsara_bundle: SamsaraUtilizationBundle = self._fetch_samsara(
             start_date, end_date
         )
-
-        df: pd.DataFrame = unify(motive_bundle, samsara_bundle)
-
-        stats = merge_incremental_to_parquet(
-            df,
-            start_date,
-            end_date,
-            self._parquet_path,
-            compression=self._config.storage.parquet_compression or 'uncompressed',
-        )
-        row_count = stats.final_row_count
-        logger.info('Wrote %d rows to %s', row_count, self._parquet_path)
-
-        run_completed = datetime.now(UTC)
-        self._metadata_store.write(
-            MetadataBuildContext(
-                prior_metadata=prior_metadata,
-                run_started=run_started,
-                run_completed=run_completed,
-                start_date=start_date,
-                end_date=end_date,
-                providers_present=list(_UTILIZATION_PROVIDERS),
-                providers_skipped=[],
-                providers_failed=[],
-            )
-        )
-
-        logger.info(
-            'UtilizationPipeline run complete: %d rows, took %.2f seconds',
-            row_count,
-            time_module.monotonic() - wall_start,
-        )
-        return UtilizationRunResult(
-            written=True,
-            row_count=row_count,
-            start_date=start_date,
-            end_date=end_date,
-            providers_present=list(_UTILIZATION_PROVIDERS),
-            providers_skipped=[],
-            providers_failed=[],
-        )
+        return UtilizationBatch(start_date, end_date, motive_bundle, samsara_bundle)
 
     # --------------------------------------------------------------
-    # Batched backfill driver
+    # Range resolution
     # --------------------------------------------------------------
 
-    def backfill_to_present(self) -> BackfillSummary:
-        """March bounded batched runs forward until the file reaches the present.
-
-        Calls ``run()`` repeatedly. Each call reads the metadata the prior
-        batch wrote, so ``latest_data_date`` -- and therefore the fetch
-        window -- advances batch to batch, while the ``max_window_days`` cap
-        keeps every batch's fetch + transform bounded in memory. Because each
-        window is delete-then-appended into the growing file (prompts 1-2 + A),
-        overlapping batch boundaries neither duplicate nor overwrite data.
-
-        Each batch re-fetches the prior ``lookback_days`` of overlap; that is
-        correct (the merge dedupes by window) and is the price of a one-time
-        backfill. A smaller ``lookback_days`` trims the redundant API volume.
-
-        Returns:
-            A ``BackfillSummary`` for a march that reached ``today_utc - 1``
-            (``caught_up=True``).
-
-        Raises:
-            ValueError: If ``max_window_days`` is unset -- an uncapped backfill
-                is the single-shot out-of-memory failure this driver avoids.
-            BackfillStalledError: If a batch wrote nothing (an enabled provider
-                failed), the window stopped advancing, or the iteration ceiling
-                was hit. Existing data is preserved; re-running resumes.
-
-        Side Effects:
-            Performs repeated fetches and parquet/metadata writes -- one set
-            per batch. Logs per-batch progress at INFO.
-        """
-        max_window_days = self._config.pipeline.max_window_days
-        if max_window_days is None:
-            raise ValueError(
-                'backfill_to_present requires pipeline.max_window_days to be set; '
-                'an uncapped backfill fetches the entire span in a single run -- '
-                'the out-of-memory failure this driver exists to avoid'
-            )
-
-        iteration_ceiling = self._backfill_iteration_ceiling(max_window_days)
-        batches_run = 0
-        prior_end_date: date | None = None
-
-        while batches_run < iteration_ceiling:
-            result = self.run()
-            batches_run += 1
-            logger.info(
-                'Backfill batch %d/%d: window %s..%s, written=%s, file rows=%d',
-                batches_run,
-                iteration_ceiling,
-                result.start_date,
-                result.end_date,
-                result.written,
-                result.row_count,
-            )
-
-            if not result.written:
-                raise BackfillStalledError(
-                    f'Backfill stalled at batch {batches_run}: the run wrote '
-                    f'nothing (providers_failed={result.providers_failed}). '
-                    f'Existing data is preserved; resolve the provider and '
-                    f're-run backfill_to_present to resume.'
-                )
-
-            today_minus_one = (datetime.now(UTC) - timedelta(days=1)).date()
-            if result.end_date >= today_minus_one:
-                return BackfillSummary(
-                    batches_run=batches_run,
-                    final_end_date=result.end_date,
-                    caught_up=True,
-                    final_row_count=result.row_count,
-                )
-
-            if prior_end_date is not None and result.end_date <= prior_end_date:
-                raise BackfillStalledError(
-                    f'Backfill made no forward progress at batch {batches_run}: '
-                    f'end_date {result.end_date} did not advance past '
-                    f'{prior_end_date}.'
-                )
-            prior_end_date = result.end_date
-
-        raise BackfillStalledError(
-            f'Backfill exceeded its iteration ceiling ({iteration_ceiling}) '
-            f'without reaching the present; aborting to avoid an unbounded loop.'
-        )
-
-    def _backfill_iteration_ceiling(self, max_window_days: int) -> int:
-        """Upper bound on backfill batches: total span / per-batch advance + buffer.
-
-        A belt-and-suspenders ceiling against a window-advance logic bug, so
-        the march can never loop unboundedly even if the per-batch progress
-        check is somehow defeated. Each batch advances the anchor by roughly
-        ``max_window_days - lookback_days`` days.
-
-        Args:
-            max_window_days: The configured cap (already known to be set).
-
-        Returns:
-            The maximum number of batches the march may attempt.
-        """
-        advance_per_batch = max(
-            1, max_window_days - self._config.pipeline.lookback_days
-        )
-        first_start, _ = self._determine_window(self._metadata_store.load())
-        today_minus_one = (datetime.now(UTC) - timedelta(days=1)).date()
-        total_days = max((today_minus_one - first_start).days, 0)
-        return math.ceil(total_days / advance_per_batch) + _BACKFILL_ITERATION_BUFFER
-
-    # --------------------------------------------------------------
-    # Window determination
-    # --------------------------------------------------------------
-
-    def _determine_window(
+    def _resolve_range(
         self, prior_metadata: dict[str, Any] | None
     ) -> tuple[date, date]:
-        """
-        Compute ``(start_date, end_date)`` inclusive for the fetch.
+        """Resolve the inclusive [range_start, range_end] the run must cover.
 
-        ``start_date`` is the configured default on a first run, otherwise
-        ``latest_data_date - lookback_days`` from prior metadata.
-
-        ``end_date`` is ``today_utc - 1`` (never the current incomplete UTC
-        day), optionally capped to ``start_date + max_window_days`` when
-        ``max_window_days`` is set. The cap is a no-op in steady state (a
-        recent ``start_date`` plus the span already reaches ``today-1``) and
-        bites only when a large gap -- a fresh backfill or an outage
-        recovery -- would otherwise fetch the whole span in one run.
-        ``backfill_to_present`` marches the capped batches forward.
+        ``range_end`` is always ``today_utc - 1`` (never the current
+        incomplete UTC day). ``range_start`` is ``default_start_date`` on a
+        first run (no prior metadata), else ``latest_data_date -
+        lookback_days`` so the trailing lookback is re-fetched.
         """
-        uncapped_end = (datetime.now(UTC) - timedelta(days=1)).date()
-        prior_latest = (
+        range_end: date = (datetime.now(UTC) - timedelta(days=1)).date()
+        prior_latest: str | None = (
             prior_metadata.get('latest_data_date')
             if prior_metadata is not None
             else None
         )
         if prior_latest is None:
-            start_date = date.fromisoformat(self._config.pipeline.default_start_date)
+            range_start: date = date.fromisoformat(
+                self._config.pipeline.default_start_date
+            )
         else:
-            latest = date.fromisoformat(prior_latest)
-            start_date = latest - timedelta(days=self._config.pipeline.lookback_days)
+            range_start = date.fromisoformat(prior_latest) - timedelta(
+                days=self._config.pipeline.lookback_days
+            )
+        return range_start, range_end
 
-        max_window_days = self._config.pipeline.max_window_days
-        if max_window_days is None:
-            end_date = uncapped_end
-        else:
-            end_date = min(uncapped_end, start_date + timedelta(days=max_window_days))
-        return start_date, end_date
+    def _effective_window_days(self, range_start: date, range_end: date) -> int:
+        """Per-window span: the configured cap, or the whole range when uncapped.
+
+        When ``max_window_days`` is unset (steady-state default), the run
+        uses a single window spanning the whole resolved range -- identical
+        to the pre-refactor uncapped behavior. A historical backfill must
+        therefore set ``max_window_days`` to march in bounded windows.
+        """
+        cap: int | None = self._config.pipeline.max_window_days
+        if cap is not None:
+            return cap
+        return max((range_end - range_start).days, 1)
 
     # --------------------------------------------------------------
     # Per-provider fetch wrappers
