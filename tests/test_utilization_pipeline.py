@@ -725,8 +725,8 @@ class TestAtomicWrites:
     ) -> None:
         """The DuckDB merge raising -> the pre-existing parquet stays intact.
 
-        The merge writes a temp file and the orchestrator renames it onto
-        ``data.parquet``; if the merge raises before the rename, the
+        The merge writes a temp file and atomically renames it onto
+        ``data.parquet`` itself; if the merge raises before the rename, the
         existing file must survive untouched and no ``*.tmp`` may leak.
         """
 
@@ -782,7 +782,7 @@ class TestAtomicWrites:
                 samsara_bundle=_empty_samsara_bundle(),
             ),
             patch(
-                'fleet_telemetry_hub.utilization_pipeline.json.dump',
+                'fleet_telemetry_hub._utilization_metadata.json.dump',
                 side_effect=OSError('disk full'),
             ),
             pytest.raises(OSError, match='disk full'),

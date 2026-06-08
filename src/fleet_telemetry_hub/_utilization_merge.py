@@ -5,8 +5,9 @@ delete + append + global sort + write of the output parquet entirely in
 DuckDB, so pandas never materializes the whole (unbounded) on-disk file:
 DuckDB streams ``read_parquet``, the window delete is a ``WHERE``, the
 append is ``UNION ALL`` over the registered window-sized new frame, the
-global sort is ``ORDER BY`` (spilling to ``temp_directory`` when it does
-not fit RAM), and the result is written with ``COPY``.
+global sort is ``ORDER BY`` (spilling to the destination's parent
+directory when it does not fit RAM), and the result is written with
+``COPY``.
 
 The merge normalizes every provider to start-anchored: both the incoming
 frame and the existing file are filtered on ``start_time_utc`` in the
@@ -27,6 +28,7 @@ import logging
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
+from uuid import uuid4
 
 import duckdb
 import pandas as pd
@@ -82,38 +84,35 @@ class MergeStats:
     final_row_count: int
 
 
-def merge_incremental_to_parquet(  # noqa: PLR0913 -- mandated public merge entrypoint; its inputs (source path, in-memory frame, the window's two dates, destination path, two write options) are heterogeneous and don't form a cohesive dataclass, and splitting the single read-merge-sort-write op would fragment an atomic unit
-    existing_path: Path | None,
+def merge_incremental_to_parquet(
     new_frame: pd.DataFrame,
     start_date: date,
     end_date: date,
-    output_path: Path,
+    destination_path: Path,
     *,
     compression: str,
-    temp_directory: Path,
 ) -> MergeStats:
-    """Merge a freshly fetched window into the existing parquet, in DuckDB.
+    """Merge a freshly fetched window into ``destination_path``, in DuckDB.
 
-    Deletes the half-open UTC window ``[W_start, W_end)`` from
-    ``existing_path`` and appends the rows of ``new_frame`` whose
-    ``start_time_utc`` falls inside that window, globally sorts the union
-    by the total deterministic key, and writes it to ``output_path`` with
-    ``COPY``. The whole pipeline streams in DuckDB; pandas only holds the
-    window-sized ``new_frame``. Atomicity (renaming ``output_path`` onto
-    ``data.parquet``) is the caller's responsibility.
+    Deletes the half-open UTC window ``[W_start, W_end)`` from any existing
+    file at ``destination_path`` and appends the rows of ``new_frame``
+    whose ``start_time_utc`` falls inside that window, globally sorts the
+    union by the total deterministic key, and writes it with ``COPY``. The
+    whole pipeline streams in DuckDB; pandas only holds the window-sized
+    ``new_frame``. The function owns the full write transaction: it creates
+    the destination's parent directory, writes to a unique temp file in
+    that directory, and atomically renames the temp file onto
+    ``destination_path``. A failure before the rename leaves any existing
+    destination untouched and leaks no temp file.
 
     Args:
-        existing_path: Path to the current on-disk parquet, or ``None`` on
-            a first run with no file yet.
         new_frame: The freshly fetched, window-sized unified frame.
         start_date: Inclusive UTC start date of the fetch window.
         end_date: Inclusive UTC end date of the fetch window.
-        output_path: Destination parquet path (a caller-provided temp
-            path) that ``COPY`` writes.
+        destination_path: Final parquet path. Read for the existing rows
+            (when present) and atomically replaced with the merged result.
         compression: Parquet codec for ``COPY`` (e.g. ``'snappy'``,
             ``'zstd'``, ``'uncompressed'``).
-        temp_directory: Directory DuckDB spills the global ``ORDER BY`` to
-            when it does not fit in memory. Must already exist.
 
     Returns:
         ``MergeStats`` with the incoming / kept / deleted / retained /
@@ -121,29 +120,44 @@ def merge_incremental_to_parquet(  # noqa: PLR0913 -- mandated public merge entr
 
     Raises:
         ValueError: If ``start_date > end_date``.
-        CorruptUtilizationParquetError: If ``existing_path`` is unreadable
-            or its column set does not match ``COLUMNS``. Never silently
-            treated as a first run.
+        CorruptUtilizationParquetError: If an existing ``destination_path``
+            is unreadable or its column set does not match ``COLUMNS``.
+            Never silently treated as a first run.
 
     Side Effects:
-        Writes ``output_path`` via DuckDB ``COPY``; reads ``existing_path``
-        if given. Emits one ``DEBUG`` row-delta line. Does not rename or
-        delete any file.
+        Creates ``destination_path.parent``; writes via a temp file in that
+        directory and atomically renames it onto ``destination_path``; the
+        temp file is always removed, so a failure leaks no ``*.tmp``. Emits
+        one ``DEBUG`` row-delta line.
     """
     if start_date > end_date:
         raise ValueError(f'start_date ({start_date}) must be <= end_date ({end_date})')
 
-    window = _window_bounds(start_date, end_date)
+    window: tuple[datetime, datetime] = _window_bounds(start_date, end_date)
 
-    with duckdb.connect() as connection:
-        connection.execute(f'SET temp_directory = {_sql_literal(str(temp_directory))}')
+    destination_path.parent.mkdir(parents=True, exist_ok=True)
+    existing_path: Path | None = (
+        destination_path if destination_path.exists() else None
+    )
+    temp_path: Path = destination_path.parent / f'data-{uuid4().hex}.parquet.tmp'
 
-        if existing_path is not None:
-            _validate_existing_columns(connection, existing_path)
+    try:
+        with duckdb.connect() as connection:
+            connection.execute(
+                f'SET temp_directory = {_sql_literal(str(destination_path.parent))}'
+            )
 
-        connection.register('new_frame', new_frame)
-        _copy_merged(connection, existing_path, output_path, window, compression)
-        stats = _compute_stats(connection, existing_path, len(new_frame), window)
+            if existing_path is not None:
+                _validate_existing_columns(connection, existing_path)
+
+            connection.register('new_frame', new_frame)
+            _copy_merged(connection, existing_path, temp_path, window, compression)
+            stats: MergeStats = _compute_stats(
+                connection, existing_path, len(new_frame), window
+            )
+        temp_path.replace(destination_path)
+    finally:
+        temp_path.unlink(missing_ok=True)
 
     logger.debug(
         'merge_incremental: incoming=%d kept_in_window=%d '
