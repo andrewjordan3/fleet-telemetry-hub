@@ -574,7 +574,7 @@ class TestDetermineWindow:
 
 
 class TestProviderIsolation:
-    """``_fetch_motive`` / ``_fetch_samsara`` isolate per-provider failures."""
+    """The binary provider model: both required at construction, fetch fails loud."""
 
     def test_both_present_when_both_succeed(self, tmp_path: Path) -> None:
         """Both fetchers succeed -> ``providers_present == ['motive', 'samsara']``."""
@@ -596,64 +596,41 @@ class TestProviderIsolation:
         assert metadata['providers_failed'] == []
         assert metadata['providers_skipped'] == []
 
-    def test_motive_disabled_is_skipped(self, tmp_path: Path) -> None:
-        """Disabled Motive -> ``providers_skipped = ['motive']``; Samsara still runs."""
+    def test_motive_disabled_raises_on_construction(self, tmp_path: Path) -> None:
+        """Disabled Motive -> ``UtilizationPipeline`` refuses to construct."""
 
         config_path = _write_config(tmp_path, motive_enabled=False)
-        pipeline = UtilizationPipeline(config_path)
 
-        with _PatchedFetchers(samsara_bundle=_empty_samsara_bundle()):
-            pipeline.run()
+        with pytest.raises(ValueError, match=r"\['motive'\]"):
+            UtilizationPipeline(config_path)
 
-        metadata_path = pipeline.parquet_dir / 'metadata.json'
-        with metadata_path.open() as handle:
-            metadata = json.load(handle)
-
-        assert metadata['providers_skipped'] == ['motive']
-        assert metadata['providers_present'] == ['samsara']
-
-    def test_samsara_disabled_is_skipped(self, tmp_path: Path) -> None:
-        """Symmetric: disabled Samsara -> Motive still processed."""
+    def test_samsara_disabled_raises_on_construction(self, tmp_path: Path) -> None:
+        """Symmetric: disabled Samsara -> construction raises."""
 
         config_path = _write_config(tmp_path, samsara_enabled=False)
-        pipeline = UtilizationPipeline(config_path)
 
-        with _PatchedFetchers(motive_bundle=_empty_motive_bundle()):
-            pipeline.run()
+        with pytest.raises(ValueError, match=r"\['samsara'\]"):
+            UtilizationPipeline(config_path)
 
-        metadata_path = pipeline.parquet_dir / 'metadata.json'
-        with metadata_path.open() as handle:
-            metadata = json.load(handle)
-
-        assert metadata['providers_skipped'] == ['samsara']
-        assert metadata['providers_present'] == ['motive']
-
-    def test_provider_missing_from_config_is_skipped(self, tmp_path: Path) -> None:
-        """A provider key absent from config -> skipped (treated as missing)."""
+    def test_provider_missing_from_config_raises_on_construction(
+        self, tmp_path: Path
+    ) -> None:
+        """A provider key absent from config -> construction raises (missing)."""
 
         config_path = _write_config(tmp_path, include_samsara=False)
-        pipeline = UtilizationPipeline(config_path)
 
-        with _PatchedFetchers(motive_bundle=_empty_motive_bundle()):
-            pipeline.run()
+        with pytest.raises(ValueError, match=r"\['samsara'\]"):
+            UtilizationPipeline(config_path)
 
-        metadata_path = pipeline.parquet_dir / 'metadata.json'
-        with metadata_path.open() as handle:
-            metadata = json.load(handle)
-
-        assert metadata['providers_skipped'] == ['samsara']
-        assert metadata['providers_present'] == ['motive']
-
-    def test_motive_fetch_failure_isolated_but_skips_write(
+    def test_motive_fetch_failure_raises_and_skips_write(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """A raising Motive fetcher is caught and logged, but the run skips its writes.
+        """A raising Motive fetcher propagates (fail loud); nothing is written.
 
-        Motive failing while Samsara succeeds means an enabled provider's
-        data is missing, so the run must not write -- writing the
-        Samsara-only frame would destroy prior Motive data. The fetch is
-        still isolated (Samsara is fetched, the failure is logged at
-        ERROR); only the *write* is skipped.
+        Motive failing means an enabled provider's data is missing, so the
+        run must not write -- writing a Samsara-only frame would destroy
+        prior Motive data. The failure is logged at ERROR, then re-raised;
+        no parquet or metadata file is produced (first run -> no files).
         """
 
         config_path = _write_config(tmp_path)
@@ -666,22 +643,46 @@ class TestProviderIsolation:
             caplog.at_level(
                 logging.ERROR, logger='fleet_telemetry_hub.utilization_pipeline'
             ),
+            pytest.raises(ConnectionError),
         ):
-            result = pipeline.run()
+            pipeline.run()
 
-        # Skip contract: nothing written (first run -> no files).
-        assert result.written is False
         assert not (pipeline.parquet_dir / 'data.parquet').exists()
         assert not (pipeline.parquet_dir / 'metadata.json').exists()
-        # Isolation is preserved: the Motive failure was caught and logged.
+        # The failure was logged at ERROR before propagating.
         assert any('Motive fetch failed' in record.message for record in caplog.records)
 
-    def test_both_providers_failing_skips_writes_on_first_run(
+    def test_samsara_fetch_failure_raises_and_skips_write(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Symmetric: a raising Samsara fetcher propagates; nothing is written."""
+
+        config_path = _write_config(tmp_path)
+        pipeline = UtilizationPipeline(config_path)
+        with (
+            _PatchedFetchers(
+                motive_bundle=_empty_motive_bundle(),
+                samsara_raises=ConnectionError,
+            ),
+            caplog.at_level(
+                logging.ERROR, logger='fleet_telemetry_hub.utilization_pipeline'
+            ),
+            pytest.raises(ConnectionError),
+        ):
+            pipeline.run()
+
+        assert not (pipeline.parquet_dir / 'data.parquet').exists()
+        assert not (pipeline.parquet_dir / 'metadata.json').exists()
+        assert any(
+            'Samsara fetch failed' in record.message for record in caplog.records
+        )
+
+    def test_both_providers_failing_raises_on_first_run(
         self, tmp_path: Path
     ) -> None:
-        """Both providers raise -> empty frame and neither file is written.
+        """Both providers raising -> the run raises and neither file is written.
 
-        The data-preservation companion (a both-fail run leaving a
+        The data-preservation companion (a failing run leaving a
         pre-existing good file untouched) lives in
         ``TestFailureSkipPreservesData``.
         """
@@ -689,10 +690,12 @@ class TestProviderIsolation:
         config_path = _write_config(tmp_path)
         pipeline = UtilizationPipeline(config_path)
 
-        with _PatchedFetchers(motive_raises=RuntimeError, samsara_raises=RuntimeError):
-            result = pipeline.run()
+        with (
+            _PatchedFetchers(motive_raises=RuntimeError, samsara_raises=RuntimeError),
+            pytest.raises(RuntimeError),
+        ):
+            pipeline.run()
 
-        assert result.written is False
         assert not (pipeline.parquet_dir / 'data.parquet').exists()
         assert not (pipeline.parquet_dir / 'metadata.json').exists()
 
@@ -1094,87 +1097,59 @@ class TestLogging:
 
 
 # ---------------------------------------------------------------------------
-# Failure-skip preserves existing data (the direct incident regression)
+# Fetch failure preserves existing data (the direct incident regression)
 # ---------------------------------------------------------------------------
 
 
 class TestFailureSkipPreservesData:
-    """A run that can't write every enabled provider leaves prior files intact.
+    """A fetch failure raises before any write, leaving prior files intact.
 
     This is the direct regression for the incident: a partial fetch must
-    never overwrite ``data.parquet`` with a short/empty frame.
+    never overwrite ``data.parquet`` with a short/empty frame. Under the
+    binary provider model the mechanism is a raise (not a skip-and-return),
+    but the guarantee -- existing files stay byte-identical -- is unchanged.
     """
 
     def test_samsara_failure_leaves_existing_files_byte_identical(
         self, tmp_path: Path
     ) -> None:
-        """Motive present + Samsara failing -> skip, files untouched."""
+        """Motive present + Samsara failing -> run raises, files untouched."""
 
         parquet_root = tmp_path / 'telemetry'
         parquet_bytes, metadata_text = _seed_two_provider_file(tmp_path, parquet_root)
 
         config_path = _write_config(tmp_path, parquet_root=parquet_root)
         pipeline = UtilizationPipeline(config_path)
-        with _PatchedFetchers(
-            motive_bundle=_motive_bundle_with_one_period(),
-            samsara_raises=ConnectionError,
+        with (
+            _PatchedFetchers(
+                motive_bundle=_motive_bundle_with_one_period(),
+                samsara_raises=ConnectionError,
+            ),
+            pytest.raises(ConnectionError),
         ):
-            result = pipeline.run()
+            pipeline.run()
 
-        assert result.written is False
         assert (pipeline.parquet_dir / 'data.parquet').read_bytes() == parquet_bytes
         assert (pipeline.parquet_dir / 'metadata.json').read_text() == metadata_text
 
     def test_both_failing_leaves_existing_files_byte_identical(
         self, tmp_path: Path
     ) -> None:
-        """Both providers failing -> skip, files untouched."""
+        """Both providers failing -> run raises, files untouched."""
 
         parquet_root = tmp_path / 'telemetry'
         parquet_bytes, metadata_text = _seed_two_provider_file(tmp_path, parquet_root)
 
         config_path = _write_config(tmp_path, parquet_root=parquet_root)
         pipeline = UtilizationPipeline(config_path)
-        with _PatchedFetchers(motive_raises=RuntimeError, samsara_raises=RuntimeError):
-            result = pipeline.run()
+        with (
+            _PatchedFetchers(motive_raises=RuntimeError, samsara_raises=RuntimeError),
+            pytest.raises(RuntimeError),
+        ):
+            pipeline.run()
 
-        assert result.written is False
         assert (pipeline.parquet_dir / 'data.parquet').read_bytes() == parquet_bytes
         assert (pipeline.parquet_dir / 'metadata.json').read_text() == metadata_text
-
-    # NOTE: an all-providers-disabled run (the other ``should_write``
-    # skip branch, ``not providers_present``) is unreachable here: the
-    # config validator rejects a config with every provider disabled
-    # ("At least one provider must be enabled"), so no such pipeline can
-    # be constructed. The guard term stays as defensive spec; the failed
-    # cases above already exercise the skip-and-preserve path.
-
-    def test_present_plus_skipped_run_does_write(self, tmp_path: Path) -> None:
-        """Positive contrast: present + disabled DOES write (guard isn't over-broad).
-
-        Proves the skip guard distinguishes a *disabled* provider (which
-        legitimately contributes nothing) from a *failed* one.
-        """
-
-        parquet_root = tmp_path / 'telemetry'
-        parquet_bytes, _ = _seed_two_provider_file(tmp_path, parquet_root)
-
-        config_path = _write_config(
-            tmp_path, parquet_root=parquet_root, samsara_enabled=False
-        )
-        pipeline = UtilizationPipeline(config_path)
-        with _PatchedFetchers(motive_bundle=_motive_bundle_with_one_period()):
-            result = pipeline.run()
-
-        # A write occurred: a non-empty result and the file changed (the
-        # Samsara row was dropped from the rewritten window).
-        assert result.written is True
-        assert result.row_count > 0
-        assert (pipeline.parquet_dir / 'data.parquet').read_bytes() != parquet_bytes
-        with (pipeline.parquet_dir / 'metadata.json').open() as handle:
-            metadata = json.load(handle)
-        assert metadata['providers_present'] == ['motive']
-        assert metadata['providers_skipped'] == ['samsara']
 
 
 # ---------------------------------------------------------------------------
@@ -1198,11 +1173,12 @@ class TestIncrementalMerge:
 
         # default_start_date well before the data; lookback_days=1 so run 2's
         # window opens at 2026-05-11 (latest_data_date 2026-05-12 minus 1).
+        # Both providers are required; Samsara contributes an empty bundle so
+        # only the Motive rows under test land in the file.
         config_path = _write_config(
             tmp_path,
             default_start_date='2026-05-01',
             lookback_days=1,
-            samsara_enabled=False,
         )
         pipeline = UtilizationPipeline(config_path)
 
@@ -1217,7 +1193,8 @@ class TestIncrementalMerge:
                         distance_km=16.09,
                     ),
                 ]
-            )
+            ),
+            samsara_bundle=_empty_samsara_bundle(),
         ):
             pipeline.run()
 
@@ -1233,7 +1210,8 @@ class TestIncrementalMerge:
                     ),
                     _motive_period_at(may_13, period_id=4550000013),
                 ]
-            )
+            ),
+            samsara_bundle=_empty_samsara_bundle(),
         ):
             pipeline.run()
 
@@ -1342,12 +1320,12 @@ class TestBackfillToPresent:
             default_start_date=default_start.isoformat(),
             lookback_days=7,
             max_window_days=28,
-            samsara_enabled=False,
         )
         pipeline = UtilizationPipeline(config_path)
 
         with _PatchedFetchers(
-            motive_bundle=_daily_motive_bundle(default_start, today_minus_one)
+            motive_bundle=_daily_motive_bundle(default_start, today_minus_one),
+            samsara_bundle=_empty_samsara_bundle(),
         ):
             summary = pipeline.backfill_to_present()
 
@@ -1378,7 +1356,6 @@ class TestBackfillToPresent:
             default_start_date=default_start.isoformat(),
             lookback_days=7,
             max_window_days=28,
-            samsara_enabled=False,
         )
         pipeline = UtilizationPipeline(config_path)
 
@@ -1392,7 +1369,8 @@ class TestBackfillToPresent:
 
         with (
             _PatchedFetchers(
-                motive_bundle=_daily_motive_bundle(default_start, today_minus_one)
+                motive_bundle=_daily_motive_bundle(default_start, today_minus_one),
+                samsara_bundle=_empty_samsara_bundle(),
             ),
             patch.object(pipeline, 'run', side_effect=_recording_run),
         ):
@@ -1404,7 +1382,14 @@ class TestBackfillToPresent:
         assert all(later > earlier for earlier, later in pairwise(starts))
 
     def test_stops_and_raises_on_failed_provider(self, tmp_path: Path) -> None:
-        """A batch where a provider raises -> the march stops with a stall error."""
+        """A batch where a provider raises -> the march stops, propagating the error.
+
+        Under the binary provider model a fetch failure is fail-loud: the
+        batch's ``run()`` raises the provider exception, which propagates
+        out of the march rather than being converted to a ``written=False``
+        stall. The data-preservation guarantee is unchanged -- nothing was
+        written, so a later backfill resumes cleanly.
+        """
 
         today_minus_one = (datetime.now(UTC) - timedelta(days=1)).date()
         default_start = today_minus_one - timedelta(days=60)
@@ -1422,7 +1407,7 @@ class TestBackfillToPresent:
                 motive_bundle=_daily_motive_bundle(default_start, today_minus_one),
                 samsara_raises=ConnectionError,
             ),
-            pytest.raises(BackfillStalledError, match='wrote nothing'),
+            pytest.raises(ConnectionError),
         ):
             pipeline.backfill_to_present()
 

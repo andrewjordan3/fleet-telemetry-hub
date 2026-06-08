@@ -299,76 +299,28 @@ def _make_samsara_bundle(  # noqa: PLR0913 -- mirrors SamsaraUtilizationBundle f
 
 
 class TestEmptyAndPartialBundles:
-    """Behavior when one or both bundles are None or empty."""
+    """Behavior when one or both bundles are empty."""
 
-    def test_both_none_returns_empty_schema_correct_dataframe(self) -> None:
-        """``unify(None, None)`` returns a 0-row DataFrame with the locked schema."""
+    def test_empty_samsara_emits_only_motive_rows(self) -> None:
+        """An empty Samsara bundle still produces the Motive rows."""
 
-        df = unify(None, None)
-
-        assert len(df) == 0
-        assert list(df.columns) == list(COLUMNS)
-        assert df.dtypes.to_dict() == DTYPES
-
-    def test_both_none_logs_no_bundles_message(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """The 'no bundles' entry-INFO fires for the both-None call."""
-
-        with caplog.at_level(logging.INFO, logger='fleet_telemetry_hub.unifier.unify'):
-            unify(None, None)
-
-        assert any(
-            'no bundles' in record.message for record in caplog.records
+        df = unify(
+            _make_motive_bundle(driving_periods=[_make_motive_driving_period()]),
+            _make_samsara_bundle(),
         )
-
-    def test_motive_only_emits_only_motive_rows(self) -> None:
-        """``samsara_bundle=None`` still produces the Motive rows."""
-
-        bundle = _make_motive_bundle(
-            driving_periods=[_make_motive_driving_period()],
-        )
-        df = unify(bundle, None)
 
         assert len(df) == 1
         assert df.at[0, 'company'] == 'motive_co'
         assert df.at[0, 'event_type'] == 'driving'
 
-    def test_motive_only_logs_samsara_absent(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """The partial-DataFrame entry-INFO names the missing provider."""
+    def test_empty_motive_emits_only_samsara_rows(self) -> None:
+        """An empty Motive bundle still produces the Samsara rows."""
 
-        bundle = _make_motive_bundle()
-        with caplog.at_level(logging.INFO, logger='fleet_telemetry_hub.unifier.unify'):
-            unify(bundle, None)
-
-        assert any(
-            'without Samsara bundle' in record.message for record in caplog.records
-        )
-
-    def test_samsara_only_emits_only_samsara_rows(self) -> None:
-        """``motive_bundle=None`` still produces the Samsara rows."""
-
-        bundle = _make_samsara_bundle(trips=[_make_trip()])
-        df = unify(None, bundle)
+        df = unify(_make_motive_bundle(), _make_samsara_bundle(trips=[_make_trip()]))
 
         assert len(df) == 1
         assert df.at[0, 'company'] == 'samsara_co'
         assert df.at[0, 'event_type'] == 'driving'
-
-    def test_samsara_only_logs_motive_absent(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """The partial-DataFrame entry-INFO names the missing provider."""
-
-        bundle = _make_samsara_bundle()
-        with caplog.at_level(logging.INFO, logger='fleet_telemetry_hub.unifier.unify'):
-            unify(None, bundle)
-
-        assert any(
-            'without Motive bundle' in record.message for record in caplog.records
-        )
 
     def test_both_present_both_empty_returns_zero_row_correct_schema(self) -> None:
         """Both empty bundles produce the same empty-DataFrame shape as both-None."""
@@ -420,7 +372,7 @@ class TestSortBehavior:
         )
         # Pass them in reverse order to prove the sort, not concat order, wins.
         motive = _make_motive_bundle(driving_periods=[late, early])
-        df = unify(motive, None)
+        df = unify(motive, _make_samsara_bundle())
 
         assert df.at[0, 'start_time_utc'] == pd.Timestamp(_at(hour=8))
         assert df.at[1, 'start_time_utc'] == pd.Timestamp(_at(hour=14))
@@ -438,7 +390,10 @@ class TestSortBehavior:
         idle = _make_motive_idle_event(
             start=same_start, end=_at(hour=8, minute=15)
         )
-        df = unify(_make_motive_bundle(driving_periods=[driving], idle_events=[idle]), None)
+        df = unify(
+            _make_motive_bundle(driving_periods=[driving], idle_events=[idle]),
+            _make_samsara_bundle(),
+        )
 
         assert df.at[0, 'event_type'] == 'driving'
         assert df.at[1, 'event_type'] == 'idle'
@@ -491,7 +446,7 @@ class TestSchemaIntegrity:
                 driving_periods=[_make_motive_driving_period()],
                 idle_events=[_make_motive_idle_event()],
             ),
-            None,
+            _make_samsara_bundle(),
         )
 
         types_in_output = set(df['event_type'].tolist())
@@ -502,7 +457,7 @@ class TestSchemaIntegrity:
 
         df = unify(
             _make_motive_bundle(driving_periods=[_make_motive_driving_period()]),
-            None,
+            _make_samsara_bundle(),
         )
 
         start_dtype = df.dtypes['start_time_utc']
@@ -597,7 +552,7 @@ class TestFullPipelineIntegration:
         )
         covering_trip = _make_trip(start=_at(hour=10), end=_at(hour=11))
         df = unify(
-            None,
+            _make_motive_bundle(),
             _make_samsara_bundle(
                 trips=[covering_trip], idling_events=[unattributed_idle]
             ),
@@ -699,7 +654,7 @@ class TestEntryAndExitLogs:
             driving_periods=[_make_motive_driving_period()], company=None
         )
         with caplog.at_level(logging.INFO, logger='fleet_telemetry_hub.unifier.unify'):
-            unify(motive, None)
+            unify(motive, _make_samsara_bundle())
 
         exit_records = [
             record
