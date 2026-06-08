@@ -6,10 +6,10 @@ applies a stable ``(company, start_time_utc, event_type)`` sort, and
 hands the result to ``build_dataframe``. Business logic stays in the
 per-provider transforms.
 
-The function is permissive about partial-provider failure -- if a
-bundle is ``None``, the other side's rows are still emitted. Both
-``None`` yields the locked empty-schema DataFrame so downstream
-parquet consumers never see a different shape on a no-data day.
+Both bundles are required (possibly empty). Each contributes zero rows
+when empty, so a both-empty call still yields the locked empty-schema
+DataFrame -- downstream parquet consumers never see a different shape on
+a no-data day.
 """
 
 import logging
@@ -38,15 +38,15 @@ _NULL_COMPANY_DISPLAY: str = '(null)'
 
 
 def unify(
-    motive_bundle: MotiveUtilizationBundle | None,
-    samsara_bundle: SamsaraUtilizationBundle | None,
+    motive_bundle: MotiveUtilizationBundle,
+    samsara_bundle: SamsaraUtilizationBundle,
 ) -> pd.DataFrame:
     """
     Combine Motive and Samsara utilization bundles into a single typed DataFrame.
 
-    Permissive about partial-provider failure: if either bundle is
-    ``None``, the other side's rows are still produced. If both are
-    ``None``, returns an empty DataFrame with the correct schema.
+    Both bundles are required. An empty bundle contributes zero rows via
+    its transform, so a both-empty call returns an empty DataFrame with
+    the correct schema.
 
     Rows are sorted by ``(company, start_time_utc, event_type)``
     ascending. The sort is stable; within a tied key, Motive rows
@@ -54,48 +54,29 @@ def unify(
     ``company=None`` rows sort before any non-null-company string.
 
     Args:
-        motive_bundle: Motive utilization bundle, or ``None`` if the
-            Motive fetch was skipped or failed.
-        samsara_bundle: Samsara utilization bundle, or ``None`` if the
-            Samsara fetch was skipped or failed.
+        motive_bundle: Motive utilization bundle (possibly empty).
+        samsara_bundle: Samsara utilization bundle (possibly empty).
 
     Returns:
         Typed pandas DataFrame matching the unified schema. Empty
-        (zero-row, correct columns and dtypes) when both bundles are
-        ``None`` or both produce no rows.
+        (zero-row, correct columns and dtypes) when both bundles produce
+        no rows.
     """
     _log_entry(motive_bundle, samsara_bundle)
 
     rows: list[UnifiedEventRow] = []
-    if motive_bundle is not None:
-        rows.extend(transform_motive_bundle(motive_bundle))
-    if samsara_bundle is not None:
-        rows.extend(transform_samsara_bundle(samsara_bundle))
+    rows.extend(transform_motive_bundle(motive_bundle))
+    rows.extend(transform_samsara_bundle(samsara_bundle))
 
     _log_exit(rows)
     return sort_unified_frame(build_dataframe(rows))
 
 
 def _log_entry(
-    motive_bundle: MotiveUtilizationBundle | None,
-    samsara_bundle: SamsaraUtilizationBundle | None,
+    motive_bundle: MotiveUtilizationBundle,
+    samsara_bundle: SamsaraUtilizationBundle,
 ) -> None:
-    """Log INFO at the unify boundary describing which bundles are present."""
-    if motive_bundle is None and samsara_bundle is None:
-        logger.info('unify called with no bundles; returning empty DataFrame')
-        return
-    if motive_bundle is None:
-        logger.info(
-            'unify called without Motive bundle; '
-            'producing partial DataFrame from Samsara only'
-        )
-        return
-    if samsara_bundle is None:
-        logger.info(
-            'unify called without Samsara bundle; '
-            'producing partial DataFrame from Motive only'
-        )
-        return
+    """Log INFO at the unify boundary with both bundles' date ranges."""
     logger.info(
         'unify called with both bundles: motive_date_range=%s, '
         'samsara_date_range=%s',

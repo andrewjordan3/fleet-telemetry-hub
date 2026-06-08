@@ -13,14 +13,13 @@ fetch window is deleted from the existing parquet, the freshly-fetched
 window is appended, the union is globally sorted, and the result is
 written -- all in DuckDB, so pandas never materializes the whole
 (unbounded) file (see ``_utilization_merge``). Whole-file metadata
-aggregates come from a second streaming DuckDB pass. A run writes only
-when every enabled provider succeeded; if any enabled provider's fetch
-raised, the run is skipped and the existing files are left untouched, so
-a partial fetch can never destroy prior data. This is self-healing -- the
-next run where all enabled providers succeed re-fetches the whole
-lookback window and rewrites correctly. An existing parquet that is
-unreadable or whose columns do not match the schema aborts the run
-rather than being silently overwritten.
+aggregates come from a second streaming DuckDB pass. Both Motive and
+Samsara are required (the pipeline refuses to construct otherwise), and a
+fetch failure aborts the run by raising before any write, so a partial
+fetch can never destroy prior data; the next successful run re-fetches
+the whole lookback window and rewrites correctly. An existing parquet
+that is unreadable or whose columns do not match the schema aborts the
+run rather than being silently overwritten.
 
 The merge and metadata-derivation logic live in the sibling private
 modules ``_utilization_merge`` and ``_utilization_metadata`` so this file
@@ -33,7 +32,7 @@ import time as time_module
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 import pandas as pd
 
@@ -43,7 +42,7 @@ from fleet_telemetry_hub._utilization_metadata import (
     MetadataStore,
 )
 from fleet_telemetry_hub.common import setup_logger
-from fleet_telemetry_hub.config import TelemetryConfig, load_config
+from fleet_telemetry_hub.config import ProviderConfig, TelemetryConfig, load_config
 from fleet_telemetry_hub.provider import Provider
 from fleet_telemetry_hub.unifier.unify import unify
 from fleet_telemetry_hub.utilization.motive_fetcher import (
@@ -64,7 +63,10 @@ __all__: list[str] = [
 
 logger: logging.Logger = logging.getLogger(__name__)
 
-ProviderStatus = Literal['present', 'skipped', 'failed']
+# The two providers ``UtilizationPipeline`` requires, in the fixed order
+# the metadata JSON lists them. Both must be enabled to construct the
+# pipeline; a written run always reports exactly these as present.
+_UTILIZATION_PROVIDERS: tuple[str, str] = ('motive', 'samsara')
 
 # Slack added to the computed backfill iteration ceiling, so off-by-one
 # edge effects (the final batch landing exactly on today-1) never trip the
@@ -91,15 +93,20 @@ class UtilizationRunResult:
 
     Attributes:
         written: ``True`` when the run wrote parquet + metadata; ``False``
-            on a skipped run (start-after-end, or a failed/insufficient
-            provider run), in which case existing files are unchanged.
+            only on the start-after-end skip (clock skew, nothing to
+            fetch), in which case existing files are unchanged. Under the
+            binary provider model a fetch failure raises rather than
+            returning ``written=False``.
         row_count: Whole-file row count after the write; ``0`` on a skip.
         start_date: Inclusive UTC start date of the computed fetch window.
         end_date: Inclusive UTC end date of the computed fetch window.
-        providers_present: Provider names fetched successfully, in fixed
-            order (empty on a start-after-end skip, before any fetch).
-        providers_skipped: Provider names disabled or absent from config.
-        providers_failed: Provider names that raised during fetch.
+        providers_present: Provider names fetched, in fixed order --
+            ``['motive', 'samsara']`` on a written run, empty only on the
+            start-after-end skip (before any fetch).
+        providers_skipped: Always empty; retained for metadata-shape
+            stability (a disabled provider is now a construction error).
+        providers_failed: Always empty; retained for metadata-shape
+            stability (a fetch failure now raises instead).
     """
 
     written: bool
@@ -141,11 +148,11 @@ class UtilizationPipeline:
     cadence. The pipeline figures out its own fetch window from prior
     metadata and config on each invocation.
 
-    Per-provider failure is isolated during the fetch -- one provider's
-    outage does not block the other. The run only writes when every
-    enabled provider succeeded, though: if any enabled provider failed
-    (or none is present), the run skips both writes and preserves the
-    existing files, recovering on the next all-success run.
+    Both Motive and Samsara must be enabled: the pipeline refuses to
+    construct otherwise (``__init__`` raises ``ValueError``). A fetch
+    failure on either provider aborts the run and propagates the
+    exception, before any write -- so a partial fetch can never overwrite
+    good data, and any existing files are left byte-identical.
 
     The read + window-delete + append + global-sort + write run in DuckDB
     and metadata aggregates stream from the written file, so the whole
@@ -170,12 +177,27 @@ class UtilizationPipeline:
 
         Raises:
             FileNotFoundError: If the config file does not exist.
-            ValueError: If the config fails Pydantic validation.
+            ValueError: If the config fails Pydantic validation, or if
+                either ``motive`` or ``samsara`` is missing or disabled --
+                this pipeline requires both providers enabled.
         """
         config_path = Path(config_path)
         self._config: TelemetryConfig = load_config(config_path)
         setup_logger(config=self._config.logging)
         logger.info('Initializing UtilizationPipeline from config: %s', config_path)
+
+        enabled_providers: dict[str, ProviderConfig] = (
+            self._config.get_enabled_providers()
+        )
+        missing_providers: set[str] = set(_UTILIZATION_PROVIDERS) - set(
+            enabled_providers
+        )
+        if missing_providers:
+            raise ValueError(
+                'UtilizationPipeline requires both "motive" and "samsara" enabled; '
+                f'missing or disabled: {sorted(missing_providers)}'
+            )
+
         self._parquet_dir: Path = (
             Path(self._config.storage.parquet_path) / 'utilization'
         )
@@ -197,22 +219,23 @@ class UtilizationPipeline:
         Execute one full run.
 
         Determines the fetch window from prior metadata and config,
-        fetches each provider's bundle (isolating failures), runs the
-        per-provider transforms, unifies, then -- only if every enabled
-        provider succeeded -- merges the window into the existing parquet
-        (DuckDB delete-then-append), writes parquet, and writes metadata
-        from a streaming aggregate over the written file.
+        fetches both providers' bundles, runs the per-provider transforms,
+        unifies, merges the window into the existing parquet (DuckDB
+        delete-then-append), writes parquet, and writes metadata from a
+        streaming aggregate over the written file.
 
         Returns:
             A ``UtilizationRunResult`` describing the run. ``written`` is
-            ``False`` (and ``row_count`` is 0) on a skipped run -- either
-            ``start_date`` computed after ``end_date`` (clock skew), or a
-            run where an enabled provider failed or no provider was
-            present -- in which case the on-disk parquet and metadata are
-            left unchanged. ``written`` is ``True`` with the whole-file
-            ``row_count`` when the merge wrote the file.
+            ``False`` (and ``row_count`` is 0) only on the start-after-end
+            skip (``start_date`` computed after ``end_date`` from clock
+            skew), in which case the on-disk parquet and metadata are left
+            unchanged. Otherwise ``written`` is ``True`` with the
+            whole-file ``row_count`` the merge wrote.
 
         Raises:
+            Exception: If either provider's fetch fails. The exception
+                propagates before any write, leaving existing files intact
+                (the fetch is logged at ERROR first).
             CorruptUtilizationParquetError: If the existing parquet is
                 unreadable or its columns do not match the schema. The
                 run aborts before any write, leaving the file intact.
@@ -246,37 +269,14 @@ class UtilizationPipeline:
 
         logger.info('Fetch window: %s to %s (inclusive)', start_date, end_date)
 
-        motive_bundle, motive_status = self._fetch_motive(start_date, end_date)
-        samsara_bundle, samsara_status = self._fetch_samsara(start_date, end_date)
-        statuses: list[tuple[str, ProviderStatus]] = [
-            ('motive', motive_status),
-            ('samsara', samsara_status),
-        ]
-        providers_present = [name for name, status in statuses if status == 'present']
-        providers_skipped = [name for name, status in statuses if status == 'skipped']
-        providers_failed = [name for name, status in statuses if status == 'failed']
+        motive_bundle: MotiveUtilizationBundle = self._fetch_motive(
+            start_date, end_date
+        )
+        samsara_bundle: SamsaraUtilizationBundle = self._fetch_samsara(
+            start_date, end_date
+        )
 
         df: pd.DataFrame = unify(motive_bundle, samsara_bundle)
-
-        should_write = bool(providers_present) and not providers_failed
-        if not should_write:
-            logger.warning(
-                'Skipping write: providers_failed=%s, providers_skipped=%s. '
-                'Parquet and metadata writes are skipped and existing data is '
-                'preserved; the next run where every enabled provider succeeds '
-                'will re-fetch the full lookback window and rewrite it.',
-                providers_failed,
-                providers_skipped,
-            )
-            return UtilizationRunResult(
-                written=False,
-                row_count=0,
-                start_date=start_date,
-                end_date=end_date,
-                providers_present=providers_present,
-                providers_skipped=providers_skipped,
-                providers_failed=providers_failed,
-            )
 
         stats = merge_incremental_to_parquet(
             df,
@@ -296,9 +296,9 @@ class UtilizationPipeline:
                 run_completed=run_completed,
                 start_date=start_date,
                 end_date=end_date,
-                providers_present=providers_present,
-                providers_skipped=providers_skipped,
-                providers_failed=providers_failed,
+                providers_present=list(_UTILIZATION_PROVIDERS),
+                providers_skipped=[],
+                providers_failed=[],
             )
         )
 
@@ -312,9 +312,9 @@ class UtilizationPipeline:
             row_count=row_count,
             start_date=start_date,
             end_date=end_date,
-            providers_present=providers_present,
-            providers_skipped=providers_skipped,
-            providers_failed=providers_failed,
+            providers_present=list(_UTILIZATION_PROVIDERS),
+            providers_skipped=[],
+            providers_failed=[],
         )
 
     # --------------------------------------------------------------
@@ -473,32 +473,32 @@ class UtilizationPipeline:
 
     def _fetch_motive(
         self, start_date: date, end_date: date
-    ) -> tuple[MotiveUtilizationBundle | None, ProviderStatus]:
-        """Fetch Motive bundle, isolating failures into a ``failed`` status."""
-        motive_config = self._config.providers.get('motive')
-        if motive_config is None or not motive_config.enabled:
-            logger.info('Motive provider not configured or disabled; skipping')
-            return None, 'skipped'
+    ) -> MotiveUtilizationBundle:
+        """Fetch the Motive bundle; log and re-raise on failure (fail loud).
+
+        ``__init__`` guarantees Motive is enabled, so there is no
+        disabled/missing branch here.
+        """
         try:
-            provider = Provider.from_config('motive', self._config)
-            fetcher = MotiveUtilizationFetcher(provider)
-            return fetcher.fetch(start_date, end_date), 'present'
+            provider: Provider = Provider.from_config('motive', self._config)
+            fetcher: MotiveUtilizationFetcher = MotiveUtilizationFetcher(provider)
+            return fetcher.fetch(start_date, end_date)
         except Exception:
-            logger.exception('Motive fetch failed; treating as missing bundle')
-            return None, 'failed'
+            logger.exception('Motive fetch failed')
+            raise
 
     def _fetch_samsara(
         self, start_date: date, end_date: date
-    ) -> tuple[SamsaraUtilizationBundle | None, ProviderStatus]:
-        """Fetch Samsara bundle, isolating failures into a ``failed`` status."""
-        samsara_config = self._config.providers.get('samsara')
-        if samsara_config is None or not samsara_config.enabled:
-            logger.info('Samsara provider not configured or disabled; skipping')
-            return None, 'skipped'
+    ) -> SamsaraUtilizationBundle:
+        """Fetch the Samsara bundle; log and re-raise on failure (fail loud).
+
+        ``__init__`` guarantees Samsara is enabled, so there is no
+        disabled/missing branch here.
+        """
         try:
-            provider = Provider.from_config('samsara', self._config)
-            fetcher = SamsaraUtilizationFetcher(provider)
-            return fetcher.fetch(start_date, end_date), 'present'
+            provider: Provider = Provider.from_config('samsara', self._config)
+            fetcher: SamsaraUtilizationFetcher = SamsaraUtilizationFetcher(provider)
+            return fetcher.fetch(start_date, end_date)
         except Exception:
-            logger.exception('Samsara fetch failed; treating as missing bundle')
-            return None, 'failed'
+            logger.exception('Samsara fetch failed')
+            raise
