@@ -389,32 +389,32 @@ Field notes:
 
 ## Utilization Pipeline: Backfill
 
-A historical backfill must **not** be run as a single invocation at fleet scale: a 2025→present range across ~1300 vehicles is ~20M rows, and fetching + transforming that span in one shot builds one giant in-memory frame before DuckDB ever sees a row — an out-of-memory failure regardless of how bounded the merge is. Backfill is instead run as **bounded batches** marched forward by the `max_window_days` cap.
+A historical backfill must **not** be run as a single uncapped window at fleet scale: a 2025→present range across ~1300 vehicles is ~20M rows, and fetching + transforming that span in one shot builds one giant in-memory frame before DuckDB ever sees a row — an out-of-memory failure regardless of how bounded the merge is. A single `run()` instead covers its resolved range as **bounded windows** marched forward by the `max_window_days` cap: one window in steady state, many for a historical backfill.
 
 To bootstrap or re-run the utilization pipeline over a historical range:
 
 1. Set `pipeline.default_start_date` to the desired backfill start date (e.g., `"2025-01-01"`).
-2. Set `pipeline.max_window_days` to the span each batch should cover, e.g. `28`–`31` to fetch roughly a month per batch (it must exceed `lookback_days`).
+2. Set `pipeline.max_window_days` to the span each window should cover, e.g. `28`–`31` to fetch roughly a month per window (it must exceed `lookback_days`). Leaving it unset would make `run()` cover the whole range as one giant window — the out-of-memory case above — so a historical backfill requires setting it.
 3. Delete the existing utilization output directory if any:
 
    ```bash
    rm -rf {parquet_path}/utilization/
    ```
 
-4. Drive the batched march to the present:
+4. Run the pipeline once; a single `run()` marches the range to the present:
 
    ```python
    from fleet_telemetry_hub.utilization_pipeline import UtilizationPipeline
 
-   summary = UtilizationPipeline('config/telemetry_config.yaml').backfill_to_present()
-   print(summary.batches_run, summary.final_end_date, summary.final_row_count)
+   result = UtilizationPipeline('config/telemetry_config.yaml').run()
+   print(result.windows_run, result.final_end_date, result.final_row_count)
    ```
 
-   Each batch fetches and transforms one capped window (which fits in pandas) and delete-then-appends it via the DuckDB merge (which stays bounded on the file side), so the whole backfill runs in bounded memory across many small batches. `backfill_to_present` stops with a `BackfillStalledError` if a batch can't write (an enabled provider failed) — existing data is preserved, so a later call resumes from where it left off. Alternatively, just leave `max_window_days` set and let your **scheduled runs** catch up one batch per invocation over successive ticks.
+   `run()` covers `[range_start, today-1]` as a sequence of capped windows. Each window fetches and transforms one span (which fits in pandas) and delete-then-appends it via the DuckDB merge (which stays bounded on the file side), then writes metadata before the next window begins — so the whole backfill runs in bounded memory, and a mid-march failure (e.g. an enabled provider raising) leaves every completed window persisted and resumes from there on the next `run()`. Alternatively, just leave `max_window_days` set and let your **scheduled runs** advance one or more windows per invocation over successive ticks.
 
-5. Subsequent steady-state runs use `latest_data_date - lookback_days` as the window start; with a recent anchor the cap is inert and each run covers a single day.
+5. Subsequent steady-state runs use `latest_data_date - lookback_days` as the range start; with a recent anchor the range fits in a single window and the cap is inert.
 
-**Memory vs. batches tradeoff:** a smaller `max_window_days` lowers peak per-batch memory but needs more batches (more total runs, and more redundant re-fetch — each batch re-fetches the prior `lookback_days` of overlap). A larger span is fewer batches but higher peak memory. Pick the largest span that comfortably fits the run host's memory. The `max_window_days > lookback_days` requirement guarantees forward progress: each batch advances the anchor by ~`max_window_days - lookback_days` days, so a cap that didn't exceed the lookback would stall or regress the march.
+**Memory vs. windows tradeoff:** a smaller `max_window_days` lowers peak per-window memory but needs more windows (more redundant re-fetch — each window re-fetches the prior `lookback_days` of overlap). A larger span is fewer windows but higher peak memory. Pick the largest span that comfortably fits the run host's memory. The `max_window_days > lookback_days` requirement guarantees forward progress: each window advances the leading edge by ~`max_window_days - lookback_days` days, so a cap that didn't exceed the lookback would stall the march.
 
 ## Configuration
 
