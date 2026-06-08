@@ -183,8 +183,6 @@ def _empty_motive_bundle(
     company: str | None = 'motive_co',
 ) -> MotiveUtilizationBundle:
     return MotiveUtilizationBundle(
-        vehicle_utilizations_by_date={},
-        driver_idle_rollups_by_date={},
         driving_periods=[],
         idle_events=[],
         date_range=date_range,
@@ -197,8 +195,6 @@ def _motive_bundle_with_one_period(
     company: str | None = 'motive_co',
 ) -> MotiveUtilizationBundle:
     return MotiveUtilizationBundle(
-        vehicle_utilizations_by_date={},
-        driver_idle_rollups_by_date={},
         driving_periods=[_motive_period()],
         idle_events=[],
         date_range=date_range,
@@ -239,8 +235,6 @@ def _motive_bundle_with_periods(
 ) -> MotiveUtilizationBundle:
     """A Motive bundle carrying an explicit list of driving periods."""
     return MotiveUtilizationBundle(
-        vehicle_utilizations_by_date={},
-        driver_idle_rollups_by_date={},
         driving_periods=periods,
         idle_events=[],
         date_range=(_MAY_14, _MAY_20),

@@ -213,8 +213,6 @@ class TestBundleCompanyField:
         """``MotiveUtilizationBundle(company=None)`` exposes ``.company is None``."""
 
         bundle = MotiveUtilizationBundle(
-            vehicle_utilizations_by_date={},
-            driver_idle_rollups_by_date={},
             driving_periods=[],
             idle_events=[],
             date_range=(_MAY_14, _MAY_14),
@@ -227,8 +225,6 @@ class TestBundleCompanyField:
         """``MotiveUtilizationBundle(company=X)`` exposes ``.company == X``."""
 
         bundle = MotiveUtilizationBundle(
-            vehicle_utilizations_by_date={},
-            driver_idle_rollups_by_date={},
             driving_periods=[],
             idle_events=[],
             date_range=(_MAY_14, _MAY_14),
@@ -269,8 +265,6 @@ class TestBundleCompanyField:
         """Assigning to ``bundle.company`` raises ``FrozenInstanceError``."""
 
         bundle = MotiveUtilizationBundle(
-            vehicle_utilizations_by_date={},
-            driver_idle_rollups_by_date={},
             driving_periods=[],
             idle_events=[],
             date_range=(_MAY_14, _MAY_14),

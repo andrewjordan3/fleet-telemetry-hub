@@ -180,8 +180,6 @@ def _make_motive_bundle(
     date_range: tuple[date, date] = (_MAY_14, _MAY_20),
 ) -> MotiveUtilizationBundle:
     return MotiveUtilizationBundle(
-        vehicle_utilizations_by_date={},
-        driver_idle_rollups_by_date={},
         driving_periods=driving_periods or [],
         idle_events=idle_events or [],
         date_range=date_range,
