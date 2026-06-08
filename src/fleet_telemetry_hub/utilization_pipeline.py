@@ -241,7 +241,6 @@ class UtilizationPipeline:
 
         range_start, range_end = self._resolve_range(self._metadata_store.load())
         window_days: int = self._effective_window_days(range_start, range_end)
-        lookback_days: int = self._config.pipeline.lookback_days
 
         windows_run: int = 0
         final_start: date | None = None
@@ -249,7 +248,7 @@ class UtilizationPipeline:
         final_row_count: int = 0
 
         for window_start, window_end in iter_windows(
-            range_start, range_end, window_days, lookback_days
+            range_start, range_end, window_days
         ):
             prior_metadata: dict[str, Any] | None = self._metadata_store.load()
             logger.info(

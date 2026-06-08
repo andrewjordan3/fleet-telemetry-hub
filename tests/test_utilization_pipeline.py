@@ -493,7 +493,7 @@ class TestRangeResolution:
         )
         window_days = pipeline._effective_window_days(range_start, range_end)
         windows = list(
-            iter_windows(range_start, range_end, window_days, lookback_days=7)
+            iter_windows(range_start, range_end, window_days)
         )
 
         # The 7-day range fits inside the 28-day cap: a single window to today-1.
@@ -511,7 +511,7 @@ class TestRangeResolution:
         range_start, range_end = pipeline._resolve_range(None)
         window_days = pipeline._effective_window_days(range_start, range_end)
         windows = list(
-            iter_windows(range_start, range_end, window_days, lookback_days=7)
+            iter_windows(range_start, range_end, window_days)
         )
 
         assert range_start == date(2025, 1, 1)
@@ -531,7 +531,7 @@ class TestRangeResolution:
         range_start, range_end = pipeline._resolve_range(None)
         window_days = pipeline._effective_window_days(range_start, range_end)
         windows = list(
-            iter_windows(range_start, range_end, window_days, lookback_days=7)
+            iter_windows(range_start, range_end, window_days)
         )
 
         assert range_start == date(2025, 1, 1)
@@ -1344,7 +1344,7 @@ class TestRunMarchesWindows:
             default_start + timedelta(days=offset) for offset in range(span_days + 1)
         ]
         assert covered_dates == expected_dates
-        # No duplicates across window-boundary overlaps.
+        # No duplicates across contiguous window boundaries.
         assert len(on_disk) == len(expected_dates)
         assert result.final_row_count == len(expected_dates)
 
