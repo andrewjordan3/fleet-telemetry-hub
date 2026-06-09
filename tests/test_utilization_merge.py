@@ -244,6 +244,73 @@ class TestDuplicateAcrossFrames:
         assert result.at[0, 'distance_miles'] == _NEW_DISTANCE
 
 
+class TestIncomingDeduplication:
+    """Exact duplicates within one incoming frame collapse to a single copy.
+
+    Overlap-anchored chunk seams and pagination drift can put two
+    identical copies of an event into a single run's ``new_frame``; the
+    merge dedups the incoming side with ``SELECT DISTINCT`` so the output
+    parquet never contains two identical rows.
+    """
+
+    def test_exact_duplicate_pair_written_once(self, tmp_path: Path) -> None:
+        """A duplicate pair plus distinct rows writes one copy of each row."""
+
+        duplicated = _row(_at(14, 8))
+        distinct_rows = [duplicated, _row(_at(14, 9)), _row(_at(14, 20))]
+        result, stats = _merge(None, [duplicated, *distinct_rows], tmp_path)
+
+        assert len(result) == len(distinct_rows)
+        assert result['start_time_utc'].tolist() == [
+            pd.Timestamp(_at(14, 8)),
+            pd.Timestamp(_at(14, 9)),
+            pd.Timestamp(_at(14, 20)),
+        ]
+        assert stats.incoming_duplicates_dropped == 1
+        assert stats.kept_in_window == len(distinct_rows)
+        # final_row_count must match the file actually written, not just
+        # the kept + retained formula.
+        assert stats.final_row_count == len(result)
+
+    def test_merge_branch_dedups_and_keeps_outside_rows(self, tmp_path: Path) -> None:
+        """With an existing file, the duplicate pair still collapses and
+        existing rows outside the window are untouched."""
+
+        duplicated = _row(_at(14, 8))
+        existing_rows = [_row(_at(10, 8)), _row(_at(20, 8))]
+        result, stats = _merge(
+            existing_rows,
+            [duplicated, duplicated],
+            tmp_path,
+        )
+
+        starts = result['start_time_utc'].tolist()
+        assert starts.count(pd.Timestamp(_at(14, 8))) == 1
+        assert pd.Timestamp(_at(10, 8)) in starts
+        assert pd.Timestamp(_at(20, 8)) in starts
+        assert len(result) == len(existing_rows) + 1
+        assert stats.incoming_duplicates_dropped == 1
+        assert stats.final_row_count == len(result)
+
+    def test_near_duplicate_rows_both_survive(self, tmp_path: Path) -> None:
+        """Rows identical except one column are not duplicates -- both survive.
+
+        Pins the exact-duplicate-only scope: same-event-different-payload
+        pairs (e.g. a provider-side edit shifting ``end_time_utc``) are
+        intentionally not collapsed here.
+        """
+
+        new_rows = [
+            _row(_at(14, 8), end=_at(14, 9)),
+            _row(_at(14, 8), end=_at(14, 10)),
+        ]
+        result, stats = _merge(None, new_rows, tmp_path)
+
+        assert len(result) == len(new_rows)
+        assert stats.incoming_duplicates_dropped == 0
+        assert stats.kept_in_window == len(new_rows)
+
+
 class TestOutputShapeAndOrder:
     """The written parquet respects the locked schema and sort order."""
 
@@ -360,6 +427,7 @@ class TestMergeStats:
         assert stats == MergeStats(
             incoming=2,
             kept_in_window=1,
+            incoming_duplicates_dropped=0,
             existing_deleted=1,
             existing_retained=1,
             final_row_count=2,
@@ -409,9 +477,38 @@ class TestLogging:
         message = debug_records[0].message
         assert 'incoming=2' in message
         assert 'kept_in_window=1' in message
+        assert 'incoming_duplicates_dropped=0' in message
         assert 'existing_deleted=1' in message
         assert 'existing_retained=1' in message
         assert 'final=2' in message
+
+    def test_warning_emitted_when_duplicates_dropped(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A planted exact duplicate produces one WARNING naming count and window."""
+
+        duplicated = _row(_at(14, 8))
+        new_frame = build_dataframe([duplicated, duplicated])
+
+        with caplog.at_level(
+            logging.WARNING, logger='fleet_telemetry_hub._utilization_merge'
+        ):
+            merge_incremental_to_parquet(
+                new_frame,
+                _START_DATE,
+                _END_DATE,
+                tmp_path / 'data.parquet',
+                compression='snappy',
+            )
+
+        warning_records = [
+            record for record in caplog.records if record.levelno == logging.WARNING
+        ]
+        assert len(warning_records) == 1
+        message = warning_records[0].message
+        assert 'dropped 1 exact duplicate' in message
+        assert '2026-05-14T00:00:00+00:00' in message
+        assert '2026-05-15T00:00:00+00:00' in message
 
 
 class TestWriteTransaction:
