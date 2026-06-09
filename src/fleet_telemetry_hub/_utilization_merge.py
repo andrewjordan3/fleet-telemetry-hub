@@ -4,10 +4,12 @@ Companion module to ``utilization_pipeline.py``. Owns the read + window
 delete + append + global sort + write of the output parquet entirely in
 DuckDB, so pandas never materializes the whole (unbounded) on-disk file:
 DuckDB streams ``read_parquet``, the window delete is a ``WHERE``, the
-append is ``UNION ALL`` over the registered window-sized new frame, the
-global sort is ``ORDER BY`` (spilling to the destination's parent
-directory when it does not fit RAM), and the result is written with
-``COPY``.
+append is ``UNION ALL`` over the registered window-sized new frame --
+deduplicated with ``SELECT DISTINCT`` before the append, because
+overlap-anchored chunk seams and pagination drift can put two identical
+copies of an event into one fetch -- the global sort is ``ORDER BY``
+(spilling to the destination's parent directory when it does not fit
+RAM), and the result is written with ``COPY``.
 
 The merge normalizes every provider to start-anchored: both the incoming
 frame and the existing file are filtered on ``start_time_utc`` in the
@@ -71,7 +73,11 @@ class MergeStats:
 
     Attributes:
         incoming: Rows in ``new_frame``.
-        kept_in_window: ``new_frame`` rows with start in ``[W_start, W_end)``.
+        kept_in_window: Distinct ``new_frame`` rows with start in
+            ``[W_start, W_end)`` -- the in-window count after exact
+            duplicates are collapsed, i.e. what is actually appended.
+        incoming_duplicates_dropped: Exact duplicate copies removed from
+            the in-window incoming rows (0 in a healthy steady-state run).
         existing_deleted: Existing rows removed (0 on a first run).
         existing_retained: Existing rows kept (outside the window).
         final_row_count: Rows written to the output parquet.
@@ -79,6 +85,7 @@ class MergeStats:
 
     incoming: int
     kept_in_window: int
+    incoming_duplicates_dropped: int
     existing_deleted: int
     existing_retained: int
     final_row_count: int
@@ -96,7 +103,11 @@ def merge_incremental_to_parquet(
 
     Deletes the half-open UTC window ``[W_start, W_end)`` from any existing
     file at ``destination_path`` and appends the rows of ``new_frame``
-    whose ``start_time_utc`` falls inside that window, globally sorts the
+    whose ``start_time_utc`` falls inside that window -- deduplicated with
+    ``SELECT DISTINCT``, so given a duplicate-free existing file the output
+    never contains two identical rows (the two sides of the union are
+    row-disjoint by the window predicate, making the dedup of the incoming
+    side alone a structural invariant) -- globally sorts the
     union by the total deterministic key, and writes it with ``COPY``. The
     whole pipeline streams in DuckDB; pandas only holds the window-sized
     ``new_frame``. The function owns the full write transaction: it creates
@@ -115,8 +126,8 @@ def merge_incremental_to_parquet(
             ``'zstd'``, ``'uncompressed'``).
 
     Returns:
-        ``MergeStats`` with the incoming / kept / deleted / retained /
-        final row counts.
+        ``MergeStats`` with the incoming / kept / duplicates-dropped /
+        deleted / retained / final row counts.
 
     Raises:
         ValueError: If ``start_date > end_date``.
@@ -128,7 +139,8 @@ def merge_incremental_to_parquet(
         Creates ``destination_path.parent``; writes via a temp file in that
         directory and atomically renames it onto ``destination_path``; the
         temp file is always removed, so a failure leaks no ``*.tmp``. Emits
-        one ``DEBUG`` row-delta line.
+        one ``DEBUG`` row-delta line, plus one ``WARNING`` when exact
+        duplicates were dropped from the incoming frame.
     """
     if start_date > end_date:
         raise ValueError(f'start_date ({start_date}) must be <= end_date ({end_date})')
@@ -161,13 +173,25 @@ def merge_incremental_to_parquet(
 
     logger.debug(
         'merge_incremental: incoming=%d kept_in_window=%d '
+        'incoming_duplicates_dropped=%d '
         'existing_deleted=%d existing_retained=%d final=%d',
         stats.incoming,
         stats.kept_in_window,
+        stats.incoming_duplicates_dropped,
         stats.existing_deleted,
         stats.existing_retained,
         stats.final_row_count,
     )
+    if stats.incoming_duplicates_dropped > 0:
+        # Duplicates within a single-chunk steady-state window indicate
+        # pagination drift upstream -- surface them in the journal.
+        logger.warning(
+            'merge_incremental: dropped %d exact duplicate incoming row(s) '
+            'in window [%s, %s)',
+            stats.incoming_duplicates_dropped,
+            window[0].isoformat(),
+            window[1].isoformat(),
+        )
     return stats
 
 
@@ -235,6 +259,14 @@ def _copy_merged(
 ) -> None:
     """Build and execute the ``COPY`` that writes the merged, sorted parquet.
 
+    The incoming side selects with ``DISTINCT``: overlap-anchored chunk
+    seams and pagination drift can put two identical copies of an event
+    into one fetch, and collapsing them here -- over the window-sized
+    ``new_frame``, never the whole file -- makes a duplicate-free output
+    an invariant of the merge. The existing-file side stays ``SELECT``:
+    it is already duplicate-free under that invariant, and the window
+    predicate keeps the two sides of the union row-disjoint.
+
     The COPY target path and compression are escaped string literals
     (DuckDB binds the COPY target before the inner query's parameters, so
     it cannot be a ``?``); the ``read_parquet`` path and the window bounds
@@ -252,14 +284,17 @@ def _copy_merged(
     """
     window_start, window_end = window
     if existing_path is None:
-        select_sql = f'SELECT {_COLUMN_LIST} FROM new_frame WHERE {_WINDOW_PREDICATE}'
+        select_sql = (
+            f'SELECT DISTINCT {_COLUMN_LIST} FROM new_frame WHERE {_WINDOW_PREDICATE}'
+        )
         params: list[object] = [window_start, window_end]
     else:
         select_sql = (
             f'SELECT {_COLUMN_LIST} FROM read_parquet(?) '
             f'WHERE NOT ({_WINDOW_PREDICATE}) '
             f'UNION ALL '
-            f'SELECT {_COLUMN_LIST} FROM new_frame WHERE {_WINDOW_PREDICATE}'
+            f'SELECT DISTINCT {_COLUMN_LIST} FROM new_frame '
+            f'WHERE {_WINDOW_PREDICATE}'
         )
         params = [
             str(existing_path),
@@ -292,14 +327,23 @@ def _compute_stats(
         window: The half-open ``(window_start, window_end)`` bounds.
 
     Returns:
-        ``MergeStats`` for the merge. ``final_row_count`` is
-        ``kept_in_window + existing_retained`` (the ``UNION ALL`` does not
-        deduplicate), avoiding a re-scan of the written file.
+        ``MergeStats`` for the merge. ``kept_in_window`` is the *distinct*
+        in-window count, matching the ``SELECT DISTINCT`` the COPY appends,
+        so ``final_row_count`` is ``kept_in_window + existing_retained``
+        without a re-scan of the written file (the union's two sides are
+        row-disjoint by the window predicate).
     """
     window_start, window_end = window
-    kept_in_window = _count(
+    raw_in_window: int = _count(
         connection,
         f'SELECT count(*) FROM new_frame WHERE {_WINDOW_PREDICATE}',
+        [window_start, window_end],
+    )
+    kept_in_window: int = _count(
+        connection,
+        f'SELECT count(*) FROM ('
+        f'SELECT DISTINCT {_COLUMN_LIST} FROM new_frame '
+        f'WHERE {_WINDOW_PREDICATE})',
         [window_start, window_end],
     )
 
@@ -321,6 +365,7 @@ def _compute_stats(
     return MergeStats(
         incoming=incoming,
         kept_in_window=kept_in_window,
+        incoming_duplicates_dropped=raw_in_window - kept_in_window,
         existing_deleted=existing_deleted,
         existing_retained=existing_retained,
         final_row_count=kept_in_window + existing_retained,
